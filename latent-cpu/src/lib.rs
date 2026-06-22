@@ -2,7 +2,7 @@
 
 use latent_image::ImageBuf;
 use latent_image::color::luminance;
-use latent_pipeline::{Backend, CombineKind, PointOp};
+use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
 use rayon::prelude::*;
 
 /// A rendering backend that runs every primitive on the CPU.
@@ -65,6 +65,23 @@ impl Backend for CpuBackend {
             }
         }
     }
+
+    fn resample(&self, img: &ImageBuf, t: &Transform) -> ImageBuf {
+        // Inverse mapping: trace each output pixel back into the source and
+        // bilinearly sample. Output rows are independent → run them in parallel.
+        let mut out = ImageBuf::new(t.output.width, t.output.height);
+        let stride = t.output.width as usize;
+        out.pixels_mut()
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(oy, row)| {
+                for ox in 0..t.output.width {
+                    let (sx, sy) = t.map(ox as f32, oy as f32);
+                    row[ox as usize] = sample_bilinear(img, sx, sy);
+                }
+            });
+        out
+    }
 }
 
 /// One 1-D box-average pass, along columns (`vertical`) or rows. Each output
@@ -100,9 +117,42 @@ fn blur_axis(src: &ImageBuf, radius: i32, vertical: bool) -> ImageBuf {
     out
 }
 
+/// Bilinear sample of `img` at the fractional coordinate `(x, y)`, where integer
+/// coordinates address pixel centers. Blends the four surrounding pixels; any
+/// neighbor outside the image contributes black, so sampling past the border
+/// fades to black.
+///
+/// This is a 2-tap interpolator with no prefilter, so it assumes a transform of
+/// roughly unit scale (the geometry stage uses it only for crop/rotation).
+/// Minifying through it would undersample and alias — downscaling is done
+/// separately by area-averaging (`ImageBuf::downscaled`), not here.
+fn sample_bilinear(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+
+    let at = |xi: i32, yi: i32| -> [f32; 3] {
+        if xi < 0 || yi < 0 || xi >= w || yi >= h {
+            [0.0; 3]
+        } else {
+            img.get(xi as u32, yi as u32)
+        }
+    };
+    let (p00, p10) = (at(x0, y0), at(x0 + 1, y0));
+    let (p01, p11) = (at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+
+    std::array::from_fn(|c| {
+        let top = p00[c] * (1.0 - fx) + p10[c] * fx;
+        let bot = p01[c] * (1.0 - fx) + p11[c] * fx;
+        top * (1.0 - fy) + bot * fy
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use latent_pipeline::Extent;
 
     #[test]
     fn map_pixels_identity_leaves_the_image_unchanged() {
@@ -193,5 +243,42 @@ mod tests {
         assert!(img.get(2, 0)[0] < 0.0, "dark side should undershoot");
         assert!(img.get(3, 0)[0] > 1.0, "bright side should overshoot");
         assert!(img.get(0, 0)[0].abs() < 1e-6, "flat region unchanged");
+    }
+
+    #[test]
+    fn resample_identity_reproduces_the_image() {
+        let mut img = ImageBuf::new(3, 2);
+        img.set(0, 0, [0.1, 0.2, 0.3]);
+        img.set(2, 1, [0.7, 0.8, 0.9]);
+        let t = Transform::identity(Extent {
+            width: 3,
+            height: 2,
+        });
+        assert_eq!(CpuBackend.resample(&img, &t), img);
+    }
+
+    #[test]
+    fn resample_rotation_expands_and_keeps_the_center() {
+        let mut img = ImageBuf::new(20, 20);
+        for p in img.pixels_mut() {
+            *p = [0.4, 0.6, 0.8];
+        }
+        let t = Transform::rotation(
+            Extent {
+                width: 20,
+                height: 20,
+            },
+            20.0_f32.to_radians(),
+        );
+        let out = CpuBackend.resample(&img, &t);
+        assert!(out.width() > 20 && out.height() > 20, "canvas should grow");
+        let center = out.get(out.width() / 2, out.height() / 2);
+        assert!(
+            (center[0] - 0.4).abs() < 1e-4
+                && (center[1] - 0.6).abs() < 1e-4
+                && (center[2] - 0.8).abs() < 1e-4,
+            "center preserved, got {center:?}"
+        );
+        assert_eq!(out.get(0, 0), [0.0, 0.0, 0.0]); // corner outside source → black
     }
 }

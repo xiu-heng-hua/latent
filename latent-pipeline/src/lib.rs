@@ -6,7 +6,7 @@
 //! (SOURCE space), and geometry is the single later step that reframes it
 //! (SOURCE → OUTPUT).
 
-use latent_edit::{Adjustments, Geometry, LocalAdjustment, SelectiveTone, Settings};
+use latent_edit::{Adjustments, Crop, Geometry, LocalAdjustment, SelectiveTone, Settings};
 use latent_image::ImageBuf;
 use latent_image::tone::{self, ToneCurve};
 
@@ -39,6 +39,71 @@ pub enum CombineKind {
     Unsharp { gain: f32 },
 }
 
+/// Pixel dimensions of an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// An affine map from OUTPUT pixel coordinates to SOURCE pixel coordinates,
+/// plus the size of the output image.
+///
+/// The geometry stage resamples by inverse-mapping each output pixel through
+/// this and sampling the source — so the map runs output → source. Keeping it
+/// an explicit value (rather than baking rotation into the backend) is what
+/// will later let perspective/distortion compose here, and mask reprojection
+/// remain possible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    /// Size of the output image.
+    pub output: Extent,
+    /// Row-major 2x3 affine: `src = (m[0]·(x, y, 1), m[1]·(x, y, 1))`.
+    pub m: [[f32; 3]; 2],
+}
+
+impl Transform {
+    /// The identity transform for an image of the given size: every output pixel
+    /// maps to the same source pixel, so resampling is a no-op.
+    pub fn identity(extent: Extent) -> Self {
+        Self {
+            output: extent,
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        }
+    }
+
+    /// A rotation about the image center by `angle` radians, expanding the
+    /// output to the rotated bounding box so no content is lost (the corner
+    /// wedges fall outside the source and sample as black).
+    pub fn rotation(src: Extent, angle: f32) -> Self {
+        let (w, h) = (src.width as f32, src.height as f32);
+        let (sin, cos) = angle.sin_cos();
+        let nw = (w * cos.abs() + h * sin.abs()).ceil().max(1.0);
+        let nh = (w * sin.abs() + h * cos.abs()).ceil().max(1.0);
+        let (scx, scy) = (w / 2.0, h / 2.0);
+        let (dcx, dcy) = (nw / 2.0, nh / 2.0);
+        // Map an output pixel center back through the inverse rotation into the
+        // source, in pixel-index coordinates (pixel centers at integers).
+        let m02 = cos * (0.5 - dcx) + sin * (0.5 - dcy) + scx - 0.5;
+        let m12 = -sin * (0.5 - dcx) + cos * (0.5 - dcy) + scy - 0.5;
+        Self {
+            output: Extent {
+                width: nw as u32,
+                height: nh as u32,
+            },
+            m: [[cos, sin, m02], [-sin, cos, m12]],
+        }
+    }
+
+    /// The source coordinate an output pixel `(x, y)` maps to.
+    pub fn map(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.m[0][0] * x + self.m[0][1] * y + self.m[0][2],
+            self.m[1][0] * x + self.m[1][1] * y + self.m[1][2],
+        )
+    }
+}
+
 /// The pixel-level primitives a rendering backend provides.
 ///
 /// The pipeline calls these in a fixed order; the order lives in [`render`],
@@ -55,6 +120,10 @@ pub trait Backend {
     /// Combine `img` with `other` pixelwise in place, per `kind`. The two images
     /// must have the same dimensions.
     fn combine(&self, img: &mut ImageBuf, other: &ImageBuf, kind: &CombineKind);
+
+    /// Resample the image into a new one by inverse-mapping each output pixel
+    /// through `transform` and sampling the source (bilinear).
+    fn resample(&self, img: &ImageBuf, transform: &Transform) -> ImageBuf;
 }
 
 /// Render a finished working image from a source image and its settings.
@@ -140,11 +209,36 @@ fn apply_locals(img: ImageBuf, _locals: &[LocalAdjustment], _backend: &dyn Backe
     img
 }
 
-/// Stage: geometry — the single SOURCE → OUTPUT resample (crop, straighten).
+/// Stage: geometry — the single SOURCE → OUTPUT step.
 ///
-/// Not implemented yet, so this returns the image unchanged.
-fn apply_geometry(img: ImageBuf, _geometry: &Geometry, _backend: &dyn Backend) -> ImageBuf {
+/// Straighten first (a resample about the center, expanding the canvas), then
+/// crop (an exact clip of the result). Both are reversible: they only change
+/// what the *output* contains, never the source. The default geometry leaves
+/// the image untouched.
+fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend) -> ImageBuf {
+    if geometry.straighten_degrees != 0.0 {
+        let extent = Extent {
+            width: img.width(),
+            height: img.height(),
+        };
+        let t = Transform::rotation(extent, geometry.straighten_degrees.to_radians());
+        img = backend.resample(&img, &t);
+    }
+    if let Some(crop) = geometry.crop {
+        img = crop_image(&img, crop);
+    }
     img
+}
+
+/// Clip `img` to a normalized crop rectangle. Fractions become pixels at this
+/// image's resolution, so the same crop applies to a preview and a full render.
+fn crop_image(img: &ImageBuf, c: Crop) -> ImageBuf {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let x = (c.x.clamp(0.0, 1.0) * w).round() as u32;
+    let y = (c.y.clamp(0.0, 1.0) * h).round() as u32;
+    let cw = (c.width.clamp(0.0, 1.0) * w).round().max(1.0) as u32;
+    let ch = (c.height.clamp(0.0, 1.0) * h).round().max(1.0) as u32;
+    img.cropped(x, y, cw, ch)
 }
 
 #[cfg(test)]
@@ -221,6 +315,25 @@ mod tests {
                     }
                 }
             }
+        }
+
+        fn resample(&self, img: &ImageBuf, t: &Transform) -> ImageBuf {
+            // Nearest-neighbor is enough to exercise the geometry stage here.
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            let mut out = ImageBuf::new(t.output.width, t.output.height);
+            for oy in 0..t.output.height {
+                for ox in 0..t.output.width {
+                    let (sx, sy) = t.map(ox as f32, oy as f32);
+                    let (xi, yi) = (sx.round() as i32, sy.round() as i32);
+                    let px = if xi >= 0 && yi >= 0 && xi < w && yi < h {
+                        img.get(xi as u32, yi as u32)
+                    } else {
+                        [0.0; 3]
+                    };
+                    out.set(ox, oy, px);
+                }
+            }
+            out
         }
     }
 
@@ -339,5 +452,52 @@ mod tests {
         let out = render(&src, &settings, &TestBackend);
         assert!(out.get(2, 0)[0] < 0.0, "dark side: {:?}", out.get(2, 0));
         assert!(out.get(3, 0)[0] > 1.0, "bright side: {:?}", out.get(3, 0));
+    }
+
+    #[test]
+    fn crop_reduces_dimensions_and_keeps_the_region() {
+        // 4x2 with a per-pixel marker; crop the right half.
+        let mut src = ImageBuf::new(4, 2);
+        for y in 0..2 {
+            for x in 0..4 {
+                src.set(x, y, [(x + y * 4) as f32, 0.0, 0.0]);
+            }
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: Some(Crop {
+                    x: 0.5,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                }),
+                straighten_degrees: 0.0,
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert_eq!((out.width(), out.height()), (2, 2));
+        assert_eq!(out.get(0, 0), [2.0, 0.0, 0.0]); // old (2, 0)
+        assert_eq!(out.get(1, 1), [7.0, 0.0, 0.0]); // old (3, 1)
+    }
+
+    #[test]
+    fn straighten_expands_the_canvas_and_keeps_the_center() {
+        let mut src = ImageBuf::new(20, 20);
+        for p in src.pixels_mut() {
+            *p = [0.4, 0.6, 0.8];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 20.0,
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert!(out.width() > 20 && out.height() > 20, "canvas should grow");
+        let center = out.get(out.width() / 2, out.height() / 2);
+        assert!((center[0] - 0.4).abs() < 1e-4, "center kept: {center:?}");
+        assert_eq!(out.get(0, 0), [0.0, 0.0, 0.0]); // corner outside source → black
     }
 }
