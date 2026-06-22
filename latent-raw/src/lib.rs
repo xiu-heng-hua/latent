@@ -5,6 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use latent_image::ImageBuf;
+use latent_image::color::{self, Mat3};
 
 /// Bindings generated from `libraw/libraw.h` by bindgen (see build.rs).
 #[allow(
@@ -349,6 +350,19 @@ impl RawImage {
         }
         img
     }
+
+    /// The camera → linear-sRGB color matrix built from this file's metadata.
+    ///
+    /// `cam_xyz` is the XYZ → camera matrix (its first three rows form the 3x3
+    /// used here); composing its inverse with XYZ → sRGB lifts demosaiced camera
+    /// RGB into the working space. White balance is already applied once on the
+    /// mosaic, so the result is row-normalized to keep a neutral input neutral
+    /// (no double white-balance). Returns `None` if the matrix is singular.
+    pub fn color_matrix(&self) -> Option<Mat3> {
+        let x = self.meta.cam_xyz;
+        let xyz_to_cam = Mat3([x[0], x[1], x[2]]);
+        color::camera_to_linear_srgb(xyz_to_cam)
+    }
 }
 
 /// Whether the sensor is a standard RGB Bayer mosaic (`cdesc == "RGBG"`), the
@@ -528,6 +542,28 @@ mod tests {
         // After WB every photosite should land on the same gray (~0.5).
         for v in mosaic {
             assert!((v - 0.5).abs() < 1e-6, "expected ~0.5, got {v}");
+        }
+    }
+
+    #[test]
+    fn color_matrix_keeps_a_neutral_patch_neutral() {
+        // Arbitrary non-singular stand-in for an XYZ→camera matrix (only the
+        // first three rows are used by the 3x3 color conversion).
+        let mut raw = raw_grid(4, 4);
+        raw.meta.cam_xyz = [
+            [1.4, -0.3, -0.1],
+            [-0.5, 1.6, -0.1],
+            [0.0, -0.4, 1.5],
+            [0.0; 3],
+        ];
+        let m = raw.color_matrix().expect("invertible");
+        // A white-balanced neutral patch is camera RGB [v,v,v]; the color matrix
+        // must keep it neutral (white balance applied exactly once, not twice).
+        for v in [0.25_f32, 0.5, 1.0] {
+            let out = m.mul_vec([v, v, v]);
+            for c in out {
+                assert!((c - v).abs() < 1e-5, "drifted from neutral: {out:?}");
+            }
         }
     }
 
