@@ -28,6 +28,17 @@ pub enum PointOp {
     Saturation(f32),
 }
 
+/// A data-described operation combining an image with a second one pixelwise.
+///
+/// Like [`PointOp`], this is data rather than a closure so any backend can run
+/// it. The second image is supplied to [`Backend::combine`] alongside the kind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CombineKind {
+    /// Unsharp recombine: `other + gain·(img − other)`. With `other` the blurred
+    /// base, this amplifies the detail the image holds over its blur.
+    Unsharp { gain: f32 },
+}
+
 /// The pixel-level primitives a rendering backend provides.
 ///
 /// The pipeline calls these in a fixed order; the order lives in [`render`],
@@ -37,6 +48,13 @@ pub enum PointOp {
 pub trait Backend {
     /// Apply a per-pixel operation to every pixel of the image, in place.
     fn map_pixels(&self, img: &mut ImageBuf, op: &PointOp);
+
+    /// Blur the image with a box blur of the given radius (in pixels).
+    fn blur(&self, img: &ImageBuf, radius: f32) -> ImageBuf;
+
+    /// Combine `img` with `other` pixelwise in place, per `kind`. The two images
+    /// must have the same dimensions.
+    fn combine(&self, img: &mut ImageBuf, other: &ImageBuf, kind: &CombineKind);
 }
 
 /// Render a finished working image from a source image and its settings.
@@ -58,9 +76,9 @@ pub fn render(source: &ImageBuf, settings: &Settings, backend: &dyn Backend) -> 
 
 /// Stage: global adjustments, applied in SOURCE space.
 ///
-/// Each active adjustment is lowered into a per-pixel operation and applied via
-/// the backend, in canonical order: white balance, exposure, tone, saturation.
-/// An inactive (`None`) adjustment contributes nothing.
+/// Each active adjustment is lowered into backend primitives and applied in
+/// canonical order: white balance, exposure, tone, saturation, sharpening. An
+/// inactive (`None`) adjustment contributes nothing.
 fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) -> ImageBuf {
     if let Some(wb) = global.white_balance {
         // temp/tint become per-channel gains, with green as the anchor.
@@ -81,6 +99,15 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
     }
     if let Some(amount) = global.saturation {
         backend.map_pixels(&mut img, &PointOp::Saturation(amount));
+    }
+    if let Some(s) = global.sharpen
+        && s.amount > 0.0
+        && s.radius > 0.0
+    {
+        // Unsharp mask: blur to a base, then amplify the detail (img − base).
+        let base = backend.blur(&img, s.radius);
+        let gain = 1.0 + s.amount;
+        backend.combine(&mut img, &base, &CombineKind::Unsharp { gain });
     }
     img
 }
@@ -123,12 +150,13 @@ fn apply_geometry(img: ImageBuf, _geometry: &Geometry, _backend: &dyn Backend) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::WhiteBalance;
+    use latent_edit::{Sharpen, WhiteBalance};
     use latent_image::color::luminance;
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
     /// backend lives in a crate that depends on this one. It gives each
-    /// [`PointOp`] the same meaning the CPU backend does.
+    /// [`PointOp`]/[`CombineKind`] the same meaning the CPU backend does, with
+    /// simple (and sequential) reference implementations.
     struct TestBackend;
 
     impl Backend for TestBackend {
@@ -152,6 +180,44 @@ mod tests {
                         // Clamp to ≥0 so over-saturation never emits negative light
                         // (mirrors the CPU backend).
                         *px = std::array::from_fn(|c| (y + amount * (px[c] - y)).max(0.0));
+                    }
+                }
+            }
+        }
+
+        fn blur(&self, img: &ImageBuf, radius: f32) -> ImageBuf {
+            let r = radius.round().max(0.0) as i32;
+            if r == 0 {
+                return img.clone();
+            }
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            let mut out = ImageBuf::new(img.width(), img.height());
+            for y in 0..h {
+                for x in 0..w {
+                    let mut sum = [0.0_f32; 3];
+                    let mut n = 0.0;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            let sx = (x + dx).clamp(0, w - 1) as u32;
+                            let sy = (y + dy).clamp(0, h - 1) as u32;
+                            let p = img.get(sx, sy);
+                            sum[0] += p[0];
+                            sum[1] += p[1];
+                            sum[2] += p[2];
+                            n += 1.0;
+                        }
+                    }
+                    out.set(x as u32, y as u32, [sum[0] / n, sum[1] / n, sum[2] / n]);
+                }
+            }
+            out
+        }
+
+        fn combine(&self, img: &mut ImageBuf, other: &ImageBuf, kind: &CombineKind) {
+            match *kind {
+                CombineKind::Unsharp { gain } => {
+                    for (px, o) in img.pixels_mut().iter_mut().zip(other.pixels().iter()) {
+                        *px = std::array::from_fn(|c| o[c] + gain * (px[c] - o[c]));
                     }
                 }
             }
@@ -250,5 +316,28 @@ mod tests {
             [0.7, 0.7, 0.7],
         );
         assert!(p[0] > 0.7 && p[1] > 0.7 && p[2] > 0.7, "{p:?}");
+    }
+
+    #[test]
+    fn sharpening_overshoots_a_step_edge() {
+        // Sharpening is lowered to blur + recombine; on a step edge it should
+        // push the dark side below and the bright side above their originals.
+        let mut src = ImageBuf::new(5, 1);
+        for (x, v) in [0.0, 0.0, 0.0, 1.0, 1.0].into_iter().enumerate() {
+            src.set(x as u32, 0, [v; 3]);
+        }
+        let settings = Settings {
+            global: Adjustments {
+                sharpen: Some(Sharpen {
+                    amount: 1.0,
+                    radius: 1.0,
+                }),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert!(out.get(2, 0)[0] < 0.0, "dark side: {:?}", out.get(2, 0));
+        assert!(out.get(3, 0)[0] > 1.0, "bright side: {:?}", out.get(3, 0));
     }
 }

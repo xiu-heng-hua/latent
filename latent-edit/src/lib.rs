@@ -58,6 +58,8 @@ pub struct Adjustments {
     pub tone: Option<SelectiveTone>,
     /// Saturation factor: `0` is grayscale, `1` is unchanged, `> 1` is more.
     pub saturation: Option<f32>,
+    /// Unsharp-mask sharpening.
+    pub sharpen: Option<Sharpen>,
 }
 
 /// Editable white balance as a temp/tint pair; both `0` is neutral. Positive
@@ -76,6 +78,25 @@ pub struct SelectiveTone {
     pub highlights: f32,
     pub shadows: f32,
     pub blacks: f32,
+}
+
+/// Unsharp-mask sharpening: `amount` is the strength (`0` = off), `radius` the
+/// blur radius (in pixels) of the unsharp base.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sharpen {
+    pub amount: f32,
+    pub radius: f32,
+}
+
+impl Default for Sharpen {
+    fn default() -> Self {
+        // A sensible default radius so a freshly-enabled slider has somewhere
+        // to sit; `amount` 0 keeps it a no-op until the user raises it.
+        Self {
+            amount: 0.0,
+            radius: 2.0,
+        }
+    }
 }
 
 /// Framing and orientation of the rendered image: an optional crop and a
@@ -122,6 +143,7 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.global, Adjustments::default());
         assert_eq!(s.global.exposure, None);
+        assert_eq!(s.global.sharpen, None);
         assert!(s.locals.is_empty());
         assert!(s.geometry.is_identity());
     }
@@ -148,6 +170,10 @@ mod tests {
                     blacks: 0.0,
                 }),
                 saturation: Some(1.2),
+                sharpen: Some(Sharpen {
+                    amount: 0.3,
+                    radius: 1.5,
+                }),
             },
             locals: vec![LocalAdjustment {
                 adjustments: Adjustments::default(),
