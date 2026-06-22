@@ -1,0 +1,13 @@
+[package]
+name = "latent-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+latent-image = { path = "../latent-image" }
+latent-raw = { path = "../latent-raw" }
+latent-edit = { path = "../latent-edit" }
+latent-pipeline = { path = "../latent-pipeline" }
+latent-cpu = { path = "../latent-cpu" }
+latent-export = { path = "../latent-export" }

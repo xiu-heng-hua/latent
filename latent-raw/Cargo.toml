@@ -1,0 +1,8 @@
+[package]
+name = "latent-raw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+latent-image = { path = "../latent-image" }

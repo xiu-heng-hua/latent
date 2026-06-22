@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "latent-image",
+    "latent-raw",
+    "latent-edit",
+    "latent-pipeline",
+    "latent-cpu",
+    "latent-export",
+    "latent-app",
+]
+
+# Shared metadata; each crate inherits these via `field.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
