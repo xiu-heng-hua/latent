@@ -11,8 +11,9 @@
 pub const LUT_SIZE: usize = 256;
 
 /// Approximate perceptual domain: a plain gamma. A 2.2 gamma is a simple,
-/// reasonable perceptual space for tone shaping.
-const GAMMA: f32 = 2.2;
+/// reasonable perceptual space for tone shaping. Public so a backend that
+/// evaluates the curve itself (e.g. on the GPU) uses the same encode/decode.
+pub const GAMMA: f32 = 2.2;
 
 fn tone_encode(linear: f32) -> f32 {
     linear.clamp(0.0, 1.0).powf(1.0 / GAMMA)
@@ -61,6 +62,13 @@ impl ToneCurve {
     /// perceived tone, not raw linear energy" actually happens.
     pub fn apply_linear(&self, linear: f32) -> f32 {
         tone_decode(self.eval(tone_encode(linear)))
+    }
+
+    /// The lookup table: `LUT_SIZE` output samples at inputs `i / (LUT_SIZE - 1)`
+    /// in the perceptual domain. A backend that evaluates the curve itself (e.g.
+    /// on the GPU) uploads this and reproduces [`Self::eval`]'s interpolation.
+    pub fn lut(&self) -> &[f32] {
+        &self.lut
     }
 }
 

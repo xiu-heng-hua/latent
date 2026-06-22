@@ -1,0 +1,17 @@
+[package]
+name = "latent-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+latent-image = { path = "../latent-image" }
+latent-edit = { path = "../latent-edit" }
+latent-pipeline = { path = "../latent-pipeline" }
+latent-cpu = { path = "../latent-cpu" }
+# Headless compute only: a Vulkan device with WGSL shaders is all we need
+# (lavapipe provides a software Vulkan device), so the other graphics backends
+# are left out to keep the build lean.
+wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl", "std"] }
+pollster = "0.4"
+bytemuck = "1"

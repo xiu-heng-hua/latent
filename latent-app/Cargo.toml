@@ -15,6 +15,7 @@ latent-raw = { path = "../latent-raw" }
 latent-edit = { path = "../latent-edit" }
 latent-pipeline = { path = "../latent-pipeline" }
 latent-cpu = { path = "../latent-cpu" }
+latent-gpu = { path = "../latent-gpu" }
 latent-export = { path = "../latent-export" }
 clap = { version = "4", features = ["derive"] }
 eframe = "0.32"

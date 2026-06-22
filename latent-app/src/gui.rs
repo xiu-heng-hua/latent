@@ -7,20 +7,19 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use latent_cpu::CpuBackend;
 use latent_edit::{
     Adjustments, Crop, Document, Gradient, History, LocalAdjustment, Mask, MaskShape, Radial,
     SelectiveTone, Settings, Sharpen, WhiteBalance,
 };
 use latent_image::ImageBuf;
-use latent_pipeline::render;
+use latent_pipeline::{Backend, render};
 
 /// Longest side of the interactive preview, in pixels. Keeps re-render cheap
 /// during editing; export uses the full-resolution image.
 const PREVIEW_MAX_DIM: u32 = 1600;
 
-/// Develop `input` and open the editor window.
-pub fn run(input: &Path) -> Result<(), Box<dyn Error>> {
+/// Develop `input` and open the editor window, rendering with `backend`.
+pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>> {
     // Develop once at full res; the preview re-renders over a downscaled copy.
     let full = crate::develop_to_image(input)?;
     let preview = full.downscaled(PREVIEW_MAX_DIM);
@@ -55,6 +54,7 @@ pub fn run(input: &Path) -> Result<(), Box<dyn Error>> {
                 status: String::new(),
                 texture: None,
                 local_sel: 0,
+                backend,
             }) as Box<dyn eframe::App>)
         }),
     )
@@ -82,6 +82,8 @@ struct App {
     texture: Option<egui::TextureHandle>,
     /// Index of the local adjustment selected for editing in the panel.
     local_sel: usize,
+    /// The rendering backend (CPU, or GPU when selected and available).
+    backend: Box<dyn Backend>,
 }
 
 impl App {
@@ -118,7 +120,7 @@ impl App {
         let rendered = render(
             &self.preview,
             self.variants[self.active].current(),
-            &CpuBackend,
+            self.backend.as_ref(),
         );
         let color = to_color_image(&rendered);
         match &mut self.texture {
@@ -135,7 +137,7 @@ impl App {
         let rendered = render(
             &self.full,
             self.variants[self.active].current(),
-            &CpuBackend,
+            self.backend.as_ref(),
         );
         self.status = match latent_export::save(&rendered, Path::new(&self.output)) {
             Ok(()) => format!("Exported to {}", self.output),
