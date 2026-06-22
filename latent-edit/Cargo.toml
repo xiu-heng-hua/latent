@@ -5,4 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-latent-image = { path = "../latent-image" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+ron = "0.12"
