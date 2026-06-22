@@ -1,7 +1,9 @@
 //! CPU rendering backend.
 
 use latent_image::ImageBuf;
+use latent_image::color::luminance;
 use latent_pipeline::{Backend, PointOp};
+use rayon::prelude::*;
 
 /// A rendering backend that runs every primitive on the CPU.
 ///
@@ -11,12 +13,30 @@ pub struct CpuBackend;
 
 impl Backend for CpuBackend {
     fn map_pixels(&self, img: &mut ImageBuf, op: &PointOp) {
-        // The operation is matched once, outside the per-pixel loop.
-        match *op {
+        // The operation is matched once, outside the per-pixel loop; each pixel
+        // depends only on its own value, so the work is data-parallel.
+        match op {
             PointOp::Gain(g) => {
-                for px in img.pixels_mut() {
-                    *px = [px[0] * g[0], px[1] * g[1], px[2] * g[2]];
-                }
+                let g = *g;
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .for_each(|px| *px = [px[0] * g[0], px[1] * g[1], px[2] * g[2]]);
+            }
+            PointOp::Tone(curve) => {
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .for_each(|px| *px = std::array::from_fn(|c| curve.apply_linear(px[c])));
+            }
+            PointOp::Saturation(amount) => {
+                let amount = *amount;
+                img.pixels_mut().par_iter_mut().for_each(|px| {
+                    let y = luminance(*px);
+                    // Clamp the result to ≥0: an over-saturation (amount > 1) can
+                    // push the weakest channel negative, which would otherwise twist
+                    // hue when later stages clamp it asymmetrically. Headroom (the
+                    // brightened channel) is left unbounded.
+                    *px = std::array::from_fn(|c| (y + amount * (px[c] - y)).max(0.0));
+                });
             }
         }
     }

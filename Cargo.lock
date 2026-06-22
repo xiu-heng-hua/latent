@@ -588,6 +588,7 @@ version = "0.1.0"
 dependencies = [
  "latent-image",
  "latent-pipeline",
+ "rayon",
 ]
 
 [[package]]

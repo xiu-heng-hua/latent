@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 latent-image = { path = "../latent-image" }
 latent-pipeline = { path = "../latent-pipeline" }
+rayon = "1"

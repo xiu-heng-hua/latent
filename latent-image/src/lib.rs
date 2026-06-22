@@ -1,6 +1,7 @@
 //! Linear-light image buffers and color math.
 
 pub mod color;
+pub mod tone;
 
 /// The image as it flows through the pipeline: always linear-light, f32 RGB.
 ///

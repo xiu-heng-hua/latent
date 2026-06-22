@@ -46,12 +46,36 @@ impl Default for LocalAdjustment {
 ///
 /// Each field is optional: `Some` means the adjustment is active with the given
 /// parameters, `None` means it is off. The empty (default) value is neutral and
-/// changes nothing. Fields are added here as adjustments are implemented; there
-/// is deliberately no ordering field, because the engine applies adjustments in
-/// a fixed order rather than the order they appear in.
+/// changes nothing. There is deliberately no ordering field, because the engine
+/// applies adjustments in a fixed order rather than the order they appear in.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Adjustments {
-    // Adjustment parameters are added here as they are implemented.
+    /// Editable white balance, on top of the as-shot balance applied at decode.
+    pub white_balance: Option<WhiteBalance>,
+    /// Exposure in stops (EV): a linear multiply by `2^stops`.
+    pub exposure: Option<f32>,
+    /// Tonal shaping across the contrast/highlights/shadows/blacks ranges.
+    pub tone: Option<SelectiveTone>,
+    /// Saturation factor: `0` is grayscale, `1` is unchanged, `> 1` is more.
+    pub saturation: Option<f32>,
+}
+
+/// Editable white balance as a temp/tint pair; both `0` is neutral. Positive
+/// `temp` warms (more red, less blue); positive `tint` shifts toward magenta.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct WhiteBalance {
+    pub temp: f32,
+    pub tint: f32,
+}
+
+/// Tonal shaping split across four ranges; all `0` is neutral. Each value is
+/// roughly `[-1, 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct SelectiveTone {
+    pub contrast: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub blacks: f32,
 }
 
 /// Framing and orientation of the rendered image: an optional crop and a
@@ -97,6 +121,7 @@ mod tests {
     fn default_settings_are_neutral() {
         let s = Settings::default();
         assert_eq!(s.global, Adjustments::default());
+        assert_eq!(s.global.exposure, None);
         assert!(s.locals.is_empty());
         assert!(s.geometry.is_identity());
     }
@@ -110,7 +135,20 @@ mod tests {
     #[test]
     fn populated_settings_round_trip() {
         let s = Settings {
-            global: Adjustments::default(),
+            global: Adjustments {
+                white_balance: Some(WhiteBalance {
+                    temp: 0.1,
+                    tint: -0.2,
+                }),
+                exposure: Some(0.5),
+                tone: Some(SelectiveTone {
+                    contrast: 0.2,
+                    highlights: 0.0,
+                    shadows: 0.1,
+                    blacks: 0.0,
+                }),
+                saturation: Some(1.2),
+            },
             locals: vec![LocalAdjustment {
                 adjustments: Adjustments::default(),
                 opacity: 0.5,
