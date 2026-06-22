@@ -72,11 +72,13 @@ impl Mask {
     }
 }
 
-/// One masking primitive. More shapes (radial, brush, …) are added over time.
+/// One masking primitive. More shapes (brush, …) are added over time.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MaskShape {
     /// A linear gradient.
     Gradient(Gradient),
+    /// A radial (elliptical) falloff.
+    Radial(Radial),
 }
 
 impl MaskShape {
@@ -84,6 +86,7 @@ impl MaskShape {
     pub fn weight_at(&self, px: f32, py: f32) -> f32 {
         match self {
             MaskShape::Gradient(g) => g.weight_at(px, py),
+            MaskShape::Radial(r) => r.weight_at(px, py),
         }
     }
 }
@@ -106,6 +109,28 @@ impl Gradient {
             return 0.0;
         }
         (((px - self.x0) * dx + (py - self.y0) * dy) / len2).clamp(0.0, 1.0)
+    }
+}
+
+/// A radial mask: weight `1` within `radius` of the center `(cx, cy)`, fading to
+/// `0` over `feather`, in normalized coordinates. (Distance is measured in
+/// normalized units, so the falloff is elliptical on non-square images.)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Radial {
+    pub cx: f32,
+    pub cy: f32,
+    pub radius: f32,
+    pub feather: f32,
+}
+
+impl Radial {
+    fn weight_at(&self, px: f32, py: f32) -> f32 {
+        let d = ((px - self.cx).powi(2) + (py - self.cy).powi(2)).sqrt();
+        if self.feather <= 0.0 {
+            if d <= self.radius { 1.0 } else { 0.0 }
+        } else {
+            (1.0 - (d - self.radius) / self.feather).clamp(0.0, 1.0)
+        }
     }
 }
 
@@ -282,6 +307,27 @@ mod tests {
         assert_eq!(mask.weight_at(1.0, 0.5), 1.0);
         assert_eq!(mask.weight_at(-0.3, 0.5), 0.0); // clamped before the band
         assert_eq!(mask.weight_at(1.3, 0.5), 1.0); // clamped after the band
+    }
+
+    #[test]
+    fn radial_is_full_at_center_and_zero_far_away() {
+        let mask = Mask {
+            shapes: vec![MaskShape::Radial(Radial {
+                cx: 0.5,
+                cy: 0.5,
+                radius: 0.2,
+                feather: 0.1,
+            })],
+            invert: false,
+        };
+        assert_eq!(mask.weight_at(0.5, 0.5), 1.0); // center: inside radius
+        assert_eq!(mask.weight_at(0.5, 0.3), 1.0); // distance 0.2 = the radius edge
+        assert_eq!(mask.weight_at(0.5, 0.05), 0.0); // distance 0.45 > radius + feather
+        let mid = mask.weight_at(0.5, 0.5 - 0.25); // within the feather band
+        assert!(
+            (0.0..=1.0).contains(&mid) && mid > 0.0 && mid < 1.0,
+            "{mid}"
+        );
     }
 
     #[test]

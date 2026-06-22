@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use latent_cpu::CpuBackend;
-use latent_edit::{Crop, Document, History, SelectiveTone, Settings, Sharpen, WhiteBalance};
+use latent_edit::{
+    Adjustments, Crop, Document, Gradient, History, LocalAdjustment, Mask, MaskShape, Radial,
+    SelectiveTone, Settings, Sharpen, WhiteBalance,
+};
 use latent_image::ImageBuf;
 use latent_pipeline::render;
 
@@ -51,6 +54,7 @@ pub fn run(input: &Path) -> Result<(), Box<dyn Error>> {
                 output,
                 status: String::new(),
                 texture: None,
+                local_sel: 0,
             }) as Box<dyn eframe::App>)
         }),
     )
@@ -76,6 +80,8 @@ struct App {
     output: String,
     status: String,
     texture: Option<egui::TextureHandle>,
+    /// Index of the local adjustment selected for editing in the panel.
+    local_sel: usize,
 }
 
 impl App {
@@ -229,6 +235,10 @@ impl eframe::App for App {
             ui.heading("Geometry");
             dirty |= straighten_slider(ui, &mut self.variants[active]);
             dirty |= crop_block(ui, &mut self.variants[active]);
+
+            ui.separator();
+            ui.heading("Local Adjustments");
+            dirty |= local_adjustments(ui, &mut self.variants[active], &mut self.local_sel);
 
             ui.separator();
             ui.heading("Export");
@@ -422,6 +432,198 @@ fn crop_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
         history.commit();
     }
     changed
+}
+
+/// A slider bound to a plain `f32` field of the active settings (begin/commit
+/// as one gesture, like [`opt_point_slider`] but for a non-optional value).
+fn value_slider(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    label: &str,
+    range: std::ops::RangeInclusive<f32>,
+    get: impl Fn(&Settings) -> f32,
+    set: impl Fn(&mut Settings, f32),
+) -> bool {
+    let mut value = get(history.current());
+    let r = ui.add(egui::Slider::new(&mut value, range).text(label));
+    let (begin, commit, changed) = gesture(&[&r]);
+    if begin {
+        history.begin();
+    }
+    if changed {
+        set(history.current_mut(), value);
+    }
+    if commit {
+        history.commit();
+    }
+    changed
+}
+
+/// The Local Adjustments panel: add/select/delete masked adjustments and edit
+/// the selected one. `sel` is the selected index (UI state). Returns whether
+/// the preview needs a redraw.
+fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &mut usize) -> bool {
+    let mut dirty = false;
+
+    ui.horizontal(|ui| {
+        if ui.button("+ Graduated").clicked() {
+            history.begin();
+            history.current_mut().locals.push(LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![MaskShape::Gradient(Gradient {
+                        x0: 0.5,
+                        y0: 0.0,
+                        x1: 0.5,
+                        y1: 1.0,
+                    })],
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            });
+            history.commit();
+            *sel = history.current().locals.len() - 1;
+            dirty = true;
+        }
+        if ui.button("+ Radial").clicked() {
+            history.begin();
+            history.current_mut().locals.push(LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![MaskShape::Radial(Radial {
+                        cx: 0.5,
+                        cy: 0.5,
+                        radius: 0.25,
+                        feather: 0.25,
+                    })],
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            });
+            history.commit();
+            *sel = history.current().locals.len() - 1;
+            dirty = true;
+        }
+    });
+
+    if history.current().locals.is_empty() {
+        ui.label("(none)");
+        return dirty;
+    }
+    *sel = (*sel).min(history.current().locals.len() - 1);
+
+    ui.horizontal(|ui| {
+        let count = history.current().locals.len();
+        for i in 0..count {
+            if ui
+                .selectable_label(i == *sel, format!("{}", i + 1))
+                .clicked()
+            {
+                *sel = i;
+            }
+        }
+        if ui.button("Delete").clicked() {
+            history.begin();
+            history.current_mut().locals.remove(*sel);
+            history.commit();
+            dirty = true;
+        }
+    });
+
+    if history.current().locals.is_empty() {
+        return dirty;
+    }
+    *sel = (*sel).min(history.current().locals.len() - 1);
+    let i = *sel;
+
+    dirty |= local_shape_block(ui, history, i);
+
+    let mut invert = history.current().locals[i].mask.invert;
+    if ui.checkbox(&mut invert, "Invert mask").changed() {
+        history.begin();
+        history.current_mut().locals[i].mask.invert = invert;
+        history.commit();
+        dirty = true;
+    }
+
+    dirty |= value_slider(
+        ui,
+        history,
+        "Opacity",
+        0.0..=1.0,
+        move |s| s.locals[i].opacity,
+        move |s, v| s.locals[i].opacity = v,
+    );
+    dirty |= opt_point_slider(
+        ui,
+        history,
+        "Exposure (EV)",
+        -5.0..=5.0,
+        0.0,
+        move |s| s.locals[i].adjustments.exposure,
+        move |s, v| s.locals[i].adjustments.exposure = v,
+    );
+    dirty |= opt_point_slider(
+        ui,
+        history,
+        "Saturation",
+        0.0..=2.0,
+        1.0,
+        move |s| s.locals[i].adjustments.saturation,
+        move |s, v| s.locals[i].adjustments.saturation = v,
+    );
+
+    dirty
+}
+
+/// Sliders for the selected local adjustment's first mask shape (gradient
+/// endpoints or radial center/radius/feather), in normalized coordinates.
+fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usize) -> bool {
+    match history.current().locals[i].mask.shapes.first().copied() {
+        Some(MaskShape::Gradient(g)) => {
+            let (mut x0, mut y0, mut x1, mut y1) = (g.x0, g.y0, g.x1, g.y1);
+            let r0 = ui.add(egui::Slider::new(&mut x0, 0.0..=1.0).text("From X"));
+            let r1 = ui.add(egui::Slider::new(&mut y0, 0.0..=1.0).text("From Y"));
+            let r2 = ui.add(egui::Slider::new(&mut x1, 0.0..=1.0).text("To X"));
+            let r3 = ui.add(egui::Slider::new(&mut y1, 0.0..=1.0).text("To Y"));
+            let (begin, commit, changed) = gesture(&[&r0, &r1, &r2, &r3]);
+            if begin {
+                history.begin();
+            }
+            if changed {
+                history.current_mut().locals[i].mask.shapes[0] =
+                    MaskShape::Gradient(Gradient { x0, y0, x1, y1 });
+            }
+            if commit {
+                history.commit();
+            }
+            changed
+        }
+        Some(MaskShape::Radial(r)) => {
+            let (mut cx, mut cy, mut radius, mut feather) = (r.cx, r.cy, r.radius, r.feather);
+            let r0 = ui.add(egui::Slider::new(&mut cx, 0.0..=1.0).text("Center X"));
+            let r1 = ui.add(egui::Slider::new(&mut cy, 0.0..=1.0).text("Center Y"));
+            let r2 = ui.add(egui::Slider::new(&mut radius, 0.0..=1.0).text("Radius"));
+            let r3 = ui.add(egui::Slider::new(&mut feather, 0.0..=1.0).text("Feather"));
+            let (begin, commit, changed) = gesture(&[&r0, &r1, &r2, &r3]);
+            if begin {
+                history.begin();
+            }
+            if changed {
+                history.current_mut().locals[i].mask.shapes[0] = MaskShape::Radial(Radial {
+                    cx,
+                    cy,
+                    radius,
+                    feather,
+                });
+            }
+            if commit {
+                history.commit();
+            }
+            changed
+        }
+        None => false,
+    }
 }
 
 /// Convert a linear working-RGB image to a gamma-encoded egui texture, using the
