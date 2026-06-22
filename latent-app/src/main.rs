@@ -1,5 +1,7 @@
 //! `latent` — command-line entry point.
 
+mod gui;
+
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -24,12 +26,17 @@ enum Command {
         /// Output image file (format chosen by extension, e.g. .jpg/.png/.tiff).
         output: PathBuf,
     },
+    /// Open a RAW file in the editor window.
+    Open {
+        /// Input RAW file.
+        input: PathBuf,
+    },
 }
 
-/// Decode and develop a RAW into a linear-sRGB working image (before the final
-/// gamma encode): normalize, white balance, demosaic, then the camera→working
-/// color transform.
-fn develop_to_image(input: &Path) -> Result<ImageBuf, Box<dyn Error>> {
+/// Decode and develop a RAW into a linear working image in SOURCE coordinates:
+/// normalize, white balance, demosaic, then the camera→working color transform.
+/// This is the base the pipeline renders adjustments and geometry over.
+pub fn develop_to_image(input: &Path) -> Result<ImageBuf, Box<dyn Error>> {
     let raw = latent_raw::unpack(input)?;
     let mut mosaic = raw.normalized();
     raw.apply_white_balance(&mut mosaic);
@@ -52,6 +59,7 @@ fn main() {
         Command::Develop { input, output } => {
             develop(&input, &output).map(|()| println!("wrote {}", output.display()))
         }
+        Command::Open { input } => gui::run(&input),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

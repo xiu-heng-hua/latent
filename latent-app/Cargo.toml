@@ -12,5 +12,9 @@ path = "src/main.rs"
 [dependencies]
 latent-image = { path = "../latent-image" }
 latent-raw = { path = "../latent-raw" }
+latent-edit = { path = "../latent-edit" }
+latent-pipeline = { path = "../latent-pipeline" }
+latent-cpu = { path = "../latent-cpu" }
 latent-export = { path = "../latent-export" }
 clap = { version = "4", features = ["derive"] }
+eframe = "0.32"

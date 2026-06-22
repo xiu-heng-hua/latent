@@ -2,9 +2,13 @@
 //!
 //! The whole edit state for one image is a [`Settings`] value. It is plain,
 //! serializable data: there is no execution order stored here — the engine
-//! applies the parts in a fixed order.
+//! applies the parts in a fixed order. A [`Document`] is what a sidecar stores:
+//! a schema version plus one or more variants of the same source.
 
 use serde::{Deserialize, Serialize};
+
+pub mod history;
+pub use history::History;
 
 /// The complete edit state for one image.
 ///
@@ -129,14 +133,44 @@ pub struct Crop {
     pub height: f32,
 }
 
+/// A saved edit document: a schema version plus one or more variants —
+/// independent edits of the same source image. This is what a sidecar stores.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Document {
+    /// Schema version, so the format can evolve compatibly.
+    pub version: u32,
+    /// One or more independent edits of the source; always at least one.
+    pub variants: Vec<Settings>,
+}
+
+impl Document {
+    /// Current sidecar schema version.
+    pub const VERSION: u32 = 1;
+
+    /// Serialize to a (pretty) RON string for the sidecar file.
+    pub fn to_ron(&self) -> Result<String, String> {
+        ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Parse from a RON string.
+    pub fn from_ron(text: &str) -> Result<Self, String> {
+        ron::from_str(text).map_err(|e| e.to_string())
+    }
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self {
+            version: Self::VERSION,
+            variants: vec![Settings::default()],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ron_round_trip(s: &Settings) -> Settings {
-        let text = ron::to_string(s).expect("serialize");
-        ron::from_str(&text).expect("deserialize")
-    }
 
     #[test]
     fn default_settings_are_neutral() {
@@ -149,14 +183,36 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_round_trip() {
-        let s = Settings::default();
-        assert_eq!(ron_round_trip(&s), s);
+    fn default_geometry_is_identity_and_a_change_is_not() {
+        assert!(Geometry::default().is_identity());
+        let tilted = Geometry {
+            crop: None,
+            straighten_degrees: 1.0,
+        };
+        assert!(!tilted.is_identity());
     }
 
     #[test]
-    fn populated_settings_round_trip() {
-        let s = Settings {
+    fn local_adjustment_defaults_to_full_opacity() {
+        assert!((LocalAdjustment::default().opacity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn default_document_has_one_neutral_variant() {
+        let d = Document::default();
+        assert_eq!(d.version, Document::VERSION);
+        assert_eq!(d.variants, vec![Settings::default()]);
+    }
+
+    #[test]
+    fn empty_document_round_trips() {
+        let d = Document::default();
+        assert_eq!(Document::from_ron(&d.to_ron().unwrap()).unwrap(), d);
+    }
+
+    #[test]
+    fn populated_document_round_trips() {
+        let edited = Settings {
             global: Adjustments {
                 white_balance: Some(WhiteBalance {
                     temp: 0.1,
@@ -189,29 +245,11 @@ mod tests {
                 straighten_degrees: 2.5,
             },
         };
-        assert_eq!(ron_round_trip(&s), s);
-    }
-
-    #[test]
-    fn empty_adjustments_round_trip() {
-        let a = Adjustments::default();
-        let text = ron::to_string(&a).expect("serialize");
-        let back: Adjustments = ron::from_str(&text).expect("deserialize");
-        assert_eq!(back, a);
-    }
-
-    #[test]
-    fn default_geometry_is_identity_and_a_change_is_not() {
-        assert!(Geometry::default().is_identity());
-        let tilted = Geometry {
-            crop: None,
-            straighten_degrees: 1.0,
+        // Two variants: a neutral one and the edited one.
+        let d = Document {
+            version: Document::VERSION,
+            variants: vec![Settings::default(), edited],
         };
-        assert!(!tilted.is_identity());
-    }
-
-    #[test]
-    fn local_adjustment_defaults_to_full_opacity() {
-        assert!((LocalAdjustment::default().opacity - 1.0).abs() < f32::EPSILON);
+        assert_eq!(Document::from_ron(&d.to_ron().unwrap()).unwrap(), d);
     }
 }
