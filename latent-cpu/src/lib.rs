@@ -1,8 +1,9 @@
 //! CPU rendering backend.
 
+use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::color::luminance;
-use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
+use latent_pipeline::{Backend, CombineKind, Extent, PointOp, Transform};
 use rayon::prelude::*;
 
 /// A rendering backend that runs every primitive on the CPU.
@@ -82,6 +83,34 @@ impl Backend for CpuBackend {
             });
         out
     }
+
+    fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32> {
+        // One weight per pixel, from the mask evaluated at the pixel's center in
+        // normalized coordinates. Pixels are independent → parallel.
+        let (w, h) = (extent.width, extent.height);
+        let (wf, hf) = (w as f32, h as f32);
+        let mut weights = vec![0.0_f32; (w as usize) * (h as usize)];
+        weights.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let x = (i as u32 % w) as f32;
+            let y = (i as u32 / w) as f32;
+            *out = mask.weight_at((x + 0.5) / wf, (y + 0.5) / hf);
+        });
+        weights
+    }
+
+    fn blend(&self, base: &mut ImageBuf, top: &ImageBuf, weights: &[f32], opacity: f32) {
+        // Lerp each pixel from base toward top by its mask weight × opacity.
+        base.pixels_mut()
+            .par_iter_mut()
+            .zip(top.pixels().par_iter())
+            .zip(weights.par_iter())
+            .for_each(|((b, t), &wt)| {
+                let a = (wt * opacity).clamp(0.0, 1.0);
+                for c in 0..3 {
+                    b[c] += a * (t[c] - b[c]);
+                }
+            });
+    }
 }
 
 /// One 1-D box-average pass, along columns (`vertical`) or rows. Each output
@@ -152,7 +181,7 @@ fn sample_bilinear(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_pipeline::Extent;
+    use latent_edit::{Gradient, MaskShape};
 
     #[test]
     fn map_pixels_identity_leaves_the_image_unchanged() {
@@ -280,5 +309,43 @@ mod tests {
             "center preserved, got {center:?}"
         );
         assert_eq!(out.get(0, 0), [0.0, 0.0, 0.0]); // corner outside source → black
+    }
+
+    #[test]
+    fn eval_mask_produces_a_weight_ramp() {
+        // Horizontal gradient over a 4x1 extent: weights increase left to right.
+        let mask = Mask {
+            shapes: vec![MaskShape::Gradient(Gradient {
+                x0: 0.0,
+                y0: 0.5,
+                x1: 1.0,
+                y1: 0.5,
+            })],
+            invert: false,
+        };
+        let w = CpuBackend.eval_mask(
+            &mask,
+            Extent {
+                width: 4,
+                height: 1,
+            },
+        );
+        assert_eq!(w.len(), 4);
+        assert!(w[0] < w[1] && w[1] < w[2] && w[2] < w[3], "ramp: {w:?}");
+        assert!(w.iter().all(|&v| (0.0..=1.0).contains(&v)));
+    }
+
+    #[test]
+    fn blend_lerps_by_weight_and_opacity() {
+        let mut base = ImageBuf::new(2, 1);
+        base.set(0, 0, [0.0, 0.0, 0.0]);
+        base.set(1, 0, [0.0, 0.0, 0.0]);
+        let mut top = ImageBuf::new(2, 1);
+        top.set(0, 0, [1.0, 1.0, 1.0]);
+        top.set(1, 0, [1.0, 1.0, 1.0]);
+        // weight 0 → unchanged; weight 1 at half opacity → halfway.
+        CpuBackend.blend(&mut base, &top, &[0.0, 1.0], 0.5);
+        assert_eq!(base.get(0, 0), [0.0, 0.0, 0.0]);
+        assert_eq!(base.get(1, 0), [0.5, 0.5, 0.5]);
     }
 }

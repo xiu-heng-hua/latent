@@ -31,7 +31,9 @@ pub struct Settings {
 /// local adjustment is the same kind of edit, scoped to part of the image.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalAdjustment {
-    /// The adjustments to apply where this one acts.
+    /// The region this adjustment acts on (in original-image coordinates).
+    pub mask: Mask,
+    /// The adjustments to apply where the mask is.
     pub adjustments: Adjustments,
     /// Blend strength in `[0, 1]`; `1.0` applies the adjustments fully.
     pub opacity: f32,
@@ -40,9 +42,70 @@ pub struct LocalAdjustment {
 impl Default for LocalAdjustment {
     fn default() -> Self {
         Self {
+            mask: Mask::default(),
             adjustments: Adjustments::default(),
             opacity: 1.0,
         }
+    }
+}
+
+/// The region of a local adjustment: one or more shapes combined (by taking the
+/// strongest weight), optionally inverted. Coordinates are normalized `[0, 1]`
+/// over the original image, so a mask is resolution-independent and lives in
+/// SOURCE space — it is evaluated before geometry, never reprojected.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Mask {
+    /// Shapes combined into the mask; empty means "selects nothing".
+    pub shapes: Vec<MaskShape>,
+    /// Apply to the complement of the shapes' region instead.
+    pub invert: bool,
+}
+
+impl Mask {
+    /// The mask weight in `[0, 1]` at a normalized point `(px, py)`.
+    pub fn weight_at(&self, px: f32, py: f32) -> f32 {
+        let mut w = 0.0;
+        for shape in &self.shapes {
+            w = f32::max(w, shape.weight_at(px, py));
+        }
+        if self.invert { 1.0 - w } else { w }
+    }
+}
+
+/// One masking primitive. More shapes (radial, brush, …) are added over time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MaskShape {
+    /// A linear gradient.
+    Gradient(Gradient),
+}
+
+impl MaskShape {
+    /// The shape's weight in `[0, 1]` at a normalized point.
+    pub fn weight_at(&self, px: f32, py: f32) -> f32 {
+        match self {
+            MaskShape::Gradient(g) => g.weight_at(px, py),
+        }
+    }
+}
+
+/// A linear gradient: weight ramps `0 → 1` from the line through `(x0, y0)` to
+/// the line through `(x1, y1)`, clamped flat outside that band. Normalized.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Gradient {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl Gradient {
+    fn weight_at(&self, px: f32, py: f32) -> f32 {
+        let (dx, dy) = (self.x1 - self.x0, self.y1 - self.y0);
+        let len2 = dx * dx + dy * dy;
+        if len2 <= 1e-12 {
+            return 0.0;
+        }
+        (((px - self.x0) * dx + (py - self.y0) * dy) / len2).clamp(0.0, 1.0)
     }
 }
 
@@ -198,6 +261,49 @@ mod tests {
     }
 
     #[test]
+    fn empty_mask_selects_nothing() {
+        assert_eq!(Mask::default().weight_at(0.5, 0.5), 0.0);
+    }
+
+    #[test]
+    fn gradient_ramps_from_zero_to_one_across_the_band() {
+        // Horizontal gradient: 0 at the left edge, 1 at the right edge.
+        let mask = Mask {
+            shapes: vec![MaskShape::Gradient(Gradient {
+                x0: 0.0,
+                y0: 0.5,
+                x1: 1.0,
+                y1: 0.5,
+            })],
+            invert: false,
+        };
+        assert_eq!(mask.weight_at(0.0, 0.5), 0.0);
+        assert!((mask.weight_at(0.5, 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(mask.weight_at(1.0, 0.5), 1.0);
+        assert_eq!(mask.weight_at(-0.3, 0.5), 0.0); // clamped before the band
+        assert_eq!(mask.weight_at(1.3, 0.5), 1.0); // clamped after the band
+    }
+
+    #[test]
+    fn invert_flips_the_weight() {
+        let g = MaskShape::Gradient(Gradient {
+            x0: 0.0,
+            y0: 0.5,
+            x1: 1.0,
+            y1: 0.5,
+        });
+        let normal = Mask {
+            shapes: vec![g],
+            invert: false,
+        };
+        let inverted = Mask {
+            shapes: vec![g],
+            invert: true,
+        };
+        assert!((normal.weight_at(0.25, 0.5) + inverted.weight_at(0.25, 0.5) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn default_document_has_one_neutral_variant() {
         let d = Document::default();
         assert_eq!(d.version, Document::VERSION);
@@ -232,6 +338,15 @@ mod tests {
                 }),
             },
             locals: vec![LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![MaskShape::Gradient(Gradient {
+                        x0: 0.0,
+                        y0: 0.5,
+                        x1: 1.0,
+                        y1: 0.5,
+                    })],
+                    invert: true,
+                },
                 adjustments: Adjustments::default(),
                 opacity: 0.5,
             }],

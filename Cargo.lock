@@ -1969,6 +1969,7 @@ dependencies = [
 name = "latent-cpu"
 version = "0.1.0"
 dependencies = [
+ "latent-edit",
  "latent-image",
  "latent-pipeline",
  "rayon",

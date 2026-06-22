@@ -6,7 +6,7 @@
 //! (SOURCE space), and geometry is the single later step that reframes it
 //! (SOURCE → OUTPUT).
 
-use latent_edit::{Adjustments, Crop, Geometry, LocalAdjustment, SelectiveTone, Settings};
+use latent_edit::{Adjustments, Crop, Geometry, LocalAdjustment, Mask, SelectiveTone, Settings};
 use latent_image::ImageBuf;
 use latent_image::tone::{self, ToneCurve};
 
@@ -124,6 +124,15 @@ pub trait Backend {
     /// Resample the image into a new one by inverse-mapping each output pixel
     /// through `transform` and sampling the source (bilinear).
     fn resample(&self, img: &ImageBuf, transform: &Transform) -> ImageBuf;
+
+    /// Evaluate a mask to a per-pixel weight buffer in `[0, 1]`, row-major,
+    /// sized to `extent` (SOURCE coordinates).
+    fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32>;
+
+    /// Blend `top` over `base` in place by `weights[p] * opacity`:
+    /// `base[p] = base[p] + weights[p]*opacity*(top[p] - base[p])`. The weight
+    /// buffer must match the image's pixel count.
+    fn blend(&self, base: &mut ImageBuf, top: &ImageBuf, weights: &[f32], opacity: f32);
 }
 
 /// Render a finished working image from a source image and its settings.
@@ -202,10 +211,20 @@ fn tone_curves(t: &SelectiveTone) -> Vec<ToneCurve> {
 
 /// Stage: local adjustments, applied in SOURCE space.
 ///
-/// Each local adjustment applies a set of adjustments through its mask, blended
-/// at its opacity. Masks are not implemented yet, so this returns the image
-/// unchanged.
-fn apply_locals(img: ImageBuf, _locals: &[LocalAdjustment], _backend: &dyn Backend) -> ImageBuf {
+/// Each local adjustment reuses the global lowering — its adjustments are
+/// applied to the whole image, then that result is blended back through the
+/// mask (weight × opacity). Reusing [`apply_global`] is the point: a local
+/// adjustment is the same edit as a global one, just scoped by a mask.
+fn apply_locals(mut img: ImageBuf, locals: &[LocalAdjustment], backend: &dyn Backend) -> ImageBuf {
+    let extent = Extent {
+        width: img.width(),
+        height: img.height(),
+    };
+    for local in locals {
+        let weights = backend.eval_mask(&local.mask, extent);
+        let adjusted = apply_global(img.clone(), &local.adjustments, backend);
+        backend.blend(&mut img, &adjusted, &weights, local.opacity);
+    }
     img
 }
 
@@ -244,7 +263,7 @@ fn crop_image(img: &ImageBuf, c: Crop) -> ImageBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::{Sharpen, WhiteBalance};
+    use latent_edit::{Gradient, MaskShape, Sharpen, WhiteBalance};
     use latent_image::color::luminance;
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
@@ -334,6 +353,32 @@ mod tests {
                 }
             }
             out
+        }
+
+        fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32> {
+            let (w, h) = (extent.width, extent.height);
+            let (wf, hf) = (w as f32, h as f32);
+            (0..w * h)
+                .map(|i| {
+                    let x = (i % w) as f32;
+                    let y = (i / w) as f32;
+                    mask.weight_at((x + 0.5) / wf, (y + 0.5) / hf)
+                })
+                .collect()
+        }
+
+        fn blend(&self, base: &mut ImageBuf, top: &ImageBuf, weights: &[f32], opacity: f32) {
+            for ((b, t), &wt) in base
+                .pixels_mut()
+                .iter_mut()
+                .zip(top.pixels().iter())
+                .zip(weights.iter())
+            {
+                let a = (wt * opacity).clamp(0.0, 1.0);
+                for c in 0..3 {
+                    b[c] += a * (t[c] - b[c]);
+                }
+            }
         }
     }
 
@@ -499,5 +544,45 @@ mod tests {
         let center = out.get(out.width() / 2, out.height() / 2);
         assert!((center[0] - 0.4).abs() < 1e-4, "center kept: {center:?}");
         assert_eq!(out.get(0, 0), [0.0, 0.0, 0.0]); // corner outside source → black
+    }
+
+    #[test]
+    fn masked_local_adjustment_affects_only_the_masked_side() {
+        // A flat gray, a horizontal gradient mask (0 left → 1 right), and a
+        // local +1 EV. The right side should brighten toward the adjusted value
+        // while the left stays near the original — and it reuses apply_global.
+        let mut src = ImageBuf::new(8, 1);
+        for x in 0..8 {
+            src.set(x, 0, [0.4, 0.4, 0.4]);
+        }
+        let local = LocalAdjustment {
+            mask: Mask {
+                shapes: vec![MaskShape::Gradient(Gradient {
+                    x0: 0.0,
+                    y0: 0.5,
+                    x1: 1.0,
+                    y1: 0.5,
+                })],
+                invert: false,
+            },
+            adjustments: Adjustments {
+                exposure: Some(1.0), // doubles → adjusted value 0.8
+                ..Adjustments::default()
+            },
+            opacity: 1.0,
+        };
+        let settings = Settings {
+            locals: vec![local],
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        let left = out.get(0, 0)[0];
+        let right = out.get(7, 0)[0];
+        assert!(
+            right > left,
+            "masked side brighter: left {left}, right {right}"
+        );
+        assert!(left < 0.5, "left near original 0.4: {left}");
+        assert!(right > 0.6, "right near adjusted 0.8: {right}");
     }
 }
