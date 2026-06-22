@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 latent-image = { path = "../latent-image" }
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
