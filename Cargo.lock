@@ -2050,6 +2050,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "latent-image",
+ "moxcms",
 ]
 
 [[package]]

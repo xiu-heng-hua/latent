@@ -16,11 +16,13 @@ pub const LUT_SIZE: usize = 256;
 pub const GAMMA: f32 = 2.2;
 
 fn tone_encode(linear: f32) -> f32 {
-    linear.clamp(0.0, 1.0).powf(1.0 / GAMMA)
+    // No upper clamp: values above 1.0 (highlight headroom) stay above 1.0 in the
+    // perceptual domain so the curve can shape them instead of crushing to white.
+    linear.max(0.0).powf(1.0 / GAMMA)
 }
 
 fn tone_decode(encoded: f32) -> f32 {
-    encoded.clamp(0.0, 1.0).powf(GAMMA)
+    encoded.max(0.0).powf(GAMMA)
 }
 
 /// A 1-D tone curve backed by a uniformly-sampled lookup table over `[0, 1]`.
@@ -48,6 +50,13 @@ impl ToneCurve {
     /// between the two nearest table entries.
     pub fn eval(&self, t: f32) -> f32 {
         let n = self.lut.len();
+        if t > 1.0 {
+            // Past the top, extrapolate with the curve's end slope rather than
+            // clamping — so highlight headroom (>1.0) is shaped, not flattened.
+            // For the identity curve the slope is 1, so values pass through.
+            let slope = (self.lut[n - 1] - self.lut[n - 2]) * (n - 1) as f32;
+            return self.lut[n - 1] + (t - 1.0) * slope;
+        }
         let pos = t.clamp(0.0, 1.0) * (n - 1) as f32;
         let i = pos.floor() as usize;
         if i >= n - 1 {
@@ -125,10 +134,37 @@ mod tests {
     }
 
     #[test]
-    fn eval_clamps_out_of_range_inputs() {
+    fn eval_clamps_lows_but_extrapolates_highlights() {
         let c = ToneCurve::from_fn(|t| t);
-        assert_eq!(c.eval(-1.0), 0.0);
-        assert_eq!(c.eval(2.0), 1.0);
+        assert_eq!(c.eval(-1.0), 0.0); // below 0 still clamps to the floor
+        // Above 1.0 the identity curve passes through (end slope 1), so headroom
+        // is preserved rather than crushed to the top entry.
+        assert!(
+            (c.eval(2.0) - 2.0).abs() < 1e-3,
+            "headroom: {}",
+            c.eval(2.0)
+        );
+    }
+
+    #[test]
+    fn apply_linear_preserves_headroom_and_stays_monotonic() {
+        // Identity leaves a >1.0 highlight essentially unchanged (round-trips).
+        let id = ToneCurve::identity();
+        assert!(
+            (id.apply_linear(1.5) - 1.5).abs() < 1e-3,
+            "{}",
+            id.apply_linear(1.5)
+        );
+        // A real curve still maps a rising highlight ramp to a rising output
+        // (gradient kept, no flat-white plateau).
+        let c = contrast(0.6);
+        let ramp: Vec<f32> = [1.0, 1.3, 1.7, 2.5]
+            .iter()
+            .map(|&x| c.apply_linear(x))
+            .collect();
+        for w in ramp.windows(2) {
+            assert!(w[1] > w[0], "highlight ramp not increasing: {ramp:?}");
+        }
     }
 
     #[test]

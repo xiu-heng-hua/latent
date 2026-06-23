@@ -55,17 +55,19 @@ fn select_backend(use_gpu: bool) -> Box<dyn Backend> {
 }
 
 /// Decode and develop a RAW into a linear working image in SOURCE coordinates:
-/// normalize, white balance, demosaic, then the camera→working color transform.
-/// This is the base the pipeline renders adjustments and geometry over.
+/// normalize, white balance, demosaic, reconstruct blown highlights, then the
+/// camera→working color transform. This is the base the pipeline renders
+/// adjustments and geometry over.
 pub fn develop_to_image(input: &Path) -> Result<ImageBuf, Box<dyn Error>> {
     let raw = latent_raw::unpack(input)?;
     let mut mosaic = raw.normalized();
     raw.apply_white_balance(&mut mosaic);
-    let camera_rgb = raw.demosaic_mhc(&mosaic);
-    let to_srgb = raw
+    let mut camera_rgb = raw.demosaic_mhc(&mosaic);
+    raw.reconstruct_highlights(&mut camera_rgb);
+    let to_working = raw
         .color_matrix()
         .ok_or("camera color matrix is singular")?;
-    Ok(color::apply_matrix(&camera_rgb, &to_srgb))
+    Ok(color::apply_matrix(&camera_rgb, &to_working))
 }
 
 fn develop(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {

@@ -21,24 +21,34 @@ struct Params {
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var<storage, read> lut: array<f32>;
 
-const LUMA = vec3<f32>(0.2126, 0.7152, 0.0722);
+// Working-space (ProPhoto primaries, D65) luma weights — must match
+// latent_image::color::LUMA_WEIGHTS exactly (saturation equivalence relies on it).
+const LUMA = vec3<f32>(0.27881965, 0.72106725, 0.000113055);
 const LUT_LAST: u32 = 255u;
 
 // Apply the tone curve to one channel: encode to the perceptual domain, look up
 // (linearly interpolated) in the uploaded LUT, then decode back to linear —
 // matching `ToneCurve::apply_linear` + `eval` on the CPU.
 fn tone_channel(x: f32, gamma: f32) -> f32 {
-    let e = pow(clamp(x, 0.0, 1.0), 1.0 / gamma);
-    let pos = clamp(e, 0.0, 1.0) * f32(LUT_LAST);
-    let i = u32(floor(pos));
+    // Mirror ToneCurve::{apply_linear, eval} including the M4 highlight handling:
+    // no clamp at 1.0, and extrapolate past the LUT with its end slope so
+    // headroom (>1.0) is shaped, not crushed.
+    let e = pow(max(x, 0.0), 1.0 / gamma);
     var v: f32;
-    if i >= LUT_LAST {
-        v = lut[LUT_LAST];
+    if e > 1.0 {
+        let slope = (lut[LUT_LAST] - lut[LUT_LAST - 1u]) * f32(LUT_LAST);
+        v = lut[LUT_LAST] + (e - 1.0) * slope;
     } else {
-        let frac = pos - floor(pos);
-        v = lut[i] * (1.0 - frac) + lut[i + 1u] * frac;
+        let pos = clamp(e, 0.0, 1.0) * f32(LUT_LAST);
+        let i = u32(floor(pos));
+        if i >= LUT_LAST {
+            v = lut[LUT_LAST];
+        } else {
+            let frac = pos - floor(pos);
+            v = lut[i] * (1.0 - frac) + lut[i + 1u] * frac;
+        }
     }
-    return pow(clamp(v, 0.0, 1.0), gamma);
+    return pow(max(v, 0.0), gamma);
 }
 
 @compute @workgroup_size(64)

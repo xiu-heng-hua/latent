@@ -97,21 +97,88 @@ pub fn xyz_to_linear_srgb(xyz: [f32; 3]) -> [f32; 3] {
     XYZ_TO_LINEAR_SRGB.mul_vec(xyz)
 }
 
-/// Build the combined **camera → linear sRGB** matrix from the file's
+/// Build the linear-RGB → XYZ matrix for an RGB space from its primary
+/// chromaticities `[r, g, b]` (each `[x, y]`) and white point `[x, y]`.
+///
+/// Standard construction (SMPTE RP 177): take each primary's XYZ at unit
+/// luminance as a column, then scale the columns so unit RGB reproduces the
+/// white point. Deriving the matrix from published chromaticities keeps the
+/// numbers verifiable (white → neutral, round-trips) rather than transcribed.
+fn rgb_to_xyz(primaries: [[f32; 2]; 3], white: [f32; 2]) -> Mat3 {
+    let to_xyz = |c: [f32; 2]| [c[0] / c[1], 1.0, (1.0 - c[0] - c[1]) / c[1]];
+    let (r, g, b) = (
+        to_xyz(primaries[0]),
+        to_xyz(primaries[1]),
+        to_xyz(primaries[2]),
+    );
+    let basis = Mat3([[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]]);
+    let s = basis
+        .inverse()
+        .expect("primaries are linearly independent")
+        .mul_vec(to_xyz(white));
+    // Scale column `c` of the basis by `s[c]`.
+    Mat3(std::array::from_fn(|row| {
+        std::array::from_fn(|col| basis.0[row][col] * s[col])
+    }))
+}
+
+/// ProPhoto / ROMM RGB primaries (ISO 22028-2) — the wide working gamut.
+const PROPHOTO_PRIMARIES: [[f32; 2]; 3] = [[0.7347, 0.2653], [0.1596, 0.8404], [0.0366, 0.0001]];
+/// CIE D65 white point `(x, y)`.
+const D65_WHITE: [f32; 2] = [0.3127, 0.3290];
+
+/// The working space: **linear ProPhoto primaries at D65**. ProPhoto's wide
+/// gamut means saturated camera colors stay in-gamut; pinning it to D65 (rather
+/// than ProPhoto's nominal D50) matches the camera matrix and the sRGB output,
+/// so no chromatic adaptation is needed anywhere in the pipeline.
+pub fn linear_working_to_xyz() -> Mat3 {
+    rgb_to_xyz(PROPHOTO_PRIMARIES, D65_WHITE)
+}
+
+/// XYZ → linear working RGB.
+pub fn xyz_to_linear_working() -> Mat3 {
+    linear_working_to_xyz()
+        .inverse()
+        .expect("working primaries are non-singular")
+}
+
+/// Linear working RGB → linear sRGB, for the output transform at export.
+///
+/// Row-normalized so a neutral working gray maps to an *exactly* neutral sRGB
+/// gray: the working matrix is derived from chromaticities but
+/// [`XYZ_TO_LINEAR_SRGB`] is the published 4-decimal constant, so their product's
+/// rows sum to `1 ± ~1e-4` — a sub-8-bit drift that is ~10 LSB at 16-bit.
+/// Pinning neutral removes that tint; chromatic colors shift by the same ~1e-4.
+pub fn linear_working_to_linear_srgb() -> Mat3 {
+    XYZ_TO_LINEAR_SRGB
+        .mul(&linear_working_to_xyz())
+        .row_normalized()
+}
+
+/// Build the combined **camera → linear working** matrix from the file's
 /// XYZ→camera matrix, ready to apply to white-balanced camera RGB.
 ///
-/// Composes camera→XYZ→sRGB, then row-normalizes so each row sums to 1. White
+/// Composes camera→XYZ→working, then row-normalizes so each row sums to 1. White
 /// balance is already applied once on the mosaic; the row-normalization stops
 /// this matrix from re-applying its own implicit white balance (the classic
 /// double-apply bug). The net effect: a neutral input stays neutral, and the
 /// matrix only rotates color. Returns `None` if the input is singular.
-pub fn camera_to_linear_srgb(xyz_to_cam: Mat3) -> Option<Mat3> {
+pub fn camera_to_working(xyz_to_cam: Mat3) -> Option<Mat3> {
     let cam_to_xyz = camera_to_xyz(xyz_to_cam)?;
-    Some(XYZ_TO_LINEAR_SRGB.mul(&cam_to_xyz).row_normalized())
+    Some(xyz_to_linear_working().mul(&cam_to_xyz).row_normalized())
 }
 
-/// Relative-luminance weights for linear RGB (ITU-R BT.709, sRGB primaries).
-pub const LUMA_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
+/// Relative-luminance weights for the linear **working** space (the Y row of
+/// [`linear_working_to_xyz`]: ProPhoto primaries at D65). Cross-checked against
+/// that matrix in the tests. The GPU shader (`map_pixels.wgsl`) hard-codes the
+/// same values for its saturation path — keep the two in sync (the GPU/CPU
+/// render-equivalence test guards against drift).
+///
+/// Note the near-zero blue weight (~0.0001): in these wide primaries blue carries
+/// almost no luminance, which is colorimetrically correct but means a fully
+/// desaturated pure-blue maps to near-black — by design, not a bug (it would be
+/// ~0.07 under Rec. 709/sRGB primaries).
+pub const LUMA_WEIGHTS: [f32; 3] = [0.27881965, 0.72106725, 0.000113055];
 
 /// Relative luminance of a linear-light RGB pixel — its perceived brightness.
 pub fn luminance(rgb: [f32; 3]) -> f32 {
@@ -191,10 +258,10 @@ mod tests {
     }
 
     #[test]
-    fn camera_to_srgb_keeps_a_neutral_patch_neutral() {
+    fn camera_to_working_keeps_a_neutral_patch_neutral() {
         // Arbitrary non-singular stand-in for a real XYZ→camera matrix.
         let xyz_to_cam = Mat3([[1.4, -0.3, -0.1], [-0.5, 1.6, -0.1], [0.0, -0.4, 1.5]]);
-        let m = camera_to_linear_srgb(xyz_to_cam).expect("invertible");
+        let m = camera_to_working(xyz_to_cam).expect("invertible");
 
         // After white balance the mosaic, a neutral patch is camera RGB [v,v,v];
         // the matrix must keep it neutral (WB applied exactly once, not twice).
@@ -204,6 +271,52 @@ mod tests {
             assert!((out[1] - v).abs() < 1e-5, "G drifted: {out:?}");
             assert!((out[2] - v).abs() < 1e-5, "B drifted: {out:?}");
         }
+    }
+
+    #[test]
+    fn working_space_white_is_neutral_and_round_trips() {
+        // Unit working RGB must be the D65 white in XYZ, and XYZ→working→XYZ
+        // must round-trip (so the derived primaries matrix is self-consistent).
+        let to_xyz = linear_working_to_xyz();
+        let white_xyz = to_xyz.mul_vec([1.0, 1.0, 1.0]);
+        let d65 = [0.3127 / 0.3290, 1.0, (1.0 - 0.3127 - 0.3290) / 0.3290];
+        for c in 0..3 {
+            assert!((white_xyz[c] - d65[c]).abs() < 1e-4, "white: {white_xyz:?}");
+        }
+        let back = xyz_to_linear_working().mul(&to_xyz);
+        assert!(
+            approx_eq(&back, &Mat3::IDENTITY, 1e-5),
+            "round-trip: {back:?}"
+        );
+    }
+
+    #[test]
+    fn working_to_srgb_keeps_neutral_neutral() {
+        // The output transform must leave a neutral gray neutral (both spaces D65).
+        let m = linear_working_to_linear_srgb();
+        for v in [0.25_f32, 0.5, 1.0] {
+            let out = m.mul_vec([v, v, v]);
+            for c in out {
+                // ~1e-3 tolerance: the published 4-decimal XYZ→sRGB const isn't
+                // perfectly consistent with the derived working matrix (drift
+                // ≈ 0.04 of an 8-bit level — sub-quantization).
+                assert!((c - v).abs() < 1e-3, "neutral drifted: {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn luma_weights_match_the_working_matrix() {
+        // LUMA_WEIGHTS is the Y (second) row of the working RGB→XYZ matrix; this
+        // catches any transcription error in the const.
+        let y_row = linear_working_to_xyz().0[1];
+        for c in 0..3 {
+            assert!(
+                (LUMA_WEIGHTS[c] - y_row[c]).abs() < 1e-4,
+                "LUMA_WEIGHTS{LUMA_WEIGHTS:?} vs Y row {y_row:?}"
+            );
+        }
+        assert!((LUMA_WEIGHTS.iter().sum::<f32>() - 1.0).abs() < 1e-4);
     }
 
     #[test]

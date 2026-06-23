@@ -603,6 +603,28 @@ mod tests {
     }
 
     #[test]
+    fn map_pixels_tone_above_one_matches_cpu() {
+        let gpu = gpu_or_skip!();
+        // Headroom regression guard. The tone path extrapolates past 1.0 using the
+        // LUT's end slope; a [0,1) ramp never exercises that branch, so feed
+        // explicit >1.0 values. A CPU/GPU divergence in highlight handling (the
+        // kind that has slipped through before) surfaces here at a tight tolerance,
+        // not just diluted through the looser end-to-end render test.
+        let mut src = ImageBuf::new(8, 1);
+        for (i, px) in src.pixels_mut().iter_mut().enumerate() {
+            let v = 1.0 + i as f32 * 0.5; // 1.0, 1.5, …, 4.5 — all above white
+            *px = [v, v + 0.5, v + 1.0];
+        }
+        let op = PointOp::Tone(tone::contrast(0.6));
+        let mut on_gpu = src.clone();
+        gpu.map_pixels(&mut on_gpu, &op);
+        let mut on_cpu = src.clone();
+        CpuBackend.map_pixels(&mut on_cpu, &op);
+        let diff = max_abs_diff(&on_gpu, &on_cpu);
+        assert!(diff <= 1e-3, "tone >1.0 diverged from CPU by {diff}");
+    }
+
+    #[test]
     fn map_pixels_saturation_matches_cpu() {
         let gpu = gpu_or_skip!();
         assert_map_matches(&gpu, PointOp::Saturation(1.6), 1e-5);

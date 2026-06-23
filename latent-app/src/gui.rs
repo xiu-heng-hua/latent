@@ -629,16 +629,10 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
 }
 
 /// Convert a linear working-RGB image to a gamma-encoded egui texture, using the
-/// same sRGB encoding as export so the preview matches the saved file.
+/// exact output transform export uses ([`latent_export::to_srgb8`] — working→sRGB
+/// matrix, highlight rolloff, sRGB OETF) so the preview matches the saved file.
 fn to_color_image(img: &ImageBuf) -> egui::ColorImage {
-    let mut bytes = Vec::with_capacity(img.len() * 3);
-    for y in 0..img.height() {
-        for x in 0..img.width() {
-            for v in img.get(x, y) {
-                bytes.push((latent_export::srgb_encode(v).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-            }
-        }
-    }
+    let bytes = latent_export::to_srgb8(img);
     egui::ColorImage::from_rgb([img.width() as usize, img.height() as usize], &bytes)
 }
 
@@ -647,14 +641,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_color_image_gamma_encodes_pixels() {
-        let mut img = ImageBuf::new(2, 1);
-        img.set(0, 0, [0.0, 0.0, 0.0]);
-        img.set(1, 0, [1.0, 1.0, 1.0]);
+    fn to_color_image_matches_the_export_transform() {
+        // The preview must go through the same output transform as a saved file
+        // (working→sRGB matrix + highlight rolloff + sRGB OETF). Neutrals stay
+        // neutral, so the values match the export tests: 0.5 → 188, and display
+        // white 1.0 rolls off to 254 (not a bare 255).
+        let mut img = ImageBuf::new(3, 1);
+        img.set(0, 0, [0.0, 0.0, 0.0]); // black
+        img.set(1, 0, [0.5, 0.5, 0.5]); // mid-gray (below the knee, faithful)
+        img.set(2, 0, [1.0, 1.0, 1.0]); // display white (rolled off)
 
         let ci = to_color_image(&img);
-        assert_eq!(ci.size, [2, 1]);
+        assert_eq!(ci.size, [3, 1]);
         assert_eq!(ci.pixels[0], egui::Color32::from_rgb(0, 0, 0));
-        assert_eq!(ci.pixels[1], egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(ci.pixels[1], egui::Color32::from_rgb(188, 188, 188));
+        assert_eq!(ci.pixels[2], egui::Color32::from_rgb(254, 254, 254));
     }
 }

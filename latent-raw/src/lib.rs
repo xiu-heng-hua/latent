@@ -351,17 +351,71 @@ impl RawImage {
         img
     }
 
-    /// The camera → linear-sRGB color matrix built from this file's metadata.
+    /// Which RGB channels at `(x, y)` were reconstructed from a *saturated*
+    /// photosite, per the exact raw clip mask. The known (center) channel is exact
+    /// — clipped iff its own photosite saturated; an interpolated channel is
+    /// treated as clipped if any same-color photosite in the 3x3 neighborhood
+    /// saturated, mirroring how demosaic draws that channel from those samples.
+    fn clipped_channels(&self, x: usize, y: usize, mask: &[bool]) -> [bool; 3] {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let center_ch = self.channel_at(x, y);
+        let mut clipped = [false; 3];
+        clipped[center_ch] = mask[y * w + x];
+        for dy in -1_i32..=1 {
+            for dx in -1_i32..=1 {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    continue;
+                }
+                let (nx, ny) = (nx as usize, ny as usize);
+                let ch = self.channel_at(nx, ny);
+                if ch != center_ch && mask[ny * w + nx] {
+                    clipped[ch] = true;
+                }
+            }
+        }
+        clipped
+    }
+
+    /// Reconstruct blown highlights in white-balanced camera RGB (post-demosaic,
+    /// before the color matrix).
+    ///
+    /// At the sensor every channel clips at the same white level; white balance
+    /// then scales each channel by its CFA gain, so a neutral highlight that
+    /// saturated the sensor lands *colored* (typically pink/magenta) because the
+    /// boosted channels were capped at different heights. Using the exact raw clip
+    /// mask (not a post-demosaic value threshold), where two or more channels are
+    /// blown the blown channels are rebuilt up to the pixel's brightest channel —
+    /// but any channel that was actually *measured* is kept, so a genuinely
+    /// saturated color (a single blown channel) survives intact instead of being
+    /// flattened to neutral. Finer color propagation can come later.
+    pub fn reconstruct_highlights(&self, img: &mut ImageBuf) {
+        let mask = self.clip_mask();
+        let (w, h) = (self.width as usize, self.height as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let clipped = self.clipped_channels(x, y, &mask);
+                if clipped.iter().filter(|&&c| c).count() >= 2 {
+                    let px = img.get(x as u32, y as u32);
+                    let peak = px[0].max(px[1]).max(px[2]);
+                    let rebuilt = std::array::from_fn(|c| if clipped[c] { peak } else { px[c] });
+                    img.set(x as u32, y as u32, rebuilt);
+                }
+            }
+        }
+    }
+
+    /// The camera → linear-working color matrix built from this file's metadata.
     ///
     /// `cam_xyz` is the XYZ → camera matrix (its first three rows form the 3x3
-    /// used here); composing its inverse with XYZ → sRGB lifts demosaiced camera
-    /// RGB into the working space. White balance is already applied once on the
-    /// mosaic, so the result is row-normalized to keep a neutral input neutral
+    /// used here); composing its inverse with XYZ → working lifts demosaiced
+    /// camera RGB into the working space. White balance is already applied once on
+    /// the mosaic, so the result is row-normalized to keep a neutral input neutral
     /// (no double white-balance). Returns `None` if the matrix is singular.
     pub fn color_matrix(&self) -> Option<Mat3> {
         let x = self.meta.cam_xyz;
         let xyz_to_cam = Mat3([x[0], x[1], x[2]]);
-        color::camera_to_linear_srgb(xyz_to_cam)
+        color::camera_to_working(xyz_to_cam)
     }
 }
 
@@ -565,6 +619,45 @@ mod tests {
                 assert!((c - v).abs() < 1e-5, "drifted from neutral: {out:?}");
             }
         }
+    }
+
+    #[test]
+    fn reconstruct_highlights_rebuilds_blown_channels_keeping_measured_ones() {
+        // 2x2 RGGB. WB gains R=2.0, G=1.0, B=1.5; clip detection uses the exact raw
+        // mask, not post-demosaic values.
+        let mut raw = RawImage {
+            width: 2,
+            height: 2,
+            mosaic: vec![16383; 4], // every photosite saturated → every channel clipped
+            meta: Metadata {
+                black: 0,
+                cblack: [0; 4],
+                white: 16383,
+                cam_mul: [2.0, 1.0, 1.5, 1.0],
+                cfa: [0, 1, 1, 2],
+                cdesc: *b"RGBG",
+                cam_xyz: [[0.0; 3]; 4],
+            },
+        };
+        // A neutral highlight that blew the sensor demosaics to a colored cast.
+        let mut img = ImageBuf::new(2, 2);
+        for p in img.pixels_mut() {
+            *p = [2.0, 1.0, 1.5];
+        }
+        raw.reconstruct_highlights(&mut img);
+        // All three channels blown → rebuilt neutral at the peak (2.0).
+        assert_eq!(img.get(0, 0), [2.0, 2.0, 2.0]);
+
+        // Now only the red photosites saturate; green/blue are measured fine, so a
+        // genuine red highlight (one blown channel) must be kept exactly.
+        raw.mosaic = vec![16383, 8000, 8000, 8000];
+        let mut img = ImageBuf::new(2, 2);
+        img.set(0, 0, [2.0, 0.3, 0.4]); // R site: only red clipped
+        img.set(1, 0, [0.4, 0.4, 0.4]);
+        img.set(0, 1, [0.4, 0.4, 0.4]);
+        img.set(1, 1, [0.4, 0.4, 0.4]);
+        raw.reconstruct_highlights(&mut img);
+        assert_eq!(img.get(0, 0), [2.0, 0.3, 0.4]); // single blown channel → untouched
     }
 
     /// A sensor of the given size and CFA pattern, with no pixel data (callers

@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 latent-image = { path = "../latent-image" }
 image = "0.25"
+moxcms = "0.8.1"
