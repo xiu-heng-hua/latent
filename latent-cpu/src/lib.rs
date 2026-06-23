@@ -3,7 +3,7 @@
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::color::luminance;
-use latent_pipeline::{Backend, CombineKind, Extent, PointOp, Transform};
+use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
 use rayon::prelude::*;
 
 /// A rendering backend that runs every primitive on the CPU.
@@ -84,16 +84,18 @@ impl Backend for CpuBackend {
         out
     }
 
-    fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32> {
+    fn eval_mask(&self, mask: &Mask, source: &ImageBuf) -> Vec<f32> {
         // One weight per pixel, from the mask evaluated at the pixel's center in
-        // normalized coordinates. Pixels are independent → parallel.
-        let (w, h) = (extent.width, extent.height);
+        // normalized coordinates and the source pixel there (for value-driven
+        // shapes). Pixels are independent → parallel.
+        let (w, h) = (source.width(), source.height());
         let (wf, hf) = (w as f32, h as f32);
+        let pixels = source.pixels();
         let mut weights = vec![0.0_f32; (w as usize) * (h as usize)];
         weights.par_iter_mut().enumerate().for_each(|(i, out)| {
             let x = (i as u32 % w) as f32;
             let y = (i as u32 / w) as f32;
-            *out = mask.weight_at((x + 0.5) / wf, (y + 0.5) / hf);
+            *out = mask.weight_at((x + 0.5) / wf, (y + 0.5) / hf, pixels[i]);
         });
         weights
     }
@@ -182,6 +184,7 @@ fn sample_bilinear(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
 mod tests {
     use super::*;
     use latent_edit::{Gradient, MaskShape};
+    use latent_pipeline::Extent;
 
     #[test]
     fn map_pixels_identity_leaves_the_image_unchanged() {
@@ -313,7 +316,8 @@ mod tests {
 
     #[test]
     fn eval_mask_produces_a_weight_ramp() {
-        // Horizontal gradient over a 4x1 extent: weights increase left to right.
+        // Horizontal gradient over a 4x1 source: weights increase left to right.
+        // The gradient is position-only, so the source pixels' values don't matter.
         let mask = Mask {
             shapes: vec![MaskShape::Gradient(Gradient {
                 x0: 0.0,
@@ -323,13 +327,7 @@ mod tests {
             })],
             invert: false,
         };
-        let w = CpuBackend.eval_mask(
-            &mask,
-            Extent {
-                width: 4,
-                height: 1,
-            },
-        );
+        let w = CpuBackend.eval_mask(&mask, &ImageBuf::new(4, 1));
         assert_eq!(w.len(), 4);
         assert!(w[0] < w[1] && w[1] < w[2] && w[2] < w[3], "ramp: {w:?}");
         assert!(w.iter().all(|&v| (0.0..=1.0).contains(&v)));

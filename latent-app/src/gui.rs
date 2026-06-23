@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use latent_edit::{
-    Adjustments, Crop, Document, Gradient, History, LocalAdjustment, Mask, MaskShape, Radial,
-    SelectiveTone, Settings, Sharpen, WhiteBalance,
+    Adjustments, ColorRange, Crop, Document, Gradient, History, LocalAdjustment, LuminanceRange,
+    Mask, MaskShape, Radial, SelectiveTone, Settings, Sharpen, WhiteBalance,
 };
 use latent_image::ImageBuf;
 use latent_pipeline::{Backend, render};
@@ -506,6 +506,45 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
             *sel = history.current().locals.len() - 1;
             dirty = true;
         }
+        if ui.button("+ Luminosity").clicked() {
+            history.begin();
+            history.current_mut().locals.push(LocalAdjustment {
+                mask: Mask {
+                    // Defaults to the shadows; drag the range to retarget.
+                    shapes: vec![MaskShape::Luminosity(LuminanceRange {
+                        lo: 0.0,
+                        hi: 0.3,
+                        feather: 0.1,
+                    })],
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            });
+            history.commit();
+            *sel = history.current().locals.len() - 1;
+            dirty = true;
+        }
+        if ui.button("+ Color").clicked() {
+            history.begin();
+            history.current_mut().locals.push(LocalAdjustment {
+                mask: Mask {
+                    // Defaults to reds; drag the hue to retarget.
+                    shapes: vec![MaskShape::ColorRange(ColorRange {
+                        hue: 0.0,
+                        hue_width: 0.08,
+                        sat_min: 0.15,
+                        feather: 0.08,
+                    })],
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            });
+            history.commit();
+            *sel = history.current().locals.len() - 1;
+            dirty = true;
+        }
     });
 
     if history.current().locals.is_empty() {
@@ -618,6 +657,49 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     radius,
                     feather,
                 });
+            }
+            if commit {
+                history.commit();
+            }
+            changed
+        }
+        Some(MaskShape::Luminosity(l)) => {
+            let (mut lo, mut hi, mut feather) = (l.lo, l.hi, l.feather);
+            let r0 = ui.add(egui::Slider::new(&mut lo, 0.0..=1.0).text("Range low"));
+            let r1 = ui.add(egui::Slider::new(&mut hi, 0.0..=1.0).text("Range high"));
+            let r2 = ui.add(egui::Slider::new(&mut feather, 0.0..=0.5).text("Feather"));
+            let (begin, commit, changed) = gesture(&[&r0, &r1, &r2]);
+            if begin {
+                history.begin();
+            }
+            if changed {
+                history.current_mut().locals[i].mask.shapes[0] =
+                    MaskShape::Luminosity(LuminanceRange { lo, hi, feather });
+            }
+            if commit {
+                history.commit();
+            }
+            changed
+        }
+        Some(MaskShape::ColorRange(c)) => {
+            let (mut hue, mut hue_width, mut sat_min, mut feather) =
+                (c.hue, c.hue_width, c.sat_min, c.feather);
+            let r0 = ui.add(egui::Slider::new(&mut hue, 0.0..=1.0).text("Hue"));
+            let r1 = ui.add(egui::Slider::new(&mut hue_width, 0.0..=0.5).text("Hue width"));
+            let r2 = ui.add(egui::Slider::new(&mut sat_min, 0.0..=1.0).text("Min saturation"));
+            let r3 = ui.add(egui::Slider::new(&mut feather, 0.0..=0.5).text("Feather"));
+            let (begin, commit, changed) = gesture(&[&r0, &r1, &r2, &r3]);
+            if begin {
+                history.begin();
+            }
+            if changed {
+                history.current_mut().locals[i].mask.shapes[0] =
+                    MaskShape::ColorRange(ColorRange {
+                        hue,
+                        hue_width,
+                        sat_min,
+                        feather,
+                    });
             }
             if commit {
                 history.commit();

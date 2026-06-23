@@ -17,6 +17,7 @@ pub use history::History;
 /// applied to the result. The default value is neutral — it develops the image
 /// without changing it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     /// The global adjustments, applied to the whole image.
     pub global: Adjustments,
@@ -30,6 +31,7 @@ pub struct Settings {
 /// given opacity. The same `Adjustments` type is used here as globally — a
 /// local adjustment is the same kind of edit, scoped to part of the image.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LocalAdjustment {
     /// The region this adjustment acts on (in original-image coordinates).
     pub mask: Mask,
@@ -54,6 +56,7 @@ impl Default for LocalAdjustment {
 /// over the original image, so a mask is resolution-independent and lives in
 /// SOURCE space — it is evaluated before geometry, never reprojected.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Mask {
     /// Shapes combined into the mask; empty means "selects nothing".
     pub shapes: Vec<MaskShape>,
@@ -62,11 +65,13 @@ pub struct Mask {
 }
 
 impl Mask {
-    /// The mask weight in `[0, 1]` at a normalized point `(px, py)`.
-    pub fn weight_at(&self, px: f32, py: f32) -> f32 {
+    /// The mask weight in `[0, 1]` at a normalized point `(px, py)`, given the
+    /// SOURCE pixel `pixel` there (so value-driven shapes — luminosity, hue — can
+    /// select on image content, not just position; position-only shapes ignore it).
+    pub fn weight_at(&self, px: f32, py: f32, pixel: [f32; 3]) -> f32 {
         let mut w = 0.0;
         for shape in &self.shapes {
-            w = f32::max(w, shape.weight_at(px, py));
+            w = f32::max(w, shape.weight_at(px, py, pixel));
         }
         if self.invert { 1.0 - w } else { w }
     }
@@ -75,18 +80,116 @@ impl Mask {
 /// One masking primitive. More shapes (brush, …) are added over time.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MaskShape {
-    /// A linear gradient.
+    /// A linear gradient (position).
     Gradient(Gradient),
-    /// A radial (elliptical) falloff.
+    /// A radial (elliptical) falloff (position).
     Radial(Radial),
+    /// A luminosity range (value): selects a band of brightness.
+    Luminosity(LuminanceRange),
+    /// A hue/saturation range (value): selects a band of color.
+    ColorRange(ColorRange),
 }
 
 impl MaskShape {
-    /// The shape's weight in `[0, 1]` at a normalized point.
-    pub fn weight_at(&self, px: f32, py: f32) -> f32 {
+    /// The shape's weight in `[0, 1]` at a normalized point, given the SOURCE
+    /// pixel there. Position-only shapes ignore `pixel`; value-driven ones use it.
+    pub fn weight_at(&self, px: f32, py: f32, pixel: [f32; 3]) -> f32 {
         match self {
             MaskShape::Gradient(g) => g.weight_at(px, py),
             MaskShape::Radial(r) => r.weight_at(px, py),
+            MaskShape::Luminosity(l) => l.weight_at(pixel),
+            MaskShape::ColorRange(c) => c.weight_at(pixel),
+        }
+    }
+}
+
+/// A relative-luminance estimate used only for mask *selection* (Rec. 709
+/// weights). It need not match the working space's colorimetric luminance — it
+/// just answers "how bright is this pixel" for picking a tonal range.
+fn select_luma(p: [f32; 3]) -> f32 {
+    0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
+}
+
+/// A smooth band: `1` for `v` in `[lo, hi]`, ramping to `0` over `feather` on
+/// each side. `feather <= 0` gives a hard band.
+fn band(v: f32, lo: f32, hi: f32, feather: f32) -> f32 {
+    if feather <= 0.0 {
+        return if v >= lo && v <= hi { 1.0 } else { 0.0 };
+    }
+    let rising = ((v - (lo - feather)) / feather).clamp(0.0, 1.0);
+    let falling = (((hi + feather) - v) / feather).clamp(0.0, 1.0);
+    rising.min(falling)
+}
+
+/// Hue (in turns, `[0, 1)`) and saturation (`[0, 1]`) of a linear RGB pixel,
+/// for hue-range selection. Hue is the HSV hue; saturation is `(max-min)/max`.
+fn hue_sat(p: [f32; 3]) -> (f32, f32) {
+    let max = p[0].max(p[1]).max(p[2]);
+    let min = p[0].min(p[1]).min(p[2]);
+    let chroma = max - min;
+    let sat = if max <= 0.0 { 0.0 } else { chroma / max };
+    if chroma <= 1e-9 {
+        return (0.0, sat);
+    }
+    let h = if max == p[0] {
+        (p[1] - p[2]) / chroma
+    } else if max == p[1] {
+        (p[2] - p[0]) / chroma + 2.0
+    } else {
+        (p[0] - p[1]) / chroma + 4.0
+    };
+    ((h / 6.0).rem_euclid(1.0), sat)
+}
+
+/// Shortest distance between two hues on the `[0, 1)` circle (so `0.95` and
+/// `0.05` are `0.1` apart, not `0.9`).
+fn hue_distance(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+/// A luminosity-range selection: full weight where the pixel's brightness is in
+/// `[lo, hi]`, feathered on each side. Position-independent — it selects tones
+/// wherever they occur. (See [`select_luma`].)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LuminanceRange {
+    pub lo: f32,
+    pub hi: f32,
+    pub feather: f32,
+}
+
+impl LuminanceRange {
+    fn weight_at(&self, pixel: [f32; 3]) -> f32 {
+        band(select_luma(pixel), self.lo, self.hi, self.feather)
+    }
+}
+
+/// A hue-range selection: full weight where the pixel's hue is within
+/// `hue_width` of `hue` (on the color wheel) and at least `sat_min` saturated,
+/// feathered over `feather`. Position-independent.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorRange {
+    /// Target hue in turns, `[0, 1)`.
+    pub hue: f32,
+    /// Half-width of the accepted hue band, in turns.
+    pub hue_width: f32,
+    /// Minimum saturation to be selected (rejects near-neutral pixels).
+    pub sat_min: f32,
+    /// Hue feather, in turns.
+    pub feather: f32,
+}
+
+impl ColorRange {
+    fn weight_at(&self, pixel: [f32; 3]) -> f32 {
+        let (h, s) = hue_sat(pixel);
+        if s < self.sat_min {
+            return 0.0;
+        }
+        let over = (hue_distance(h, self.hue) - self.hue_width).max(0.0);
+        if self.feather <= 0.0 {
+            if over <= 0.0 { 1.0 } else { 0.0 }
+        } else {
+            (1.0 - over / self.feather).clamp(0.0, 1.0)
         }
     }
 }
@@ -141,6 +244,7 @@ impl Radial {
 /// changes nothing. There is deliberately no ordering field, because the engine
 /// applies adjustments in a fixed order rather than the order they appear in.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Adjustments {
     /// Editable white balance, on top of the as-shot balance applied at decode.
     pub white_balance: Option<WhiteBalance>,
@@ -157,6 +261,7 @@ pub struct Adjustments {
 /// Editable white balance as a temp/tint pair; both `0` is neutral. Positive
 /// `temp` warms (more red, less blue); positive `tint` shifts toward magenta.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WhiteBalance {
     pub temp: f32,
     pub tint: f32,
@@ -165,6 +270,7 @@ pub struct WhiteBalance {
 /// Tonal shaping split across four ranges; all `0` is neutral. Each value is
 /// roughly `[-1, 1]`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SelectiveTone {
     pub contrast: f32,
     pub highlights: f32,
@@ -175,6 +281,7 @@ pub struct SelectiveTone {
 /// Unsharp-mask sharpening: `amount` is the strength (`0` = off), `radius` the
 /// blur radius (in pixels) of the unsharp base.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sharpen {
     pub amount: f32,
     pub radius: f32,
@@ -194,6 +301,7 @@ impl Default for Sharpen {
 /// Framing and orientation of the rendered image: an optional crop and a
 /// straighten angle. The default is the identity — no crop, no rotation.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Geometry {
     /// Crop rectangle in normalized coordinates, or `None` for the full frame.
     pub crop: Option<Crop>,
@@ -241,9 +349,20 @@ impl Document {
             .map_err(|e| e.to_string())
     }
 
-    /// Parse from a RON string.
+    /// Parse from a RON string. A sidecar whose `version` is newer than this
+    /// build understands is rejected (rather than silently misreading a future
+    /// schema); an older one still loads, since `#[serde(default)]` on the
+    /// settings structs fills any fields it predates.
     pub fn from_ron(text: &str) -> Result<Self, String> {
-        ron::from_str(text).map_err(|e| e.to_string())
+        let doc: Document = ron::from_str(text).map_err(|e| e.to_string())?;
+        if doc.version > Self::VERSION {
+            return Err(format!(
+                "sidecar schema version {} is newer than supported {}",
+                doc.version,
+                Self::VERSION
+            ));
+        }
+        Ok(doc)
     }
 }
 
@@ -287,7 +406,7 @@ mod tests {
 
     #[test]
     fn empty_mask_selects_nothing() {
-        assert_eq!(Mask::default().weight_at(0.5, 0.5), 0.0);
+        assert_eq!(Mask::default().weight_at(0.5, 0.5, [0.0; 3]), 0.0);
     }
 
     #[test]
@@ -302,11 +421,11 @@ mod tests {
             })],
             invert: false,
         };
-        assert_eq!(mask.weight_at(0.0, 0.5), 0.0);
-        assert!((mask.weight_at(0.5, 0.5) - 0.5).abs() < 1e-6);
-        assert_eq!(mask.weight_at(1.0, 0.5), 1.0);
-        assert_eq!(mask.weight_at(-0.3, 0.5), 0.0); // clamped before the band
-        assert_eq!(mask.weight_at(1.3, 0.5), 1.0); // clamped after the band
+        assert_eq!(mask.weight_at(0.0, 0.5, [0.0; 3]), 0.0);
+        assert!((mask.weight_at(0.5, 0.5, [0.0; 3]) - 0.5).abs() < 1e-6);
+        assert_eq!(mask.weight_at(1.0, 0.5, [0.0; 3]), 1.0);
+        assert_eq!(mask.weight_at(-0.3, 0.5, [0.0; 3]), 0.0); // clamped before the band
+        assert_eq!(mask.weight_at(1.3, 0.5, [0.0; 3]), 1.0); // clamped after the band
     }
 
     #[test]
@@ -320,10 +439,10 @@ mod tests {
             })],
             invert: false,
         };
-        assert_eq!(mask.weight_at(0.5, 0.5), 1.0); // center: inside radius
-        assert_eq!(mask.weight_at(0.5, 0.3), 1.0); // distance 0.2 = the radius edge
-        assert_eq!(mask.weight_at(0.5, 0.05), 0.0); // distance 0.45 > radius + feather
-        let mid = mask.weight_at(0.5, 0.5 - 0.25); // within the feather band
+        assert_eq!(mask.weight_at(0.5, 0.5, [0.0; 3]), 1.0); // center: inside radius
+        assert_eq!(mask.weight_at(0.5, 0.3, [0.0; 3]), 1.0); // distance 0.2 = the radius edge
+        assert_eq!(mask.weight_at(0.5, 0.05, [0.0; 3]), 0.0); // distance 0.45 > radius + feather
+        let mid = mask.weight_at(0.5, 0.5 - 0.25, [0.0; 3]); // within the feather band
         assert!(
             (0.0..=1.0).contains(&mid) && mid > 0.0 && mid < 1.0,
             "{mid}"
@@ -346,7 +465,49 @@ mod tests {
             shapes: vec![g],
             invert: true,
         };
-        assert!((normal.weight_at(0.25, 0.5) + inverted.weight_at(0.25, 0.5) - 1.0).abs() < 1e-6);
+        assert!(
+            (normal.weight_at(0.25, 0.5, [0.0; 3]) + inverted.weight_at(0.25, 0.5, [0.0; 3]) - 1.0)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn luminosity_selects_a_brightness_band_regardless_of_position() {
+        // Select shadows: luma in [0, 0.3], small feather. Value-driven, so the
+        // (px, py) point doesn't matter — only the pixel's brightness.
+        let mask = Mask {
+            shapes: vec![MaskShape::Luminosity(LuminanceRange {
+                lo: 0.0,
+                hi: 0.3,
+                feather: 0.05,
+            })],
+            invert: false,
+        };
+        let dark = mask.weight_at(0.1, 0.9, [0.1, 0.1, 0.1]); // luma 0.1 → in band
+        let bright = mask.weight_at(0.1, 0.9, [0.9, 0.9, 0.9]); // luma 0.9 → out
+        assert!((dark - 1.0).abs() < 1e-6, "dark selected: {dark}");
+        assert_eq!(bright, 0.0, "bright rejected");
+    }
+
+    #[test]
+    fn color_range_selects_a_hue_and_rejects_neutrals() {
+        // Select reds (hue ~0), needing some saturation.
+        let mask = Mask {
+            shapes: vec![MaskShape::ColorRange(ColorRange {
+                hue: 0.0,
+                hue_width: 0.05,
+                sat_min: 0.2,
+                feather: 0.05,
+            })],
+            invert: false,
+        };
+        let red = mask.weight_at(0.5, 0.5, [0.8, 0.1, 0.1]); // hue ~0, saturated
+        let blue = mask.weight_at(0.5, 0.5, [0.1, 0.1, 0.8]); // hue ~0.67
+        let gray = mask.weight_at(0.5, 0.5, [0.5, 0.5, 0.5]); // unsaturated
+        assert!((red - 1.0).abs() < 1e-6, "red selected: {red}");
+        assert_eq!(blue, 0.0, "blue rejected");
+        assert_eq!(gray, 0.0, "neutral rejected (below sat_min)");
     }
 
     #[test]
@@ -412,5 +573,28 @@ mod tests {
             variants: vec![Settings::default(), edited],
         };
         assert_eq!(Document::from_ron(&d.to_ron().unwrap()).unwrap(), d);
+    }
+
+    #[test]
+    fn partial_sidecar_fills_missing_fields_with_defaults() {
+        // An older/minimal sidecar that omits fields added later must still load,
+        // the missing pieces falling back to their neutral defaults
+        // (`#[serde(default)]`) — so the format can evolve without breaking files.
+        let text = "(version: 1, variants: [(global: (exposure: Some(0.5)))])";
+        let doc = Document::from_ron(text).expect("partial sidecar should load");
+        let s = &doc.variants[0];
+        assert_eq!(s.global.exposure, Some(0.5));
+        assert_eq!(s.global.white_balance, None); // omitted → default
+        assert_eq!(s.global.sharpen, None); // omitted → default
+        assert!(s.locals.is_empty()); // omitted → default
+        assert!(s.geometry.is_identity()); // omitted → default
+    }
+
+    #[test]
+    fn newer_schema_version_is_rejected() {
+        // A sidecar from a future build is refused rather than silently misread.
+        let text = "(version: 999, variants: [(global: ())])";
+        let err = Document::from_ron(text).expect_err("newer version should fail");
+        assert!(err.contains("newer"), "unexpected error: {err}");
     }
 }

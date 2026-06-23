@@ -125,9 +125,10 @@ pub trait Backend {
     /// through `transform` and sampling the source (bilinear).
     fn resample(&self, img: &ImageBuf, transform: &Transform) -> ImageBuf;
 
-    /// Evaluate a mask to a per-pixel weight buffer in `[0, 1]`, row-major,
-    /// sized to `extent` (SOURCE coordinates).
-    fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32>;
+    /// Evaluate a mask to a per-pixel weight buffer in `[0, 1]`, row-major, sized
+    /// to and reading from `source` (SOURCE coordinates) — so value-driven shapes
+    /// (luminosity, hue) can select on pixel content, not just position.
+    fn eval_mask(&self, mask: &Mask, source: &ImageBuf) -> Vec<f32>;
 
     /// Blend `top` over `base` in place by `weights[p] * opacity`:
     /// `base[p] = base[p] + weights[p]*opacity*(top[p] - base[p])`. The weight
@@ -216,12 +217,10 @@ fn tone_curves(t: &SelectiveTone) -> Vec<ToneCurve> {
 /// mask (weight × opacity). Reusing [`apply_global`] is the point: a local
 /// adjustment is the same edit as a global one, just scoped by a mask.
 fn apply_locals(mut img: ImageBuf, locals: &[LocalAdjustment], backend: &dyn Backend) -> ImageBuf {
-    let extent = Extent {
-        width: img.width(),
-        height: img.height(),
-    };
     for local in locals {
-        let weights = backend.eval_mask(&local.mask, extent);
+        // The mask is evaluated on the current image, so value-driven shapes see
+        // the developed pixels they select on.
+        let weights = backend.eval_mask(&local.mask, &img);
         let adjusted = apply_global(img.clone(), &local.adjustments, backend);
         backend.blend(&mut img, &adjusted, &weights, local.opacity);
     }
@@ -263,7 +262,7 @@ fn crop_image(img: &ImageBuf, c: Crop) -> ImageBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::{Gradient, MaskShape, Sharpen, WhiteBalance};
+    use latent_edit::{Gradient, LuminanceRange, MaskShape, Sharpen, WhiteBalance};
     use latent_image::color::luminance;
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
@@ -355,14 +354,14 @@ mod tests {
             out
         }
 
-        fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32> {
-            let (w, h) = (extent.width, extent.height);
+        fn eval_mask(&self, mask: &Mask, source: &ImageBuf) -> Vec<f32> {
+            let (w, h) = (source.width(), source.height());
             let (wf, hf) = (w as f32, h as f32);
             (0..w * h)
                 .map(|i| {
                     let x = (i % w) as f32;
                     let y = (i / w) as f32;
-                    mask.weight_at((x + 0.5) / wf, (y + 0.5) / hf)
+                    mask.weight_at((x + 0.5) / wf, (y + 0.5) / hf, source.pixels()[i as usize])
                 })
                 .collect()
         }
@@ -584,5 +583,45 @@ mod tests {
         );
         assert!(left < 0.5, "left near original 0.4: {left}");
         assert!(right > 0.6, "right near adjusted 0.8: {right}");
+    }
+
+    #[test]
+    fn luminosity_masked_local_affects_only_the_selected_tones() {
+        // Two pixels — dark and bright. A local +1 EV masked to shadows
+        // (luma ≤ 0.3) must brighten only the dark one, proving the source pixel
+        // reaches the mask through `eval_mask` (the N1 seam) and drives selection.
+        let mut src = ImageBuf::new(2, 1);
+        src.set(0, 0, [0.1, 0.1, 0.1]); // dark → selected
+        src.set(1, 0, [0.8, 0.8, 0.8]); // bright → not selected
+        let local = LocalAdjustment {
+            mask: Mask {
+                shapes: vec![MaskShape::Luminosity(LuminanceRange {
+                    lo: 0.0,
+                    hi: 0.3,
+                    feather: 0.02,
+                })],
+                invert: false,
+            },
+            adjustments: Adjustments {
+                exposure: Some(1.0), // ×2
+                ..Adjustments::default()
+            },
+            opacity: 1.0,
+        };
+        let settings = Settings {
+            locals: vec![local],
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert!(
+            out.get(0, 0)[0] > 0.18,
+            "dark brightened: {:?}",
+            out.get(0, 0)
+        );
+        assert!(
+            (out.get(1, 0)[0] - 0.8).abs() < 1e-6,
+            "bright unchanged: {:?}",
+            out.get(1, 0)
+        );
     }
 }

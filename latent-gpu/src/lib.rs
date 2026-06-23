@@ -18,7 +18,7 @@ use latent_cpu::CpuBackend;
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::tone;
-use latent_pipeline::{Backend, CombineKind, Extent, PointOp, Transform};
+use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
 use wgpu::util::DeviceExt;
 
 /// Uniform parameters for the `map_pixels` compute shader. Layout matches the
@@ -518,8 +518,8 @@ impl Backend for GpuBackend {
         floats_to_image(ow, oh, &out)
     }
 
-    fn eval_mask(&self, mask: &Mask, extent: Extent) -> Vec<f32> {
-        self.cpu.eval_mask(mask, extent)
+    fn eval_mask(&self, mask: &Mask, source: &ImageBuf) -> Vec<f32> {
+        self.cpu.eval_mask(mask, source)
     }
 
     fn blend(&self, base: &mut ImageBuf, top: &ImageBuf, weights: &[f32], opacity: f32) {
@@ -530,6 +530,7 @@ impl Backend for GpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use latent_pipeline::Extent;
 
     /// Acquire a GPU backend, or skip the test (returning early) when no device
     /// is available, so the suite still passes on machines without one. Where an
