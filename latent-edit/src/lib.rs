@@ -60,6 +60,11 @@ impl Default for LocalAdjustment {
 pub struct Mask {
     /// Shapes combined into the mask; empty means "selects nothing".
     pub shapes: Vec<MaskShape>,
+    /// How each shape combines with the running result, parallel to `shapes`:
+    /// `ops[i]` applies to `shapes[i]`. The first shape is always the base (its
+    /// op is ignored) and a missing entry defaults to [`MaskOp::Add`], so an
+    /// empty `ops` reproduces the plain union of all shapes.
+    pub ops: Vec<MaskOp>,
     /// Apply to the complement of the shapes' region instead.
     pub invert: bool,
 }
@@ -69,16 +74,41 @@ impl Mask {
     /// SOURCE pixel `pixel` there (so value-driven shapes — luminosity, hue — can
     /// select on image content, not just position; position-only shapes ignore it).
     pub fn weight_at(&self, px: f32, py: f32, pixel: [f32; 3]) -> f32 {
-        let mut w = 0.0;
-        for shape in &self.shapes {
-            w = f32::max(w, shape.weight_at(px, py, pixel));
+        let mut w = 0.0_f32;
+        for (i, shape) in self.shapes.iter().enumerate() {
+            let s = shape.weight_at(px, py, pixel);
+            // The first shape is the base; later shapes combine via their op (a
+            // missing op — including an empty list — defaults to Add/union).
+            let op = if i == 0 {
+                MaskOp::Add
+            } else {
+                self.ops.get(i).copied().unwrap_or(MaskOp::Add)
+            };
+            w = match op {
+                MaskOp::Add => w.max(s),
+                MaskOp::Subtract => w * (1.0 - s),
+                MaskOp::Intersect => w.min(s),
+            };
         }
         if self.invert { 1.0 - w } else { w }
     }
 }
 
-/// One masking primitive. More shapes (brush, …) are added over time.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// How a [`MaskShape`] combines with the shapes before it in a [`Mask`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MaskOp {
+    /// Union — take the stronger of the running weight and this shape.
+    #[default]
+    Add,
+    /// Carve this shape out of the running weight (smoothly).
+    Subtract,
+    /// Keep only where both the running weight and this shape are present.
+    Intersect,
+}
+
+/// One masking primitive. More shapes are added over time. Not `Copy`: the
+/// brush carries a `Vec` of dabs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MaskShape {
     /// A linear gradient (position).
     Gradient(Gradient),
@@ -88,6 +118,8 @@ pub enum MaskShape {
     Luminosity(LuminanceRange),
     /// A hue/saturation range (value): selects a band of color.
     ColorRange(ColorRange),
+    /// A freehand brush (position): painted and erased dabs.
+    Brush(Brush),
 }
 
 impl MaskShape {
@@ -99,6 +131,7 @@ impl MaskShape {
             MaskShape::Radial(r) => r.weight_at(px, py),
             MaskShape::Luminosity(l) => l.weight_at(pixel),
             MaskShape::ColorRange(c) => c.weight_at(pixel),
+            MaskShape::Brush(b) => b.weight_at(px, py),
         }
     }
 }
@@ -234,6 +267,48 @@ impl Radial {
         } else {
             (1.0 - (d - self.radius) / self.feather).clamp(0.0, 1.0)
         }
+    }
+}
+
+/// A freehand brush mask: an ordered list of [`Dab`]s. Painting dabs add
+/// coverage (union); erasing dabs carve it back out. Order matters — a later
+/// erase removes earlier paint. Normalized, position-based (ignores pixel value).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Brush {
+    pub dabs: Vec<Dab>,
+}
+
+/// One brush stamp: a soft disc at `(x, y)` of `radius`, fading to `0` over
+/// `feather` (normalized units, like [`Radial`]). `erase` subtracts coverage
+/// instead of adding it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Dab {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub feather: f32,
+    pub erase: bool,
+}
+
+impl Brush {
+    fn weight_at(&self, px: f32, py: f32) -> f32 {
+        let mut w = 0.0_f32;
+        for dab in &self.dabs {
+            let d = ((px - dab.x).powi(2) + (py - dab.y).powi(2)).sqrt();
+            let cov = if dab.feather <= 0.0 {
+                if d <= dab.radius { 1.0 } else { 0.0 }
+            } else {
+                (1.0 - (d - dab.radius) / dab.feather).clamp(0.0, 1.0)
+            };
+            // Paint unions coverage; erase carves it back out (smoothly).
+            w = if dab.erase {
+                w * (1.0 - cov)
+            } else {
+                w.max(cov)
+            };
+        }
+        w
     }
 }
 
@@ -419,6 +494,7 @@ mod tests {
                 x1: 1.0,
                 y1: 0.5,
             })],
+            ops: Vec::new(),
             invert: false,
         };
         assert_eq!(mask.weight_at(0.0, 0.5, [0.0; 3]), 0.0);
@@ -437,6 +513,7 @@ mod tests {
                 radius: 0.2,
                 feather: 0.1,
             })],
+            ops: Vec::new(),
             invert: false,
         };
         assert_eq!(mask.weight_at(0.5, 0.5, [0.0; 3]), 1.0); // center: inside radius
@@ -458,11 +535,13 @@ mod tests {
             y1: 0.5,
         });
         let normal = Mask {
-            shapes: vec![g],
+            shapes: vec![g.clone()],
+            ops: Vec::new(),
             invert: false,
         };
         let inverted = Mask {
             shapes: vec![g],
+            ops: Vec::new(),
             invert: true,
         };
         assert!(
@@ -482,6 +561,7 @@ mod tests {
                 hi: 0.3,
                 feather: 0.05,
             })],
+            ops: Vec::new(),
             invert: false,
         };
         let dark = mask.weight_at(0.1, 0.9, [0.1, 0.1, 0.1]); // luma 0.1 → in band
@@ -500,6 +580,7 @@ mod tests {
                 sat_min: 0.2,
                 feather: 0.05,
             })],
+            ops: Vec::new(),
             invert: false,
         };
         let red = mask.weight_at(0.5, 0.5, [0.8, 0.1, 0.1]); // hue ~0, saturated
@@ -508,6 +589,110 @@ mod tests {
         assert!((red - 1.0).abs() < 1e-6, "red selected: {red}");
         assert_eq!(blue, 0.0, "blue rejected");
         assert_eq!(gray, 0.0, "neutral rejected (below sat_min)");
+    }
+
+    #[test]
+    fn brush_paints_a_disc_and_erase_carves_it_out() {
+        // One paint dab makes a hard disc; a later erase dab removes its center,
+        // leaving a ring. Brush is position-based, so the pixel value is ignored.
+        let mut brush = Brush {
+            dabs: vec![Dab {
+                x: 0.5,
+                y: 0.5,
+                radius: 0.2,
+                feather: 0.0,
+                erase: false,
+            }],
+        };
+        let painted = MaskShape::Brush(brush.clone());
+        assert_eq!(painted.weight_at(0.5, 0.5, [0.0; 3]), 1.0, "painted center");
+        assert_eq!(
+            painted.weight_at(0.9, 0.9, [0.0; 3]),
+            0.0,
+            "outside the dab"
+        );
+
+        brush.dabs.push(Dab {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.1,
+            feather: 0.0,
+            erase: true,
+        });
+        let carved = MaskShape::Brush(brush);
+        assert_eq!(carved.weight_at(0.5, 0.5, [0.0; 3]), 0.0, "center erased");
+        assert_eq!(
+            carved.weight_at(0.65, 0.5, [0.0; 3]),
+            1.0,
+            "ring still painted"
+        );
+    }
+
+    #[test]
+    fn mask_ops_subtract_and_intersect_combine_shapes() {
+        // Two overlapping hard discs. A is left, B is right; they overlap in the
+        // middle. Subtract carves B out of A; Intersect keeps only the overlap;
+        // empty ops unions (the prior behavior).
+        let a = MaskShape::Radial(Radial {
+            cx: 0.4,
+            cy: 0.5,
+            radius: 0.2,
+            feather: 0.0,
+        });
+        let b = MaskShape::Radial(Radial {
+            cx: 0.6,
+            cy: 0.5,
+            radius: 0.2,
+            feather: 0.0,
+        });
+        let only_a = (0.3, 0.5);
+        let overlap = (0.5, 0.5);
+        let only_b = (0.7, 0.5);
+
+        let union = Mask {
+            shapes: vec![a.clone(), b.clone()],
+            ops: Vec::new(), // empty → all Add: the union, unchanged from before
+            invert: false,
+        };
+        assert_eq!(union.weight_at(only_a.0, only_a.1, [0.0; 3]), 1.0);
+        assert_eq!(union.weight_at(only_b.0, only_b.1, [0.0; 3]), 1.0);
+
+        let subtract = Mask {
+            shapes: vec![a.clone(), b.clone()],
+            ops: vec![MaskOp::Add, MaskOp::Subtract],
+            invert: false,
+        };
+        assert_eq!(
+            subtract.weight_at(only_a.0, only_a.1, [0.0; 3]),
+            1.0,
+            "A kept"
+        );
+        assert_eq!(
+            subtract.weight_at(overlap.0, overlap.1, [0.0; 3]),
+            0.0,
+            "B carved"
+        );
+
+        let intersect = Mask {
+            shapes: vec![a, b],
+            ops: vec![MaskOp::Add, MaskOp::Intersect],
+            invert: false,
+        };
+        assert_eq!(
+            intersect.weight_at(overlap.0, overlap.1, [0.0; 3]),
+            1.0,
+            "overlap"
+        );
+        assert_eq!(
+            intersect.weight_at(only_a.0, only_a.1, [0.0; 3]),
+            0.0,
+            "A-only dropped"
+        );
+        assert_eq!(
+            intersect.weight_at(only_b.0, only_b.1, [0.0; 3]),
+            0.0,
+            "B-only dropped"
+        );
     }
 
     #[test]
@@ -552,6 +737,7 @@ mod tests {
                         x1: 1.0,
                         y1: 0.5,
                     })],
+                    ops: Vec::new(),
                     invert: true,
                 },
                 adjustments: Adjustments::default(),

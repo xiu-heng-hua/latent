@@ -325,6 +325,7 @@ mod tests {
                 x1: 1.0,
                 y1: 0.5,
             })],
+            ops: Vec::new(),
             invert: false,
         };
         let w = CpuBackend.eval_mask(&mask, &ImageBuf::new(4, 1));

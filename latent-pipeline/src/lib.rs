@@ -562,6 +562,7 @@ mod tests {
                     x1: 1.0,
                     y1: 0.5,
                 })],
+                ops: Vec::new(),
                 invert: false,
             },
             adjustments: Adjustments {
@@ -600,6 +601,7 @@ mod tests {
                     hi: 0.3,
                     feather: 0.02,
                 })],
+                ops: Vec::new(),
                 invert: false,
             },
             adjustments: Adjustments {

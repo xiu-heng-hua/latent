@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use latent_edit::{
-    Adjustments, ColorRange, Crop, Document, Gradient, History, LocalAdjustment, LuminanceRange,
-    Mask, MaskShape, Radial, SelectiveTone, Settings, Sharpen, WhiteBalance,
+    Adjustments, Brush, ColorRange, Crop, Dab, Document, Gradient, History, LocalAdjustment,
+    LuminanceRange, Mask, MaskShape, Radial, SelectiveTone, Settings, Sharpen, WhiteBalance,
 };
 use latent_image::ImageBuf;
 use latent_pipeline::{Backend, render};
@@ -54,6 +54,9 @@ pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>
                 status: String::new(),
                 texture: None,
                 local_sel: 0,
+                brush_radius: 0.08,
+                brush_feather: 0.04,
+                brush_erase: false,
                 backend,
             }) as Box<dyn eframe::App>)
         }),
@@ -82,6 +85,10 @@ struct App {
     texture: Option<egui::TextureHandle>,
     /// Index of the local adjustment selected for editing in the panel.
     local_sel: usize,
+    /// Brush tool settings for painting dabs onto a brush mask (normalized).
+    brush_radius: f32,
+    brush_feather: f32,
+    brush_erase: bool,
     /// The rendering backend (CPU, or GPU when selected and available).
     backend: Box<dyn Backend>,
 }
@@ -241,6 +248,20 @@ impl eframe::App for App {
             ui.separator();
             ui.heading("Local Adjustments");
             dirty |= local_adjustments(ui, &mut self.variants[active], &mut self.local_sel);
+            // Brush tool: only when the selected local is a brush mask. Dabs are
+            // painted on the image in the central panel using these settings.
+            if self.variants[active]
+                .current()
+                .locals
+                .get(self.local_sel)
+                .is_some_and(|l| matches!(l.mask.shapes.first(), Some(MaskShape::Brush(_))))
+            {
+                ui.label("Brush");
+                ui.add(egui::Slider::new(&mut self.brush_radius, 0.01..=0.5).text("Size"));
+                ui.add(egui::Slider::new(&mut self.brush_feather, 0.0..=0.5).text("Feather"));
+                ui.checkbox(&mut self.brush_erase, "Erase");
+                ui.label("Drag on the image to paint.");
+            }
 
             ui.separator();
             ui.heading("Export");
@@ -271,15 +292,61 @@ impl eframe::App for App {
             self.render_preview(ctx);
         }
 
-        let texture = self.texture.as_ref().unwrap();
+        let tex_id = self.texture.as_ref().unwrap().id();
+        let tex_size = self.texture.as_ref().unwrap().size_vec2();
+        let mut painted = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
-                ui.image(egui::load::SizedTexture::new(
-                    texture.id(),
-                    texture.size_vec2(),
-                ));
+                let resp = ui.add(
+                    egui::Image::new(egui::load::SizedTexture::new(tex_id, tex_size))
+                        .sense(egui::Sense::click_and_drag()),
+                );
+                // Paint brush dabs when the selected local is a brush mask, one
+                // undo step per stroke (begin on press, commit on release).
+                let is_brush = self.variants[active]
+                    .current()
+                    .locals
+                    .get(self.local_sel)
+                    .is_some_and(|l| matches!(l.mask.shapes.first(), Some(MaskShape::Brush(_))));
+                if is_brush {
+                    let click = resp.clicked() && !resp.dragged();
+                    if resp.drag_started() || click {
+                        self.variants[active].begin();
+                    }
+                    if (resp.dragged() || click)
+                        && let Some(pos) = resp.hover_pos()
+                    {
+                        let r = resp.rect;
+                        let nx = ((pos.x - r.left()) / r.width().max(1.0)).clamp(0.0, 1.0);
+                        let ny = ((pos.y - r.top()) / r.height().max(1.0)).clamp(0.0, 1.0);
+                        if let Some(MaskShape::Brush(b)) =
+                            self.variants[active].current_mut().locals[self.local_sel]
+                                .mask
+                                .shapes
+                                .first_mut()
+                        {
+                            b.dabs.push(Dab {
+                                x: nx,
+                                y: ny,
+                                radius: self.brush_radius,
+                                feather: self.brush_feather,
+                                erase: self.brush_erase,
+                            });
+                            painted = true;
+                        }
+                    }
+                    if resp.drag_stopped() || click {
+                        self.variants[active].commit();
+                    }
+                }
             });
         });
+        // A painted stroke changed the settings after this frame's render; refresh
+        // the preview and repaint so the dab shows up.
+        if painted {
+            self.render_preview(ctx);
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -478,6 +545,7 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
                         x1: 0.5,
                         y1: 1.0,
                     })],
+                    ops: Vec::new(),
                     invert: false,
                 },
                 adjustments: Adjustments::default(),
@@ -497,6 +565,7 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
                         radius: 0.25,
                         feather: 0.25,
                     })],
+                    ops: Vec::new(),
                     invert: false,
                 },
                 adjustments: Adjustments::default(),
@@ -516,6 +585,7 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
                         hi: 0.3,
                         feather: 0.1,
                     })],
+                    ops: Vec::new(),
                     invert: false,
                 },
                 adjustments: Adjustments::default(),
@@ -536,6 +606,22 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
                         sat_min: 0.15,
                         feather: 0.08,
                     })],
+                    ops: Vec::new(),
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            });
+            history.commit();
+            *sel = history.current().locals.len() - 1;
+            dirty = true;
+        }
+        if ui.button("+ Brush").clicked() {
+            history.begin();
+            history.current_mut().locals.push(LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![MaskShape::Brush(Brush::default())],
+                    ops: Vec::new(),
                     invert: false,
                 },
                 adjustments: Adjustments::default(),
@@ -620,7 +706,7 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
 /// Sliders for the selected local adjustment's first mask shape (gradient
 /// endpoints or radial center/radius/feather), in normalized coordinates.
 fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usize) -> bool {
-    match history.current().locals[i].mask.shapes.first().copied() {
+    match history.current().locals[i].mask.shapes.first().cloned() {
         Some(MaskShape::Gradient(g)) => {
             let (mut x0, mut y0, mut x1, mut y1) = (g.x0, g.y0, g.x1, g.y1);
             let r0 = ui.add(egui::Slider::new(&mut x0, 0.0..=1.0).text("From X"));
@@ -705,6 +791,10 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                 history.commit();
             }
             changed
+        }
+        Some(MaskShape::Brush(_)) => {
+            ui.label("Brush mask — paint on the preview to add, Erase to subtract.");
+            false
         }
         None => false,
     }

@@ -716,6 +716,7 @@ mod tests {
                         x1: 1.0,
                         y1: 0.5,
                     })],
+                    ops: Vec::new(),
                     invert: false,
                 },
                 adjustments: Adjustments {
