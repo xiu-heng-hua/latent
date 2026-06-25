@@ -327,10 +327,59 @@ pub struct Adjustments {
     pub exposure: Option<f32>,
     /// Tonal shaping across the contrast/highlights/shadows/blacks ranges.
     pub tone: Option<SelectiveTone>,
+    /// Master + per-channel tone curves, edited as control points.
+    pub curves: Option<Curves>,
     /// Saturation factor: `0` is grayscale, `1` is unchanged, `> 1` is more.
     pub saturation: Option<f32>,
+    /// Per-hue-band hue/saturation/luminance mixer.
+    pub hsl: Option<Hsl>,
+    /// Channel mixer: each output channel is a linear mix of the input channels.
+    pub channel_mixer: Option<ChannelMixer>,
     /// Unsharp-mask sharpening.
     pub sharpen: Option<Sharpen>,
+}
+
+/// Master + per-channel tone curves, as control points `(input, output)` in the
+/// perceptual `[0, 1]` domain. `master` shapes all channels; `red`/`green`/`blue`
+/// add per-channel grading on top. An empty point list is the identity.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Curves {
+    pub master: Vec<(f32, f32)>,
+    pub red: Vec<(f32, f32)>,
+    pub green: Vec<(f32, f32)>,
+    pub blue: Vec<(f32, f32)>,
+}
+
+/// A per-hue-band color mixer (the "HSL" tool): eight evenly-spaced hue bands
+/// around the wheel — red, orange, yellow, green, aqua, blue, purple, magenta —
+/// each with a `[hue, sat, lum]` adjustment. `hue` shifts the band's hue (in
+/// turns), `sat` and `lum` scale its saturation and lightness by `1 + value`.
+/// All-zero is neutral. A pixel is influenced by its two nearest bands, so a
+/// color at a band center is driven only by that band.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hsl {
+    /// Per-band `[hue, sat, lum]`, indexed red (0) … magenta (7).
+    pub bands: [[f32; 3]; 8],
+}
+
+/// A channel mixer: each output channel is a linear combination of the input
+/// channels — a 3x3 matrix whose rows are the output R/G/B and columns the input
+/// R/G/B. The default is the identity (no change). Also the natural home for
+/// fixed color matrices such as a monochrome conversion or a channel swap.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelMixer {
+    pub matrix: [[f32; 3]; 3],
+}
+
+impl Default for ChannelMixer {
+    fn default() -> Self {
+        Self {
+            matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
 }
 
 /// Editable white balance as a temp/tint pair; both `0` is neutral. Positive
@@ -723,7 +772,21 @@ mod tests {
                     shadows: 0.1,
                     blacks: 0.0,
                 }),
+                curves: Some(Curves {
+                    master: vec![(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)],
+                    red: vec![(0.0, 0.1)],
+                    green: Vec::new(),
+                    blue: Vec::new(),
+                }),
                 saturation: Some(1.2),
+                hsl: Some(Hsl {
+                    bands: {
+                        let mut b = [[0.0_f32; 3]; 8];
+                        b[5] = [0.02, 0.3, -0.1]; // tweak the blue band
+                        b
+                    },
+                }),
+                channel_mixer: Some(ChannelMixer::default()),
                 sharpen: Some(Sharpen {
                     amount: 0.3,
                     radius: 1.5,

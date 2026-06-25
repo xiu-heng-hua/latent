@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use latent_edit::{
-    Adjustments, Brush, ColorRange, Crop, Dab, Document, Gradient, History, LocalAdjustment,
-    LuminanceRange, Mask, MaskShape, Radial, SelectiveTone, Settings, Sharpen, WhiteBalance,
+    Adjustments, Brush, ColorRange, Crop, Curves, Dab, Document, Gradient, History,
+    LocalAdjustment, LuminanceRange, Mask, MaskShape, Radial, SelectiveTone, Settings, Sharpen,
+    WhiteBalance,
 };
 use latent_image::ImageBuf;
 use latent_pipeline::{Backend, render};
@@ -57,6 +58,7 @@ pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>
                 brush_radius: 0.08,
                 brush_feather: 0.04,
                 brush_erase: false,
+                curve_channel: 0,
                 backend,
             }) as Box<dyn eframe::App>)
         }),
@@ -89,6 +91,8 @@ struct App {
     brush_radius: f32,
     brush_feather: f32,
     brush_erase: bool,
+    /// Which curve channel the editor edits (0 = master, 1/2/3 = R/G/B).
+    curve_channel: usize,
     /// The rendering backend (CPU, or GPU when selected and available).
     backend: Box<dyn Backend>,
 }
@@ -235,6 +239,7 @@ impl eframe::App for App {
                 |s| s.global.saturation,
                 |s, v| s.global.saturation = v,
             );
+            dirty |= curves_block(ui, &mut self.variants[active], &mut self.curve_channel);
 
             ui.separator();
             ui.heading("Detail");
@@ -387,6 +392,115 @@ fn opt_point_slider(
         history.commit();
     }
     changed
+}
+
+/// Evenly-spaced input positions of the curve editor's five control points.
+const CURVE_XS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+/// The control-point list for one channel of a [`Curves`] (0 = master,
+/// 1/2/3 = red/green/blue).
+fn curve_channel_mut(curves: &mut Curves, channel: usize) -> &mut Vec<(f32, f32)> {
+    match channel {
+        1 => &mut curves.red,
+        2 => &mut curves.green,
+        3 => &mut curves.blue,
+        _ => &mut curves.master,
+    }
+}
+
+/// Curve editor: enable curves, pick a channel, then drag the five control
+/// points on the graph (the nearest point's output follows the cursor). Feeds
+/// the [`Curves`] engine and re-renders live. The drag interaction is
+/// display-unverifiable, so it carries no automated test.
+fn curves_block(ui: &mut egui::Ui, history: &mut History<Settings>, channel: &mut usize) -> bool {
+    let mut dirty = false;
+
+    let mut enabled = history.current().global.curves.is_some();
+    if ui.checkbox(&mut enabled, "Curves").changed() {
+        history.begin();
+        history.current_mut().global.curves = enabled.then(Curves::default);
+        history.commit();
+        dirty = true;
+    }
+    if history.current().global.curves.is_none() {
+        return dirty;
+    }
+
+    ui.horizontal(|ui| {
+        for (i, name) in ["Master", "R", "G", "B"].into_iter().enumerate() {
+            ui.selectable_value(channel, i, name);
+        }
+    });
+
+    // Output (y) of each fixed-input point for the selected channel; identity
+    // where a point has not been set yet.
+    let mut ys: [f32; 5] = {
+        let curves = history.current().global.curves.as_ref().unwrap();
+        let pts = match *channel {
+            1 => &curves.red,
+            2 => &curves.green,
+            3 => &curves.blue,
+            _ => &curves.master,
+        };
+        std::array::from_fn(|i| {
+            pts.iter()
+                .find(|(x, _)| (x - CURVE_XS[i]).abs() < 1e-3)
+                .map_or(CURVE_XS[i], |&(_, y)| y)
+        })
+    };
+
+    let size = egui::vec2(ui.available_width().min(220.0), 160.0);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+    let rect = resp.rect;
+    let sx = |x: f32| rect.left() + x * rect.width();
+    let sy = |y: f32| rect.bottom() - y.clamp(0.0, 1.0) * rect.height();
+
+    if resp.drag_started() {
+        history.begin();
+    }
+    if resp.dragged()
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let nx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let ny = ((rect.bottom() - pos.y) / rect.height()).clamp(0.0, 1.0);
+        let i = (0..5)
+            .min_by(|&a, &b| {
+                (CURVE_XS[a] - nx)
+                    .abs()
+                    .total_cmp(&(CURVE_XS[b] - nx).abs())
+            })
+            .unwrap();
+        ys[i] = ny;
+        let curves = history.current_mut().global.curves.as_mut().unwrap();
+        *curve_channel_mut(curves, *channel) =
+            CURVE_XS.iter().zip(ys).map(|(&x, y)| (x, y)).collect();
+        dirty = true;
+    }
+    if resp.drag_stopped() {
+        history.commit();
+    }
+
+    // Reference diagonal, then the curve and its control points.
+    painter.line_segment(
+        [egui::pos2(sx(0.0), sy(0.0)), egui::pos2(sx(1.0), sy(1.0))],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+    );
+    let pts: Vec<egui::Pos2> = CURVE_XS
+        .iter()
+        .zip(ys)
+        .map(|(&x, y)| egui::pos2(sx(x), sy(y)))
+        .collect();
+    for w in pts.windows(2) {
+        painter.line_segment(
+            [w[0], w[1]],
+            egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE),
+        );
+    }
+    for p in &pts {
+        painter.circle_filled(*p, 3.0, egui::Color32::WHITE);
+    }
+
+    dirty
 }
 
 /// White balance: two sliders (temp/tint) editing one optional adjustment.

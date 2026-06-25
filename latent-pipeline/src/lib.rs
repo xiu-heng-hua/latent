@@ -6,7 +6,9 @@
 //! (SOURCE space), and geometry is the single later step that reframes it
 //! (SOURCE → OUTPUT).
 
-use latent_edit::{Adjustments, Crop, Geometry, LocalAdjustment, Mask, SelectiveTone, Settings};
+use latent_edit::{
+    Adjustments, Crop, Curves, Geometry, LocalAdjustment, Mask, SelectiveTone, Settings,
+};
 use latent_image::ImageBuf;
 use latent_image::tone::{self, ToneCurve};
 
@@ -26,6 +28,12 @@ pub enum PointOp {
     /// Blend each channel between its luma (grayscale) and itself by `amount`
     /// (`0` = grayscale, `1` = unchanged).
     Saturation(f32),
+    /// Apply a per-channel tone curve `[r, g, b]`, each in its perceptual domain.
+    Curves([ToneCurve; 3]),
+    /// Per-hue-band color mix: eight `[hue, sat, lum]` band adjustments.
+    ColorMix([[f32; 3]; 8]),
+    /// Linearly remix channels by a 3x3 matrix (output channel = M · input).
+    Matrix([[f32; 3]; 3]),
 }
 
 /// A data-described operation combining an image with a second one pixelwise.
@@ -176,8 +184,17 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
             backend.map_pixels(&mut img, &PointOp::Tone(curve));
         }
     }
+    if let Some(c) = &global.curves {
+        backend.map_pixels(&mut img, &PointOp::Curves(channel_curves(c)));
+    }
     if let Some(amount) = global.saturation {
         backend.map_pixels(&mut img, &PointOp::Saturation(amount));
+    }
+    if let Some(hsl) = &global.hsl {
+        backend.map_pixels(&mut img, &PointOp::ColorMix(hsl.bands));
+    }
+    if let Some(cm) = &global.channel_mixer {
+        backend.map_pixels(&mut img, &PointOp::Matrix(cm.matrix));
     }
     if let Some(s) = global.sharpen
         && s.amount > 0.0
@@ -208,6 +225,42 @@ fn tone_curves(t: &SelectiveTone) -> Vec<ToneCurve> {
         curves.push(tone::blacks(t.blacks));
     }
     curves
+}
+
+/// Lower per-channel [`Curves`] to three effective tone curves `[r, g, b]`, each
+/// the channel's curve composed after the master, interpolated from its control
+/// points. Reuses [`ToneCurve`] so curves share the existing perceptual path.
+fn channel_curves(c: &Curves) -> [ToneCurve; 3] {
+    let master = point_curve(&c.master);
+    let compose = |points: &[(f32, f32)]| {
+        let channel = point_curve(points);
+        ToneCurve::from_fn(|t| channel.eval(master.eval(t)))
+    };
+    [compose(&c.red), compose(&c.green), compose(&c.blue)]
+}
+
+/// A tone curve interpolated (piecewise-linear) through `(input, output)` control
+/// points in the perceptual `[0, 1]` domain, clamped flat past the ends. No
+/// points gives the identity.
+fn point_curve(points: &[(f32, f32)]) -> ToneCurve {
+    if points.is_empty() {
+        return ToneCurve::identity();
+    }
+    let mut pts = points.to_vec();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let last = pts.len() - 1;
+    ToneCurve::from_fn(move |t| {
+        if t <= pts[0].0 {
+            return pts[0].1;
+        }
+        if t >= pts[last].0 {
+            return pts[last].1;
+        }
+        let i = pts.windows(2).position(|w| t <= w[1].0).unwrap();
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[i + 1];
+        y0 + (t - x0) / (x1 - x0) * (y1 - y0)
+    })
 }
 
 /// Stage: local adjustments, applied in SOURCE space.
@@ -262,8 +315,8 @@ fn crop_image(img: &ImageBuf, c: Crop) -> ImageBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::{Gradient, LuminanceRange, MaskShape, Sharpen, WhiteBalance};
-    use latent_image::color::luminance;
+    use latent_edit::{Gradient, Hsl, LuminanceRange, MaskShape, Sharpen, WhiteBalance};
+    use latent_image::color::{Mat3, color_mix, luminance};
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
     /// backend lives in a crate that depends on this one. It gives each
@@ -292,6 +345,22 @@ mod tests {
                         // Clamp to ≥0 so over-saturation never emits negative light
                         // (mirrors the CPU backend).
                         *px = std::array::from_fn(|c| (y + amount * (px[c] - y)).max(0.0));
+                    }
+                }
+                PointOp::Curves(curves) => {
+                    for px in img.pixels_mut() {
+                        *px = std::array::from_fn(|c| curves[c].apply_linear(px[c]));
+                    }
+                }
+                PointOp::ColorMix(bands) => {
+                    for px in img.pixels_mut() {
+                        *px = color_mix(*px, bands);
+                    }
+                }
+                PointOp::Matrix(m) => {
+                    let m = Mat3(*m);
+                    for px in img.pixels_mut() {
+                        *px = m.mul_vec(*px);
                     }
                 }
             }
@@ -458,6 +527,34 @@ mod tests {
         for c in 0..3 {
             assert!((same[c] - [0.6, 0.3, 0.1][c]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn hsl_mixer_grades_one_band_and_spares_the_others() {
+        // Desaturate only the red band via the color mixer. A red pixel goes
+        // gray; a cyan pixel (a different band) is left exactly alone — the
+        // selectivity that defines the tool, reached through apply_global.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.0, -1.0, 0.0]; // red band: saturation ×0
+        let red = developed(
+            Adjustments {
+                hsl: Some(Hsl { bands }),
+                ..Adjustments::default()
+            },
+            [0.8, 0.1, 0.1],
+        );
+        assert!(
+            (red[0] - red[1]).abs() < 1e-6 && (red[1] - red[2]).abs() < 1e-6,
+            "red desaturated: {red:?}"
+        );
+        let cyan = developed(
+            Adjustments {
+                hsl: Some(Hsl { bands }),
+                ..Adjustments::default()
+            },
+            [0.1, 0.8, 0.8],
+        );
+        assert_eq!(cyan, [0.1, 0.8, 0.8], "cyan untouched");
     }
 
     #[test]

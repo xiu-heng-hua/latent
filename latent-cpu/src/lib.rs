@@ -2,7 +2,7 @@
 
 use latent_edit::Mask;
 use latent_image::ImageBuf;
-use latent_image::color::luminance;
+use latent_image::color::{Mat3, color_mix, luminance};
 use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
 use rayon::prelude::*;
 
@@ -38,6 +38,23 @@ impl Backend for CpuBackend {
                     // brightened channel) is left unbounded.
                     *px = std::array::from_fn(|c| (y + amount * (px[c] - y)).max(0.0));
                 });
+            }
+            PointOp::Curves(curves) => {
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .for_each(|px| *px = std::array::from_fn(|c| curves[c].apply_linear(px[c])));
+            }
+            PointOp::ColorMix(bands) => {
+                let bands = *bands;
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .for_each(|px| *px = color_mix(*px, &bands));
+            }
+            PointOp::Matrix(m) => {
+                let m = Mat3(*m);
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .for_each(|px| *px = m.mul_vec(*px));
             }
         }
     }
@@ -183,8 +200,8 @@ fn sample_bilinear(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::{Gradient, MaskShape};
-    use latent_pipeline::Extent;
+    use latent_edit::{Adjustments, ChannelMixer, Curves, Gradient, MaskShape, Settings};
+    use latent_pipeline::{Extent, render};
 
     #[test]
     fn map_pixels_identity_leaves_the_image_unchanged() {
@@ -346,5 +363,88 @@ mod tests {
         CpuBackend.blend(&mut base, &top, &[0.0, 1.0], 0.5);
         assert_eq!(base.get(0, 0), [0.0, 0.0, 0.0]);
         assert_eq!(base.get(1, 0), [0.5, 0.5, 0.5]);
+    }
+
+    /// Render a uniform mid-gray pixel with the given global curves; `render`
+    /// lowers them through `apply_global` to a per-channel `PointOp::Curves`.
+    fn render_gray_with(curves: Curves) -> [f32; 3] {
+        let mut src = ImageBuf::new(1, 1);
+        src.set(0, 0, [0.3, 0.3, 0.3]);
+        let settings = Settings {
+            global: Adjustments {
+                curves: Some(curves),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        render(&src, &settings, &CpuBackend).get(0, 0)
+    }
+
+    #[test]
+    fn per_channel_curve_grades_only_that_channel() {
+        // A red curve lifting the mid-tones; green/blue stay at identity.
+        let out = render_gray_with(Curves {
+            red: vec![(0.0, 0.0), (0.5, 0.9), (1.0, 1.0)],
+            ..Curves::default()
+        });
+        assert!(out[0] > 0.3, "red lifted: {out:?}");
+        assert!((out[1] - 0.3).abs() < 1e-5, "green untouched: {out:?}");
+        assert!((out[2] - 0.3).abs() < 1e-5, "blue untouched: {out:?}");
+    }
+
+    #[test]
+    fn master_curve_applies_uniformly_and_identity_is_a_noop() {
+        // A master curve shapes every channel identically (like the tone path).
+        let lifted = render_gray_with(Curves {
+            master: vec![(0.0, 0.0), (0.5, 0.9), (1.0, 1.0)],
+            ..Curves::default()
+        });
+        assert!(lifted[0] > 0.3, "master lifts: {lifted:?}");
+        assert_eq!(lifted[0], lifted[1]);
+        assert_eq!(lifted[1], lifted[2]);
+        // An identity master (endpoints only) round-trips the perceptual path
+        // unchanged — the same no-op the existing tone curve gives.
+        let same = render_gray_with(Curves {
+            master: vec![(0.0, 0.0), (1.0, 1.0)],
+            ..Curves::default()
+        });
+        for c in same {
+            assert!((c - 0.3).abs() < 1e-5, "identity master noop: {same:?}");
+        }
+    }
+
+    /// Render a single pixel through a global channel mixer matrix.
+    fn render_pixel_with_matrix(px: [f32; 3], matrix: [[f32; 3]; 3]) -> [f32; 3] {
+        let mut src = ImageBuf::new(1, 1);
+        src.set(0, 0, px);
+        let settings = Settings {
+            global: Adjustments {
+                channel_mixer: Some(ChannelMixer { matrix }),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        render(&src, &settings, &CpuBackend).get(0, 0)
+    }
+
+    #[test]
+    fn channel_mixer_monochrome_makes_gray() {
+        // Identical rows (a luma-style mix) collapse any pixel to neutral gray.
+        let w = [0.3, 0.6, 0.1];
+        let out = render_pixel_with_matrix([0.8, 0.4, 0.2], [w, w, w]);
+        assert!(
+            (out[0] - out[1]).abs() < 1e-6 && (out[1] - out[2]).abs() < 1e-6,
+            "monochrome: {out:?}"
+        );
+    }
+
+    #[test]
+    fn channel_mixer_can_swap_channels() {
+        // A swap matrix sends [r, g, b] -> [b, g, r].
+        let out = render_pixel_with_matrix(
+            [0.1, 0.2, 0.3],
+            [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        );
+        assert_eq!(out, [0.3, 0.2, 0.1]);
     }
 }

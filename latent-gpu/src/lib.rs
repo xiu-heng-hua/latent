@@ -376,6 +376,11 @@ fn map_params(op: &PointOp, n_pixels: u32) -> (MapParams, Vec<f32>) {
             p.amount = *amount;
             (p, vec![0.0; tone::LUT_SIZE])
         }
+        // Per-channel curves aren't ported to WGSL; `map_pixels` runs them on the
+        // CPU before reaching here.
+        PointOp::Curves(_) => unreachable!("curves are handled on the CPU"),
+        PointOp::ColorMix(_) => unreachable!("the color mix is handled on the CPU"),
+        PointOp::Matrix(_) => unreachable!("the channel mixer is handled on the CPU"),
     }
 }
 
@@ -443,6 +448,15 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 impl Backend for GpuBackend {
     fn map_pixels(&self, img: &mut ImageBuf, op: &PointOp) {
         if img.is_empty() {
+            return;
+        }
+        if matches!(
+            op,
+            PointOp::Curves(_) | PointOp::ColorMix(_) | PointOp::Matrix(_)
+        ) {
+            // Per-channel curves, the color mix, and the channel mixer aren't
+            // ported to WGSL; fall back to the CPU so this stays a complete backend.
+            self.cpu.map_pixels(img, op);
             return;
         }
         let (params, lut) = map_params(op, img.len() as u32);
@@ -702,7 +716,10 @@ mod tests {
                     shadows: 0.2,
                     blacks: 0.1,
                 }),
+                curves: None,
                 saturation: Some(1.4),
+                hsl: None,
+                channel_mixer: None,
                 sharpen: Some(Sharpen {
                     amount: 0.8,
                     radius: 2.0,

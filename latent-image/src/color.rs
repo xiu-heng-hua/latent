@@ -185,6 +185,73 @@ pub fn luminance(rgb: [f32; 3]) -> f32 {
     LUMA_WEIGHTS[0] * rgb[0] + LUMA_WEIGHTS[1] * rgb[1] + LUMA_WEIGHTS[2] * rgb[2]
 }
 
+/// Hue (turns, `[0, 1)`), saturation (`[0, 1]`), and value of a linear-RGB
+/// pixel. Value is the channel maximum, so it carries highlight headroom (`> 1`)
+/// through unchanged — unlike HSL lightness, this keeps the unbounded working
+/// range intact across a round trip.
+fn rgb_to_hsv(p: [f32; 3]) -> (f32, f32, f32) {
+    let max = p[0].max(p[1]).max(p[2]);
+    let min = p[0].min(p[1]).min(p[2]);
+    let c = max - min;
+    let s = if max <= 0.0 { 0.0 } else { c / max };
+    let h = if c <= 1e-9 {
+        0.0
+    } else if max == p[0] {
+        ((p[1] - p[2]) / c).rem_euclid(6.0)
+    } else if max == p[1] {
+        (p[2] - p[0]) / c + 2.0
+    } else {
+        (p[0] - p[1]) / c + 4.0
+    };
+    ((h / 6.0).rem_euclid(1.0), s, max)
+}
+
+/// Inverse of [`rgb_to_hsv`]. Output channels lie in `[0, v]`, so a value above
+/// `1` reconstructs to RGB above `1` (headroom preserved).
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let h6 = h.rem_euclid(1.0) * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - ((h6 % 2.0) - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h6 as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r + m, g + m, b + m]
+}
+
+/// Apply a per-hue-band color mix to a linear-RGB pixel. `bands` holds eight
+/// `[hue, sat, lum]` adjustments for hue centers evenly spaced around the wheel
+/// (red … magenta). The pixel's hue picks its two neighbouring bands by linear
+/// interpolation, so a color at a band center is driven only by that band; when
+/// both neighbouring bands are neutral the pixel is returned unchanged. An
+/// achromatic pixel (no saturation) has no hue to grade and is left alone. `hue`
+/// shifts the hue (turns); `sat`/`lum` scale saturation/value by `1 + value`.
+pub fn color_mix(rgb: [f32; 3], bands: &[[f32; 3]; 8]) -> [f32; 3] {
+    let (h, s, v) = rgb_to_hsv(rgb);
+    // An achromatic pixel has no hue to grade; leave neutrals exactly alone
+    // instead of letting them fall into the red band (where hue 0 lands).
+    if s <= 1e-6 {
+        return rgb;
+    }
+    let pos = h * 8.0;
+    let i = (pos.floor() as usize) % 8;
+    let j = (i + 1) % 8;
+    let f = pos - pos.floor();
+    let adj: [f32; 3] = std::array::from_fn(|k| bands[i][k] * (1.0 - f) + bands[j][k] * f);
+    if adj.iter().all(|&x| x == 0.0) {
+        return rgb; // this hue's bands are untouched — leave it exactly alone
+    }
+    let h2 = h + adj[0];
+    let s2 = (s * (1.0 + adj[1])).clamp(0.0, 1.0);
+    let v2 = (v * (1.0 + adj[2])).max(0.0);
+    hsv_to_rgb(h2, s2, v2)
+}
+
 /// Apply a 3x3 color matrix to every pixel of an image, returning a new image.
 pub fn apply_matrix(img: &ImageBuf, m: &Mat3) -> ImageBuf {
     let mut out = ImageBuf::new(img.width(), img.height());
@@ -339,6 +406,61 @@ mod tests {
             apply_matrix(&img, &Mat3::IDENTITY).get(0, 0),
             [0.1, 0.7, 0.4]
         );
+    }
+
+    #[test]
+    fn color_mix_neutral_bands_are_identity() {
+        // All-zero bands leave every pixel exactly unchanged, including headroom.
+        let bands = [[0.0_f32; 3]; 8];
+        for px in [[0.8, 0.1, 0.1], [0.1, 0.8, 0.8], [0.5; 3], [2.0, 0.3, 0.0]] {
+            assert_eq!(color_mix(px, &bands), px, "{px:?}");
+        }
+    }
+
+    #[test]
+    fn color_mix_leaves_neutral_grays_alone() {
+        // A neutral pixel has no hue, so even a fully-dialed band must not touch
+        // it — grays would otherwise fall into the red band at hue 0.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.2, 0.5, 1.0]; // red band: hue, sat, and lum all pushed
+        for g in [[0.0; 3], [0.5; 3], [1.0; 3], [2.0; 3]] {
+            assert_eq!(color_mix(g, &bands), g, "neutral untouched: {g:?}");
+        }
+    }
+
+    #[test]
+    fn color_mix_one_band_leaves_the_others_alone() {
+        // Desaturate only the red band (band 0). A pure-red pixel (hue 0) goes
+        // gray; a pure-cyan pixel (hue 0.5, band 4) is untouched.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.0, -1.0, 0.0]; // red band: saturation ×0
+        let red = color_mix([0.8, 0.1, 0.1], &bands);
+        assert!(
+            (red[0] - red[1]).abs() < 1e-6 && (red[1] - red[2]).abs() < 1e-6,
+            "red desaturated: {red:?}"
+        );
+        let cyan = [0.1, 0.8, 0.8];
+        assert_eq!(color_mix(cyan, &bands), cyan, "cyan untouched");
+    }
+
+    #[test]
+    fn color_mix_value_preserves_highlight_headroom() {
+        // Boosting the red band's luminance scales value (max channel) above 1,
+        // proving the HSV round trip carries the unbounded range through.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.0, 0.0, 1.0]; // red band: value ×2
+        let out = color_mix([0.8, 0.1, 0.1], &bands);
+        assert!((out[0] - 1.6).abs() < 1e-5, "value doubled: {out:?}");
+    }
+
+    #[test]
+    fn hsv_round_trips_a_saturated_color() {
+        let px = [0.8, 0.3, 0.1];
+        let (h, s, v) = rgb_to_hsv(px);
+        let back = hsv_to_rgb(h, s, v);
+        for c in 0..3 {
+            assert!((back[c] - px[c]).abs() < 1e-6, "{back:?} vs {px:?}");
+        }
     }
 
     #[test]
