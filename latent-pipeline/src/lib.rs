@@ -10,6 +10,7 @@ use latent_edit::{
     Adjustments, Crop, Curves, Geometry, LocalAdjustment, Mask, SelectiveTone, Settings,
 };
 use latent_image::ImageBuf;
+use latent_image::color::luminance;
 use latent_image::tone::{self, ToneCurve};
 
 /// A data-described per-pixel operation over linear-light RGB pixels.
@@ -45,6 +46,26 @@ pub enum CombineKind {
     /// Unsharp recombine: `other + gain·(img − other)`. With `other` the blurred
     /// base, this amplifies the detail the image holds over its blur.
     Unsharp { gain: f32 },
+    /// Midtone-weighted local contrast (clarity): `img + amount·m·(img − other)`,
+    /// where `m` is a midtone window of the base (`other`) luminance — full in the
+    /// midtones, zero at black/white. Adds broad local contrast without haloing
+    /// the tonal extremes; `amount` 0 is a no-op, negative softens.
+    LocalContrast { amount: f32 },
+}
+
+/// Parameters for the edge-preserving denoise primitive (a bilateral filter),
+/// split into independent luminance and chroma channels.
+///
+/// `radius` is the spatial extent (in pixels) of the neighborhood averaged.
+/// `luma` and `chroma` are the range (edge-stopping) scales for the luminance and
+/// color components respectively: neighbors differing by much more than the scale
+/// are excluded, so edges survive while same-value noise averages out. A scale of
+/// `0` leaves that component untouched.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DenoiseParams {
+    pub radius: f32,
+    pub luma: f32,
+    pub chroma: f32,
 }
 
 /// Pixel dimensions of an image.
@@ -133,6 +154,18 @@ pub trait Backend {
     /// through `transform` and sampling the source (bilinear).
     fn resample(&self, img: &ImageBuf, transform: &Transform) -> ImageBuf;
 
+    /// Denoise the image with an edge-preserving (bilateral) filter, returning a
+    /// new image. Unlike [`Self::blur`], the averaging is edge-aware: it smooths
+    /// noise within a tone but does not bleed across luminance edges.
+    fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf;
+
+    /// Remove an estimated atmospheric haze veil, returning a new image.
+    /// `strength` in `[0, 1]` is the dark-channel prior's `ω`. The veil is
+    /// estimated from a *patch* dark channel (a neighborhood min), so a bright
+    /// neutral object with darker surroundings is recognized as haze-free rather
+    /// than crushed — see [`dehaze_recover`].
+    fn dehaze(&self, img: &ImageBuf, strength: f32) -> ImageBuf;
+
     /// Evaluate a mask to a per-pixel weight buffer in `[0, 1]`, row-major, sized
     /// to and reading from `source` (SOURCE coordinates) — so value-driven shapes
     /// (luminosity, hue) can select on pixel content, not just position.
@@ -196,6 +229,44 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
     if let Some(cm) = &global.channel_mixer {
         backend.map_pixels(&mut img, &PointOp::Matrix(cm.matrix));
     }
+    if let Some(nr) = global.noise_reduction
+        && nr.radius > 0.0
+        && (nr.luminance > 0.0 || nr.color > 0.0)
+    {
+        // Denoise before the contrast/sharpening tools so they don't amplify the
+        // noise the bilateral filter is removing.
+        img = backend.denoise(
+            &img,
+            DenoiseParams {
+                radius: nr.radius,
+                luma: nr.luminance,
+                chroma: nr.color,
+            },
+        );
+    }
+    if let Some(strength) = global.dehaze
+        && strength > 0.0
+    {
+        img = backend.dehaze(&img, strength);
+    }
+    if let Some(c) = global.clarity
+        && c.amount != 0.0
+        && c.radius > 0.0
+    {
+        // Clarity is unsharp at a broad radius with midtone weighting: the same
+        // recombine as sharpening, but the added local contrast tapers off toward
+        // black/white so it doesn't halo. The base is three box-blur passes — a
+        // central-limit approximation of a Gaussian — because a single box kernel
+        // rings at the broad clarity radius and would itself create halos.
+        let mut base = backend.blur(&img, c.radius);
+        base = backend.blur(&base, c.radius);
+        base = backend.blur(&base, c.radius);
+        backend.combine(
+            &mut img,
+            &base,
+            &CombineKind::LocalContrast { amount: c.amount },
+        );
+    }
     if let Some(s) = global.sharpen
         && s.amount > 0.0
         && s.radius > 0.0
@@ -206,6 +277,131 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
         backend.combine(&mut img, &base, &CombineKind::Unsharp { gain });
     }
     img
+}
+
+/// A midtone window for clarity: `1` at mid-gray, falling smoothly to `0` at
+/// black and white (a parabola). The window is evaluated in the **perceptual**
+/// (gamma) domain the tone system uses, so its peak lands on perceptual mid-gray
+/// (≈0.18 in linear light) rather than linear 0.5 (≈0.73 perceptually) — i.e. it
+/// genuinely weights the midtones instead of skewing into the highlights.
+/// Weighting the added local contrast by this protects the highlights and
+/// shadows from halos. Public so a backend computing the
+/// [`CombineKind::LocalContrast`] recombine reuses the identical window.
+pub fn midtone_weight(base_luma: f32) -> f32 {
+    let b = base_luma.clamp(0.0, 1.0).powf(1.0 / tone::GAMMA);
+    1.0 - (2.0 * b - 1.0) * (2.0 * b - 1.0)
+}
+
+/// Transmission floor for dehazing: the smallest transmission allowed, so the
+/// recovery never divides by ~0 in the densest haze. From the dark-channel
+/// dehazing method (He, Sun & Tang, *Single Image Haze Removal Using Dark Channel
+/// Prior*, CVPR 2009), which uses `t0 = 0.1`.
+const DEHAZE_T0: f32 = 0.1;
+
+/// Radius (pixels) of the dark-channel patch. He, Sun & Tang take the dark
+/// channel over a local *patch*, not a single pixel: that is what lets a bright
+/// neutral object (which has darker pixels nearby) be told apart from a uniformly
+/// bright haze veil, so the former is preserved instead of crushed to black.
+pub const DEHAZE_PATCH: i32 = 4;
+
+/// The patch dark channel at `(x, y)`: the minimum, over the surrounding
+/// `(2·DEHAZE_PATCH+1)²` window (clamped at the borders), of each pixel's
+/// smallest channel. High for uniform bright haze, low wherever any nearby pixel
+/// is dark — so a bright neutral subject with darker surroundings reads as
+/// haze-free. Public so a backend evaluating dehaze reuses the identical estimate.
+pub fn dehaze_dark_channel(img: &ImageBuf, x: u32, y: u32) -> f32 {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let mut dc = f32::INFINITY;
+    for dy in -DEHAZE_PATCH..=DEHAZE_PATCH {
+        for dx in -DEHAZE_PATCH..=DEHAZE_PATCH {
+            let sx = (x as i32 + dx).clamp(0, w - 1) as u32;
+            let sy = (y as i32 + dy).clamp(0, h - 1) as u32;
+            let p = img.get(sx, sy);
+            dc = dc.min(p[0].min(p[1]).min(p[2]));
+        }
+    }
+    dc
+}
+
+/// Recover one dehazed linear-RGB pixel from its value and patch dark channel.
+///
+/// The atmospheric scattering model is `I = J·t + A·(1 − t)`: the observed pixel
+/// `I` is the clear radiance `J` attenuated by transmission `t`, plus airlight
+/// `A`. With a neutral unit airlight (`A = 1`) the dark-channel prior gives
+/// `t = 1 − strength·dc`, and inverting the model recovers
+/// `J = (I − A)/clamp(t, t0, 1) + A`. `strength` in `[0, 1]` is the prior's `ω`.
+/// A clear pixel (`dc ≈ 0`) has `t ≈ 1` and is left unchanged; removing the gray
+/// veil restores contrast (deeper blacks) and saturation at once. Highlight
+/// headroom (`I > 1`) is passed through, since the model assumes `I ≤ A`.
+pub fn dehaze_recover(rgb: [f32; 3], dc: f32, strength: f32) -> [f32; 3] {
+    let t = (1.0 - strength * dc.clamp(0.0, 1.0)).clamp(DEHAZE_T0, 1.0);
+    std::array::from_fn(|c| {
+        let in_range = rgb[c].min(1.0);
+        let headroom = (rgb[c] - 1.0).max(0.0);
+        ((in_range - 1.0) / t + 1.0).max(0.0) + headroom
+    })
+}
+
+/// One output pixel of the bilateral denoise filter at `(x, y)`.
+///
+/// Each pixel splits into luminance `Y` and chroma `rgb − Y`, which are denoised
+/// on **separate** range scales and recombined: luminance carries the detail (so
+/// `params.luma` is kept gentle) while color noise is low-frequency blotches that
+/// `params.chroma` can smooth hard. Each component is a bilateral average over the
+/// `±radius` neighborhood — the weight is a spatial Gaussian times a range
+/// Gaussian on that component's own difference, so an edge (a large luminance
+/// *or* chroma step) gets a near-zero weight and is not blurred across. Stopping
+/// chroma on chroma difference preserves iso-luminant *color* edges; stopping
+/// luma on luma difference preserves luminance detail. Bilateral filtering:
+/// Tomasi & Manduchi, ICCV 1998. The spatial Gaussian uses `σ = radius/2` so it
+/// falls off across the support (window `2σ`) rather than behaving like a box. A
+/// component whose scale is `0` is left untouched. The caller guarantees
+/// `radius >= 1` and at least one positive scale.
+///
+/// Public so a backend evaluating the filter itself reuses the identical kernel.
+pub fn bilateral_pixel(img: &ImageBuf, x: u32, y: u32, params: DenoiseParams) -> [f32; 3] {
+    let r = params.radius.round().max(1.0) as i32;
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let sigma_s = r as f32 / 2.0;
+    let inv_2ss2 = 1.0 / (2.0 * sigma_s * sigma_s); // spatial (σ = radius/2)
+    let (do_luma, do_chroma) = (params.luma > 0.0, params.chroma > 0.0);
+    let inv_2sl2 = 1.0 / (2.0 * params.luma * params.luma); // luminance range
+    let inv_2sc2 = 1.0 / (2.0 * params.chroma * params.chroma); // chroma range
+
+    let c = img.get(x, y);
+    let cy = luminance(c);
+    let cc: [f32; 3] = std::array::from_fn(|k| c[k] - cy);
+    let (mut acc_y, mut wsum_y) = (0.0_f32, 0.0_f32);
+    let (mut acc_c, mut wsum_c) = ([0.0_f32; 3], 0.0_f32);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let sx = (x as i32 + dx).clamp(0, w - 1) as u32;
+            let sy = (y as i32 + dy).clamp(0, h - 1) as u32;
+            let n = img.get(sx, sy);
+            let ny = luminance(n);
+            let spatial = -((dx * dx + dy * dy) as f32) * inv_2ss2;
+            if do_luma {
+                let dl = cy - ny;
+                let wl = (spatial - dl * dl * inv_2sl2).exp();
+                acc_y += wl * ny;
+                wsum_y += wl;
+            }
+            if do_chroma {
+                let nc: [f32; 3] = std::array::from_fn(|k| n[k] - ny);
+                let dc2 = (0..3)
+                    .map(|k| (cc[k] - nc[k]) * (cc[k] - nc[k]))
+                    .sum::<f32>();
+                let wc = (spatial - dc2 * inv_2sc2).exp();
+                for k in 0..3 {
+                    acc_c[k] += wc * nc[k];
+                }
+                wsum_c += wc;
+            }
+        }
+    }
+    let yout = if do_luma { acc_y / wsum_y } else { cy };
+    let cout: [f32; 3] = std::array::from_fn(|k| if do_chroma { acc_c[k] / wsum_c } else { cc[k] });
+    std::array::from_fn(|k| yout + cout[k])
 }
 
 /// The active tonal curves of a [`SelectiveTone`], in canonical order. A control
@@ -315,7 +511,9 @@ fn crop_image(img: &ImageBuf, c: Crop) -> ImageBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::{Gradient, Hsl, LuminanceRange, MaskShape, Sharpen, WhiteBalance};
+    use latent_edit::{
+        Clarity, Gradient, Hsl, LuminanceRange, MaskShape, NoiseReduction, Sharpen, WhiteBalance,
+    };
     use latent_image::color::{Mat3, color_mix, luminance};
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
@@ -401,6 +599,12 @@ mod tests {
                         *px = std::array::from_fn(|c| o[c] + gain * (px[c] - o[c]));
                     }
                 }
+                CombineKind::LocalContrast { amount } => {
+                    for (px, o) in img.pixels_mut().iter_mut().zip(other.pixels().iter()) {
+                        let k = amount * midtone_weight(luminance(*o));
+                        *px = std::array::from_fn(|c| px[c] + k * (px[c] - o[c]));
+                    }
+                }
             }
         }
 
@@ -418,6 +622,33 @@ mod tests {
                         [0.0; 3]
                     };
                     out.set(ox, oy, px);
+                }
+            }
+            out
+        }
+
+        fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
+            if params.radius.round() < 1.0 || (params.luma <= 0.0 && params.chroma <= 0.0) {
+                return img.clone();
+            }
+            let mut out = ImageBuf::new(img.width(), img.height());
+            for y in 0..img.height() {
+                for x in 0..img.width() {
+                    out.set(x, y, bilateral_pixel(img, x, y, params));
+                }
+            }
+            out
+        }
+
+        fn dehaze(&self, img: &ImageBuf, strength: f32) -> ImageBuf {
+            if strength <= 0.0 {
+                return img.clone();
+            }
+            let mut out = ImageBuf::new(img.width(), img.height());
+            for y in 0..img.height() {
+                for x in 0..img.width() {
+                    let dc = dehaze_dark_channel(img, x, y);
+                    out.set(x, y, dehaze_recover(img.get(x, y), dc, strength));
                 }
             }
             out
@@ -593,6 +824,97 @@ mod tests {
         let out = render(&src, &settings, &TestBackend);
         assert!(out.get(2, 0)[0] < 0.0, "dark side: {:?}", out.get(2, 0));
         assert!(out.get(3, 0)[0] > 1.0, "bright side: {:?}", out.get(3, 0));
+    }
+
+    #[test]
+    fn noise_reduction_smooths_a_tone_but_keeps_an_edge() {
+        // A noisy dark region beside a bright one. The bilateral filter pulls the
+        // noisy midtone pixel toward its like-toned neighbors, while the bright
+        // pixel at the edge keeps its value — its dark neighbor across the edge is
+        // rejected by the range term. Wired through apply_global.
+        let mut src = ImageBuf::new(5, 1);
+        for (x, v) in [0.20, 0.25, 0.20, 0.80, 0.80].into_iter().enumerate() {
+            src.set(x as u32, 0, [v; 3]);
+        }
+        let settings = Settings {
+            global: Adjustments {
+                noise_reduction: Some(NoiseReduction {
+                    radius: 1.0,
+                    luminance: 0.1,
+                    color: 0.1,
+                }),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        let smoothed = out.get(1, 0)[0];
+        assert!(
+            smoothed > 0.20 && smoothed < 0.25,
+            "noise smoothed toward neighbors: {smoothed}"
+        );
+        assert!(
+            (out.get(3, 0)[0] - 0.80).abs() < 1e-3,
+            "edge preserved: {:?}",
+            out.get(3, 0)
+        );
+    }
+
+    #[test]
+    fn dehaze_clears_a_synthetic_veil() {
+        // Veil a saturated clear pixel (one channel at 0, so the dark-channel prior
+        // holds) with white airlight at transmission 0.5, then dehaze it. Full
+        // strength inverts the model and recovers the clear pixel; the lowering
+        // wires it through apply_global.
+        let clear = [0.8, 0.2, 0.0];
+        let t = 0.5;
+        let hazy: [f32; 3] = std::array::from_fn(|c| clear[c] * t + (1.0 - t));
+        let out = developed(
+            Adjustments {
+                dehaze: Some(1.0),
+                ..Adjustments::default()
+            },
+            hazy,
+        );
+        for (c, &want) in clear.iter().enumerate() {
+            assert!(
+                (out[c] - want).abs() < 1e-5,
+                "recovered {out:?} vs {clear:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clarity_boosts_midtone_local_contrast() {
+        // A midtone step. Clarity (broad blur + midtone-weighted recombine) lifts
+        // local contrast: the dark side goes down and the bright side up. The
+        // radius is kept small here only so the blurred base is predictable; all
+        // values sit in the midtones, where the weight is ~1, so it stays active.
+        let mut src = ImageBuf::new(5, 1);
+        for (x, v) in [0.4, 0.4, 0.4, 0.6, 0.6].into_iter().enumerate() {
+            src.set(x as u32, 0, [v; 3]);
+        }
+        let settings = Settings {
+            global: Adjustments {
+                clarity: Some(Clarity {
+                    amount: 1.0,
+                    radius: 1.0,
+                }),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert!(
+            out.get(2, 0)[0] < 0.4,
+            "dark side deepened: {:?}",
+            out.get(2, 0)
+        );
+        assert!(
+            out.get(3, 0)[0] > 0.6,
+            "bright side lifted: {:?}",
+            out.get(3, 0)
+        );
     }
 
     #[test]

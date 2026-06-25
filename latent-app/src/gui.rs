@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use latent_edit::{
-    Adjustments, Brush, ColorRange, Crop, Curves, Dab, Document, Gradient, History,
-    LocalAdjustment, LuminanceRange, Mask, MaskShape, Radial, SelectiveTone, Settings, Sharpen,
-    WhiteBalance,
+    Adjustments, Brush, Clarity, ColorRange, Crop, Curves, Dab, Document, Gradient, History,
+    LocalAdjustment, LuminanceRange, Mask, MaskShape, NoiseReduction, Radial, SelectiveTone,
+    Settings, Sharpen, WhiteBalance,
 };
 use latent_image::ImageBuf;
 use latent_pipeline::{Backend, render};
@@ -244,6 +244,17 @@ impl eframe::App for App {
             ui.separator();
             ui.heading("Detail");
             dirty |= sharpen_block(ui, &mut self.variants[active]);
+            dirty |= clarity_block(ui, &mut self.variants[active]);
+            dirty |= opt_point_slider(
+                ui,
+                &mut self.variants[active],
+                "Dehaze",
+                0.0..=1.0,
+                0.0,
+                |s| s.global.dehaze,
+                |s, v| s.global.dehaze = v,
+            );
+            dirty |= noise_reduction_block(ui, &mut self.variants[active]);
 
             ui.separator();
             ui.heading("Geometry");
@@ -561,6 +572,49 @@ fn sharpen_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
     }
     if changed {
         history.current_mut().global.sharpen = Some(Sharpen { amount, radius });
+    }
+    if commit {
+        history.commit();
+    }
+    changed
+}
+
+/// Clarity: midtone local-contrast amount/radius sliders editing one adjustment.
+fn clarity_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
+    let c = history.current().global.clarity.unwrap_or_default();
+    let (mut amount, mut radius) = (c.amount, c.radius);
+    let ra = ui.add(egui::Slider::new(&mut amount, -1.0..=1.0).text("Clarity amount"));
+    let rr = ui.add(egui::Slider::new(&mut radius, 5.0..=100.0).text("Clarity radius"));
+    let (begin, commit, changed) = gesture(&[&ra, &rr]);
+    if begin {
+        history.begin();
+    }
+    if changed {
+        history.current_mut().global.clarity = Some(Clarity { amount, radius });
+    }
+    if commit {
+        history.commit();
+    }
+    changed
+}
+
+/// Noise reduction: independent luminance/color strengths plus a radius.
+fn noise_reduction_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
+    let nr = history.current().global.noise_reduction.unwrap_or_default();
+    let (mut luminance, mut color, mut radius) = (nr.luminance, nr.color, nr.radius);
+    let rl = ui.add(egui::Slider::new(&mut luminance, 0.0..=0.3).text("Luminance NR"));
+    let rc = ui.add(egui::Slider::new(&mut color, 0.0..=0.3).text("Color NR"));
+    let rr = ui.add(egui::Slider::new(&mut radius, 1.0..=10.0).text("NR radius"));
+    let (begin, commit, changed) = gesture(&[&rl, &rc, &rr]);
+    if begin {
+        history.begin();
+    }
+    if changed {
+        history.current_mut().global.noise_reduction = Some(NoiseReduction {
+            radius,
+            luminance,
+            color,
+        });
     }
     if commit {
         history.commit();

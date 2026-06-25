@@ -3,7 +3,10 @@
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::color::{Mat3, color_mix, luminance};
-use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
+use latent_pipeline::{
+    Backend, CombineKind, DenoiseParams, PointOp, Transform, bilateral_pixel, dehaze_dark_channel,
+    dehaze_recover, midtone_weight,
+};
 use rayon::prelude::*;
 
 /// A rendering backend that runs every primitive on the CPU.
@@ -81,6 +84,17 @@ impl Backend for CpuBackend {
                         *px = std::array::from_fn(|c| o[c] + gain * (px[c] - o[c]))
                     });
             }
+            CombineKind::LocalContrast { amount } => {
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .zip(other.pixels().par_iter())
+                    .for_each(|(px, o)| {
+                        // Midtone window from the low-frequency base luminance: the
+                        // shared weight protects the highlights/shadows from halos.
+                        let k = amount * midtone_weight(luminance(*o));
+                        *px = std::array::from_fn(|c| px[c] + k * (px[c] - o[c]));
+                    });
+            }
         }
     }
 
@@ -96,6 +110,47 @@ impl Backend for CpuBackend {
                 for ox in 0..t.output.width {
                     let (sx, sy) = t.map(ox as f32, oy as f32);
                     row[ox as usize] = sample_bilinear(img, sx, sy);
+                }
+            });
+        out
+    }
+
+    fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
+        // Edge-preserving bilateral filter: each output pixel is an edge-aware
+        // weighted average of its neighborhood, split into luma and chroma. A
+        // sub-pixel radius or two zero strengths is a no-op. Rows are independent.
+        if params.radius.round() < 1.0 || (params.luma <= 0.0 && params.chroma <= 0.0) {
+            return img.clone();
+        }
+        let stride = img.width() as usize;
+        let mut out = ImageBuf::new(img.width(), img.height());
+        out.pixels_mut()
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..img.width() {
+                    row[x as usize] = bilateral_pixel(img, x, y as u32, params);
+                }
+            });
+        out
+    }
+
+    fn dehaze(&self, img: &ImageBuf, strength: f32) -> ImageBuf {
+        // Dark-channel-prior dehaze: estimate the veil from a patch dark channel,
+        // then invert the scattering model per pixel. Rows are independent →
+        // parallel; the patch min is what spares bright neutral subjects.
+        if strength <= 0.0 {
+            return img.clone();
+        }
+        let stride = img.width() as usize;
+        let mut out = ImageBuf::new(img.width(), img.height());
+        out.pixels_mut()
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..img.width() {
+                    let dc = dehaze_dark_channel(img, x, y as u32);
+                    row[x as usize] = dehaze_recover(img.get(x, y as u32), dc, strength);
                 }
             });
         out
@@ -224,6 +279,64 @@ mod tests {
     }
 
     #[test]
+    fn dehaze_recovers_a_uniform_veil_and_spares_a_clear_region() {
+        // A uniform region veiled by white airlight at transmission 0.5 (so the
+        // patch dark channel reflects the haze, not a clear neighbor); full
+        // strength inverts the scattering model and recovers the clear color.
+        let clear = [0.8, 0.2, 0.0];
+        let t = 0.5;
+        let hazy: [f32; 3] = std::array::from_fn(|c| clear[c] * t + (1.0 - t));
+        let mut img = ImageBuf::new(4, 4);
+        for p in img.pixels_mut() {
+            *p = hazy;
+        }
+        let out = CpuBackend.dehaze(&img, 1.0);
+        let c = out.get(2, 2);
+        for (i, &want) in clear.iter().enumerate() {
+            assert!((c[i] - want).abs() < 1e-5, "veil cleared: {c:?}");
+        }
+        // A region that is already clear (a channel at 0 → dark channel 0) has no
+        // veil to remove and is left untouched (to within float round-trip error).
+        let mut clear_img = ImageBuf::new(4, 4);
+        for p in clear_img.pixels_mut() {
+            *p = clear;
+        }
+        let kept = CpuBackend.dehaze(&clear_img, 1.0).get(2, 2);
+        for (i, &want) in clear.iter().enumerate() {
+            assert!((kept[i] - want).abs() < 1e-6, "clear untouched: {kept:?}");
+        }
+    }
+
+    #[test]
+    fn dehaze_preserves_a_bright_neutral_subject() {
+        // A bright neutral pixel in a dark surround: the *patch* dark channel sees
+        // the dark neighbors, so the pixel reads as a real subject, not haze, and
+        // is kept — the per-pixel dark channel would have crushed it toward black.
+        let mut img = ImageBuf::new(5, 5);
+        for p in img.pixels_mut() {
+            *p = [0.05, 0.05, 0.05];
+        }
+        img.set(2, 2, [0.7, 0.7, 0.7]);
+        let s = CpuBackend.dehaze(&img, 1.0).get(2, 2);
+        assert!(s[0] > 0.6, "bright neutral preserved, not crushed: {s:?}");
+    }
+
+    #[test]
+    fn dehaze_passes_highlight_headroom_through() {
+        // A specular highlight above 1.0 must pass through, not be amplified by the
+        // scattering inversion (which assumes the pixel is at or below the airlight).
+        let mut img = ImageBuf::new(4, 4);
+        for p in img.pixels_mut() {
+            *p = [0.9, 0.6, 0.5]; // surrounding haze sets the patch dark channel
+        }
+        img.set(1, 1, [1.5, 1.5, 1.5]);
+        let h = CpuBackend.dehaze(&img, 1.0).get(1, 1);
+        for c in h {
+            assert!((c - 1.5).abs() < 1e-5, "headroom preserved: {h:?}");
+        }
+    }
+
+    #[test]
     fn blur_radius_zero_is_identity() {
         let mut img = ImageBuf::new(2, 2);
         img.set(0, 0, [0.1, 0.2, 0.3]);
@@ -280,6 +393,29 @@ mod tests {
     }
 
     #[test]
+    fn local_contrast_amplifies_midtones_and_protects_the_extremes() {
+        // The clarity recombine: the detail (img − base) is amplified where the
+        // base is a midtone and suppressed where it is near black or white.
+        let mut img = ImageBuf::new(2, 1);
+        img.set(0, 0, [0.6, 0.6, 0.6]); // base 0.5 (midtone): amplified
+        img.set(1, 0, [0.9, 0.9, 0.9]); // base 1.0 (white): protected
+        let mut base = ImageBuf::new(2, 1);
+        base.set(0, 0, [0.5, 0.5, 0.5]);
+        base.set(1, 0, [1.0, 1.0, 1.0]);
+        CpuBackend.combine(&mut img, &base, &CombineKind::LocalContrast { amount: 1.0 });
+        // The window is evaluated in the perceptual domain: base luma 0.5 → weight
+        // ≈0.79 (not 1.0), so p0 is amplified to ≈0.68; base luma 1.0 → weight 0,
+        // so the highlight is left exactly alone.
+        let mid = img.get(0, 0)[0];
+        assert!(mid > 0.6 && mid < 0.7, "midtone amplified: {mid}");
+        assert!(
+            (img.get(1, 0)[0] - 0.9).abs() < 1e-6,
+            "highlight protected: {:?}",
+            img.get(1, 0)
+        );
+    }
+
+    #[test]
     fn unsharp_overshoots_a_step_edge() {
         // A dark→bright step. Unsharp (blur to a base, then amplify the detail)
         // should push the dark side below its original and the bright side above.
@@ -292,6 +428,91 @@ mod tests {
         assert!(img.get(2, 0)[0] < 0.0, "dark side should undershoot");
         assert!(img.get(3, 0)[0] > 1.0, "bright side should overshoot");
         assert!(img.get(0, 0)[0].abs() < 1e-6, "flat region unchanged");
+    }
+
+    #[test]
+    fn denoise_is_identity_when_off() {
+        let mut img = ImageBuf::new(3, 1);
+        img.set(0, 0, [0.1, 0.2, 0.3]);
+        img.set(1, 0, [0.4, 0.5, 0.6]);
+        img.set(2, 0, [0.7, 0.8, 0.9]);
+        // A sub-pixel radius, or both strengths zero, disable the filter.
+        let off_radius = DenoiseParams {
+            radius: 0.0,
+            luma: 0.1,
+            chroma: 0.1,
+        };
+        let off_strength = DenoiseParams {
+            radius: 2.0,
+            luma: 0.0,
+            chroma: 0.0,
+        };
+        assert_eq!(CpuBackend.denoise(&img, off_radius), img);
+        assert_eq!(CpuBackend.denoise(&img, off_strength), img);
+    }
+
+    #[test]
+    fn denoise_luma_smooths_a_flat_tone_but_preserves_an_edge() {
+        // A noisy dark region beside a bright one (all neutral, so only luma noise).
+        // Luminance NR averages the like-toned neighbors (reducing the dark
+        // region's noise) but rejects the bright neighbor across the edge, so the
+        // edge pixel keeps its value.
+        let mut img = ImageBuf::new(5, 1);
+        for (x, v) in [0.20, 0.25, 0.20, 0.80, 0.80].into_iter().enumerate() {
+            img.set(x as u32, 0, [v; 3]);
+        }
+        let out = CpuBackend.denoise(
+            &img,
+            DenoiseParams {
+                radius: 1.0,
+                luma: 0.1,
+                chroma: 0.0,
+            },
+        );
+        let smoothed = out.get(1, 0)[0];
+        assert!(
+            smoothed > 0.20 && smoothed < 0.25,
+            "noise pulled toward neighbors: {smoothed}"
+        );
+        assert!(
+            (out.get(3, 0)[0] - 0.80).abs() < 1e-3,
+            "edge preserved (bright neighbor rejected): {:?}",
+            out.get(3, 0)
+        );
+    }
+
+    #[test]
+    fn denoise_color_smooths_chroma_independently_of_luma() {
+        // A neutral row with one reddish chroma speckle at the same brightness.
+        // Color NR (luma off) pulls the speckle's chroma toward its neutral
+        // neighbors — reducing the color blotch — while leaving luminance alone.
+        let mut img = ImageBuf::new(5, 1);
+        for x in 0..5 {
+            img.set(x, 0, [0.5, 0.5, 0.5]);
+        }
+        let speckle = [0.6, 0.45, 0.45]; // a color speckle, near the neutral luma
+        img.set(2, 0, speckle);
+        let before = speckle[0] - speckle[1]; // chroma spread r vs g
+        let out = CpuBackend.denoise(
+            &img,
+            DenoiseParams {
+                radius: 1.0,
+                luma: 0.0,
+                chroma: 0.3,
+            },
+        );
+        let s = out.get(2, 0);
+        assert!(
+            (s[0] - s[1]) < before - 0.02,
+            "chroma noise reduced: {s:?} (spread {} → {})",
+            before,
+            s[0] - s[1]
+        );
+        // Luma NR was off, so the pixel's brightness is essentially unchanged.
+        assert!(
+            (luminance(s) - luminance(speckle)).abs() < 1e-4,
+            "luma preserved: {s:?}"
+        );
     }
 
     #[test]

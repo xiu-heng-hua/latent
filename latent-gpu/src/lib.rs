@@ -18,7 +18,7 @@ use latent_cpu::CpuBackend;
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::tone;
-use latent_pipeline::{Backend, CombineKind, PointOp, Transform};
+use latent_pipeline::{Backend, CombineKind, DenoiseParams, PointOp, Transform};
 use wgpu::util::DeviceExt;
 
 /// Uniform parameters for the `map_pixels` compute shader. Layout matches the
@@ -532,6 +532,17 @@ impl Backend for GpuBackend {
         floats_to_image(ow, oh, &out)
     }
 
+    fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
+        // The bilateral filter isn't ported to WGSL yet; delegate to the CPU so
+        // this stays a complete backend (the L2/L3 pattern would port it later).
+        self.cpu.denoise(img, params)
+    }
+
+    fn dehaze(&self, img: &ImageBuf, strength: f32) -> ImageBuf {
+        // The patch dark-channel dehaze isn't ported to WGSL yet; delegate to CPU.
+        self.cpu.dehaze(img, strength)
+    }
+
     fn eval_mask(&self, mask: &Mask, source: &ImageBuf) -> Vec<f32> {
         self.cpu.eval_mask(mask, source)
     }
@@ -696,8 +707,8 @@ mod tests {
     #[test]
     fn render_matches_cpu_across_the_pipeline() {
         use latent_edit::{
-            Adjustments, Crop, Geometry, Gradient, LocalAdjustment, Mask, MaskShape, SelectiveTone,
-            Settings, Sharpen, WhiteBalance,
+            Adjustments, Clarity, Crop, Geometry, Gradient, LocalAdjustment, Mask, MaskShape,
+            NoiseReduction, SelectiveTone, Settings, Sharpen, WhiteBalance,
         };
         use latent_pipeline::render;
 
@@ -723,6 +734,19 @@ mod tests {
                 sharpen: Some(Sharpen {
                     amount: 0.8,
                     radius: 2.0,
+                }),
+                // Exercise the Epic P tools too, so the GPU backend's CPU-fallback
+                // wiring for them (dehaze, denoise are CPU; clarity's base blur runs
+                // on the GPU) is regression-tested, not just compiled.
+                clarity: Some(Clarity {
+                    amount: 0.4,
+                    radius: 6.0,
+                }),
+                dehaze: Some(0.4),
+                noise_reduction: Some(NoiseReduction {
+                    radius: 2.0,
+                    luminance: 0.05,
+                    color: 0.1,
                 }),
             },
             locals: vec![LocalAdjustment {

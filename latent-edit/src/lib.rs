@@ -337,6 +337,12 @@ pub struct Adjustments {
     pub channel_mixer: Option<ChannelMixer>,
     /// Unsharp-mask sharpening.
     pub sharpen: Option<Sharpen>,
+    /// Midtone local contrast ("clarity").
+    pub clarity: Option<Clarity>,
+    /// Dehaze strength in `[0, 1]`: removes an estimated atmospheric veil.
+    pub dehaze: Option<f32>,
+    /// Edge-preserving noise reduction.
+    pub noise_reduction: Option<NoiseReduction>,
 }
 
 /// Master + per-channel tone curves, as control points `(input, output)` in the
@@ -418,6 +424,57 @@ impl Default for Sharpen {
         Self {
             amount: 0.0,
             radius: 2.0,
+        }
+    }
+}
+
+/// Clarity: midtone local contrast. An unsharp recombine over a *broad* base,
+/// weighted toward the midtones so it adds punch without haloing the highlights
+/// or crushing the shadows. `amount` is the strength (`0` = off, positive adds
+/// contrast, negative softens); `radius` is the blur radius (in pixels) of the
+/// low-frequency base — large, because clarity shapes broad local contrast
+/// rather than fine detail (that is what sharpening does).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Clarity {
+    pub amount: f32,
+    pub radius: f32,
+}
+
+impl Default for Clarity {
+    fn default() -> Self {
+        // A broad default radius so a freshly-enabled slider reads as local
+        // contrast, not sharpening; `amount` 0 keeps it a no-op until raised.
+        Self {
+            amount: 0.0,
+            radius: 40.0,
+        }
+    }
+}
+
+/// Edge-preserving noise reduction (a bilateral filter), with **independent
+/// luminance and color strengths** — the two kinds of sensor noise behave
+/// differently, so they are denoised separately. `radius` is the spatial
+/// neighborhood (in pixels). `luminance` is the luma range scale: keep it gentle,
+/// since luminance carries the detail. `color` is the chroma range scale: it can
+/// be stronger, because color noise is low-frequency blotches that smooth away
+/// without costing perceived detail. Both `0` is off (a no-op).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NoiseReduction {
+    pub radius: f32,
+    pub luminance: f32,
+    pub color: f32,
+}
+
+impl Default for NoiseReduction {
+    fn default() -> Self {
+        // A small default radius so a freshly-enabled control has somewhere to
+        // sit; both strengths 0 keep it a no-op until the user raises them.
+        Self {
+            radius: 2.0,
+            luminance: 0.0,
+            color: 0.0,
         }
     }
 }
@@ -790,6 +847,16 @@ mod tests {
                 sharpen: Some(Sharpen {
                     amount: 0.3,
                     radius: 1.5,
+                }),
+                clarity: Some(Clarity {
+                    amount: 0.4,
+                    radius: 30.0,
+                }),
+                dehaze: Some(0.6),
+                noise_reduction: Some(NoiseReduction {
+                    radius: 2.0,
+                    luminance: 0.05,
+                    color: 0.1,
                 }),
             },
             locals: vec![LocalAdjustment {
