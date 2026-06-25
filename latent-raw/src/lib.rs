@@ -118,6 +118,16 @@ pub struct Metadata {
     pub cdesc: [u8; 4],
     /// Camera→XYZ color matrix (one row per camera channel).
     pub cam_xyz: [[f32; 3]; 4],
+    /// Camera maker, as in EXIF (e.g. `"Canon"`); empty if unknown.
+    pub make: String,
+    /// Camera model, as in EXIF (e.g. `"Canon EOS 5D Mark III"`); empty if unknown.
+    pub model: String,
+    /// Lens model, as in EXIF (e.g. `"Canon EF 16-35mm f/2.8L II USM"`); empty if unknown.
+    pub lens: String,
+    /// Focal length in mm at capture, or `0` if unknown.
+    pub focal_len: f32,
+    /// Aperture (f-number) at capture, or `0` if unknown.
+    pub aperture: f32,
 }
 
 /// A decoded RAW file that owns its sensor data.
@@ -480,9 +490,22 @@ pub fn unpack(path: &Path) -> Result<RawImage, RawError> {
 ///
 /// # Safety
 /// `raw` must be a non-null, successfully unpacked `libraw_data_t`.
+/// Read a NUL-terminated fixed C `char` buffer into an owned `String` (lossy on
+/// non-UTF-8, trimmed of trailing whitespace).
+fn c_str_field(buf: &[std::os::raw::c_char]) -> String {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
 unsafe fn read_metadata(raw: *mut ffi::libraw_data_t) -> Metadata {
     let color = unsafe { &(*raw).color };
     let idata = unsafe { &(*raw).idata };
+    let other = unsafe { &(*raw).other };
+    let lens = unsafe { &(*raw).lens };
 
     // The 2x2 CFA: ask LibRaw which color each of the top-left photosites is.
     let mut cfa = [0_u8; 4];
@@ -502,6 +525,11 @@ unsafe fn read_metadata(raw: *mut ffi::libraw_data_t) -> Metadata {
         cfa,
         cdesc: std::array::from_fn(|i| idata.cdesc[i] as u8),
         cam_xyz,
+        make: c_str_field(&idata.make),
+        model: c_str_field(&idata.model),
+        lens: c_str_field(&lens.Lens),
+        focal_len: other.focal_len,
+        aperture: other.aperture,
     }
 }
 
@@ -529,6 +557,11 @@ mod tests {
                 cfa: [0, 1, 1, 2],
                 cdesc: *b"RGBG",
                 cam_xyz: [[0.0; 3]; 4],
+                make: String::new(),
+                model: String::new(),
+                lens: String::new(),
+                focal_len: 0.0,
+                aperture: 0.0,
             },
         }
     }
@@ -588,6 +621,11 @@ mod tests {
                 cfa: [0, 1, 1, 2], // RGGB
                 cdesc: *b"RGBG",
                 cam_xyz: [[0.0; 3]; 4],
+                make: String::new(),
+                model: String::new(),
+                lens: String::new(),
+                focal_len: 0.0,
+                aperture: 0.0,
             },
         };
         // A neutral gray reads unequal per channel (∝ 1/gain): R, G, G, B.
@@ -637,6 +675,11 @@ mod tests {
                 cfa: [0, 1, 1, 2],
                 cdesc: *b"RGBG",
                 cam_xyz: [[0.0; 3]; 4],
+                make: String::new(),
+                model: String::new(),
+                lens: String::new(),
+                focal_len: 0.0,
+                aperture: 0.0,
             },
         };
         // A neutral highlight that blew the sensor demosaics to a colored cast.
@@ -675,6 +718,11 @@ mod tests {
                 cfa,
                 cdesc: *b"RGBG",
                 cam_xyz: [[0.0; 3]; 4],
+                make: String::new(),
+                model: String::new(),
+                lens: String::new(),
+                focal_len: 0.0,
+                aperture: 0.0,
             },
         }
     }

@@ -7,7 +7,8 @@
 //! (SOURCE → OUTPUT).
 
 use latent_edit::{
-    Adjustments, Crop, Curves, Geometry, LocalAdjustment, Mask, SelectiveTone, Settings,
+    Adjustments, Crop, Curves, Geometry, LensProfile, LocalAdjustment, Mask, Perspective,
+    SelectiveTone, Settings,
 };
 use latent_image::ImageBuf;
 use latent_image::color::luminance;
@@ -75,20 +76,22 @@ pub struct Extent {
     pub height: u32,
 }
 
-/// An affine map from OUTPUT pixel coordinates to SOURCE pixel coordinates,
-/// plus the size of the output image.
+/// A projective (homography) map from OUTPUT pixel coordinates to SOURCE pixel
+/// coordinates, plus the size of the output image.
 ///
 /// The geometry stage resamples by inverse-mapping each output pixel through
 /// this and sampling the source — so the map runs output → source. Keeping it
-/// an explicit value (rather than baking rotation into the backend) is what
-/// will later let perspective/distortion compose here, and mask reprojection
-/// remain possible.
+/// an explicit value (rather than baking rotation into the backend) is what lets
+/// perspective compose here ([`Self::compose`]), distortion compose later, and
+/// mask reprojection remain possible.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
     /// Size of the output image.
     pub output: Extent,
-    /// Row-major 2x3 affine: `src = (m[0]·(x, y, 1), m[1]·(x, y, 1))`.
-    pub m: [[f32; 3]; 2],
+    /// Row-major 3x3 homography mapping an output pixel `(x, y, 1)` to a source
+    /// coordinate via the perspective divide (see [`Self::map`]). An affine
+    /// transform is the special case whose bottom row is `[0, 0, 1]`.
+    pub m: [[f32; 3]; 3],
 }
 
 impl Transform {
@@ -97,7 +100,7 @@ impl Transform {
     pub fn identity(extent: Extent) -> Self {
         Self {
             output: extent,
-            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         }
     }
 
@@ -120,16 +123,168 @@ impl Transform {
                 width: nw as u32,
                 height: nh as u32,
             },
-            m: [[cos, sin, m02], [-sin, cos, m12]],
+            m: [[cos, sin, m02], [-sin, cos, m12], [0.0, 0.0, 1.0]],
         }
     }
 
-    /// The source coordinate an output pixel `(x, y)` maps to.
+    /// The source coordinate an output pixel `(x, y)` maps to, after the
+    /// perspective divide by the homogeneous weight `w`. For an affine transform
+    /// (`w ≡ 1`) this is the plain matrix-vector product.
     pub fn map(&self, x: f32, y: f32) -> (f32, f32) {
+        let sx = self.m[0][0] * x + self.m[0][1] * y + self.m[0][2];
+        let sy = self.m[1][0] * x + self.m[1][1] * y + self.m[1][2];
+        let w = self.m[2][0] * x + self.m[2][1] * y + self.m[2][2];
+        if w <= 0.0 {
+            // Behind the projection plane (only reachable at extreme keystone):
+            // no valid source, so map outside the frame to read as black rather
+            // than a sign-flipped or NaN (0/0) coordinate.
+            return (-1.0, -1.0);
+        }
+        (sx / w, sy / w)
+    }
+
+    /// Compose two homographies: `self.compose(other).map(p)` equals
+    /// `self.map(other.map(p))` (up to the perspective scale). The matrix is the
+    /// product `self.m · other.m`; the result carries `self.output` as the final
+    /// output extent.
+    pub fn compose(&self, other: &Transform) -> Transform {
+        let (a, b) = (&self.m, &other.m);
+        let mut m = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+            }
+        }
+        Transform {
+            output: self.output,
+            m,
+        }
+    }
+}
+
+/// The normalized radial distance of a point from `center`, scaled by
+/// `inv_norm` (the reciprocal of the normalization radius). Shared by the radial
+/// warp and the radial-gain (vignette) steps so they agree on one geometry.
+pub fn normalized_radius(x: f32, y: f32, center: [f32; 2], inv_norm: f32) -> f32 {
+    let dx = x - center[0];
+    let dy = y - center[1];
+    (dx * dx + dy * dy).sqrt() * inv_norm
+}
+
+/// A radial gain field — a per-pixel multiplier varying with the normalized
+/// distance from `center`. Shared by lens-vignetting *correction* (in SOURCE,
+/// `reciprocal` of the measured falloff) and the *creative* vignette (in OUTPUT);
+/// the model is `1 + g0·r² + g1·r⁴ + g2·r⁶`, optionally reciprocated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadialGain {
+    /// Center of the radial field, in the image's pixel coordinates.
+    pub center: [f32; 2],
+    /// Reciprocal of the radius normalization.
+    pub inv_norm: f32,
+    /// Polynomial coefficients in `r²`.
+    pub poly: [f32; 3],
+    /// Divide by the polynomial instead of multiplying (lens correction is the
+    /// reciprocal of the measured falloff).
+    pub reciprocal: bool,
+}
+
+impl RadialGain {
+    /// The gain multiplier at point `(x, y)`.
+    pub fn at(&self, x: f32, y: f32) -> f32 {
+        let r2 = {
+            let r = normalized_radius(x, y, self.center, self.inv_norm);
+            r * r
+        };
+        let p = 1.0 + self.poly[0] * r2 + self.poly[1] * r2 * r2 + self.poly[2] * r2 * r2 * r2;
+        if self.reciprocal { 1.0 / p } else { p }
+    }
+}
+
+/// A general (possibly non-affine) OUTPUT → SOURCE map for a single resample: a
+/// homography applied first, then a radial distortion about a center, then an
+/// optional per-channel radial scale (lateral chromatic aberration).
+///
+/// Composing all of these into one coordinate lookup is what keeps the geometry
+/// stage to a *single* interpolation — a separate distortion pass followed by a
+/// separate perspective pass would interpolate twice and soften the image. With
+/// an all-zero `radial` and unit `channel_scale` this is exactly the homography
+/// [`Transform`] of the same matrix.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warp {
+    /// Size of the output image.
+    pub output: Extent,
+    /// Homography (output → rectilinear source coordinates), as in [`Transform`].
+    pub m: [[f32; 3]; 3],
+    /// Center of the radial term, in source pixel coordinates.
+    pub center: [f32; 2],
+    /// Reciprocal of the radius normalization, so radius math is a multiply.
+    pub inv_norm: f32,
+    /// Radial distortion polynomial in the normalized radius `r`: a point at
+    /// radius `r` from `center` is mapped to `r·(1 + d0·r + d1·r² + d2·r³ + d3·r⁴)`.
+    /// The even-only subset is Brown–Conrady (Brown 1966); the odd terms let it
+    /// also express the PanoTools/Hugin model. All-zero = no radial term.
+    pub radial: [f32; 4],
+    /// Per-channel `[r, g, b]` scale of the offset from `center`, for lateral
+    /// chromatic aberration: each channel samples at its own radius. `[1, 1, 1]`
+    /// is no CA — the channels share one coordinate and resample in one pass.
+    pub channel_scale: [f32; 3],
+}
+
+impl Warp {
+    /// The pure-homography warp of a [`Transform`] — no radial term and no CA, so
+    /// it resamples identically to [`Backend::resample`] of the same transform.
+    pub fn from_transform(t: &Transform) -> Self {
+        Self {
+            output: t.output,
+            m: t.m,
+            center: [0.0, 0.0],
+            inv_norm: 0.0,
+            radial: [0.0, 0.0, 0.0, 0.0],
+            channel_scale: [1.0, 1.0, 1.0],
+        }
+    }
+
+    /// The source coordinate an output pixel `(x, y)` maps to: the homography
+    /// (with perspective divide), then the radial distortion about `center`. This
+    /// is the geometric (CA-free) coordinate shared by all channels.
+    pub fn map(&self, x: f32, y: f32) -> (f32, f32) {
+        let w = self.m[2][0] * x + self.m[2][1] * y + self.m[2][2];
+        if w <= 0.0 {
+            // Behind the projection plane (extreme keystone) — sample outside.
+            return (-1.0, -1.0);
+        }
+        let ix = (self.m[0][0] * x + self.m[0][1] * y + self.m[0][2]) / w;
+        let iy = (self.m[1][0] * x + self.m[1][1] * y + self.m[1][2]) / w;
+        if self.radial == [0.0, 0.0, 0.0, 0.0] {
+            return (ix, iy);
+        }
+        let (dx, dy) = (ix - self.center[0], iy - self.center[1]);
+        let r2 = (dx * dx + dy * dy) * self.inv_norm * self.inv_norm;
+        let r = r2.sqrt();
+        // s(r) = 1 + d0·r + d1·r² + d2·r³ + d3·r⁴ (Horner in r).
+        let [d0, d1, d2, d3] = self.radial;
+        let s = 1.0 + r * (d0 + r * (d1 + r * (d2 + r * d3)));
+        (self.center[0] + dx * s, self.center[1] + dy * s)
+    }
+
+    /// The source coordinate channel `c` samples from: [`Self::map`] with the
+    /// per-channel CA scale applied to the offset from `center`.
+    pub fn map_channel(&self, x: f32, y: f32, c: usize) -> (f32, f32) {
+        let (bx, by) = self.map(x, y);
+        let f = self.channel_scale[c];
+        if f == 1.0 {
+            return (bx, by);
+        }
         (
-            self.m[0][0] * x + self.m[0][1] * y + self.m[0][2],
-            self.m[1][0] * x + self.m[1][1] * y + self.m[1][2],
+            self.center[0] + (bx - self.center[0]) * f,
+            self.center[1] + (by - self.center[1]) * f,
         )
+    }
+
+    /// Whether any channel has a non-unit CA scale (so channels must be sampled
+    /// separately rather than in one shared lookup).
+    pub fn has_chromatic(&self) -> bool {
+        self.channel_scale != [1.0, 1.0, 1.0]
     }
 }
 
@@ -153,6 +308,14 @@ pub trait Backend {
     /// Resample the image into a new one by inverse-mapping each output pixel
     /// through `transform` and sampling the source (bilinear).
     fn resample(&self, img: &ImageBuf, transform: &Transform) -> ImageBuf;
+
+    /// Resample through a general [`Warp`] — a homography composed with a radial
+    /// distortion — in a single interpolation. With an all-zero radial term this
+    /// matches [`Self::resample`] of the same homography.
+    fn warp(&self, img: &ImageBuf, warp: &Warp) -> ImageBuf;
+
+    /// Multiply each pixel by a radial gain field (see [`RadialGain`]), in place.
+    fn apply_radial_gain(&self, img: &mut ImageBuf, gain: &RadialGain);
 
     /// Denoise the image with an edge-preserving (bilateral) filter, returning a
     /// new image. Unlike [`Self::blur`], the averaging is edge-aware: it smooths
@@ -476,23 +639,131 @@ fn apply_locals(mut img: ImageBuf, locals: &[LocalAdjustment], backend: &dyn Bac
     img
 }
 
+/// Build the keystone (perspective-correction) transform for an image of size
+/// `extent`: an output → source homography correcting converging verticals
+/// (`vertical`) and horizontals (`horizontal`). The frame center is fixed and
+/// each amount is normalized to the half-extent, so it is the shift in the
+/// projective weight from center to edge. Both amounts `0` is the identity.
+///
+/// Derived as `T(c) · K · T(-c)` with the centered keystone `K` carrying the
+/// perspective term in its bottom row `[a, b, 1]` (`a = horizontal/cx`,
+/// `b = vertical/cy`), so the divide varies the horizontal scale with `y` (and
+/// vice versa) — turning a converging source line into a straight output one.
+pub fn keystone_transform(extent: Extent, vertical: f32, horizontal: f32) -> Transform {
+    let cx = (extent.width as f32 - 1.0) / 2.0;
+    let cy = (extent.height as f32 - 1.0) / 2.0;
+    let a = if cx > 0.0 { horizontal / cx } else { 0.0 };
+    let b = if cy > 0.0 { vertical / cy } else { 0.0 };
+    let k = a * cx + b * cy;
+    Transform {
+        output: extent,
+        m: [
+            [1.0 + cx * a, cx * b, -cx * k],
+            [cy * a, 1.0 + cy * b, -cy * k],
+            [a, b, 1.0 - k],
+        ],
+    }
+}
+
+/// The radial component of a [`LensProfile`] for an image of size `extent`, as
+/// the `(center, inv_norm, radial)` fields of a [`Warp`]: the optical center in
+/// source pixels, the reciprocal of the normalization radius (half the shorter
+/// side, the pinned convention), and the Brown–Conrady coefficients.
+fn lens_radial(extent: Extent, lens: &LensProfile) -> ([f32; 2], f32, [f32; 4]) {
+    let (w, h) = (extent.width as f32, extent.height as f32);
+    let center = [lens.center[0] * (w - 1.0), lens.center[1] * (h - 1.0)];
+    let inv_norm = 2.0 / w.min(h);
+    (center, inv_norm, lens.distortion)
+}
+
 /// Stage: geometry — the single SOURCE → OUTPUT step.
 ///
-/// Straighten first (a resample about the center, expanding the canvas), then
-/// crop (an exact clip of the result). Both are reversible: they only change
-/// what the *output* contains, never the source. The default geometry leaves
-/// the image untouched.
+/// Lens distortion, keystone, and straighten all compose into one coordinate map
+/// so the image is interpolated *exactly once*; then crop is an exact clip of the
+/// result. All are reversible: they only change what the *output* contains, never
+/// the source. The default geometry leaves the image untouched.
+///
+/// The output keeps the source frame size — there is no auto-scale-to-fill, so a
+/// strong distortion or keystone correction can leave black borders the user
+/// crops away (an auto-scale would be a later addition).
 fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend) -> ImageBuf {
-    if geometry.straighten_degrees != 0.0 {
-        let extent = Extent {
-            width: img.width(),
-            height: img.height(),
-        };
-        let t = Transform::rotation(extent, geometry.straighten_degrees.to_radians());
-        img = backend.resample(&img, &t);
+    let extent = Extent {
+        width: img.width(),
+        height: img.height(),
+    };
+    // Lens vignetting correction is a SOURCE-space radial gain applied *before*
+    // any resample (matching lensfun's vignetting → geometry order): a flat-field
+    // multiply, not an interpolation.
+    if let Some(l) = geometry.lens.filter(|l| l.vignetting != [0.0, 0.0, 0.0]) {
+        let (center, inv_norm, _) = lens_radial(extent, &l);
+        backend.apply_radial_gain(
+            &mut img,
+            &RadialGain {
+                center,
+                inv_norm,
+                poly: l.vignetting,
+                reciprocal: true,
+            },
+        );
+    }
+    let straighten = (geometry.straighten_degrees != 0.0)
+        .then(|| Transform::rotation(extent, geometry.straighten_degrees.to_radians()));
+    let keystone = geometry
+        .perspective
+        .filter(|p: &Perspective| p.vertical != 0.0 || p.horizontal != 0.0)
+        .map(|p| keystone_transform(extent, p.vertical, p.horizontal));
+    // Compose straighten and keystone into one homography (output → rectilinear
+    // source). The output canvas is the straighten's bounding box when present.
+    let homography = match (straighten, keystone) {
+        (Some(s), Some(k)) => Some(Transform {
+            output: s.output,
+            ..k.compose(&s)
+        }),
+        (Some(s), None) => Some(s),
+        (None, Some(k)) => Some(k),
+        (None, None) => None,
+    };
+    // Fold lens distortion and chromatic aberration into the *same* resample:
+    // homography, then the radial term, then a per-channel scale — one
+    // interpolation, never a second warp pass.
+    let lens = geometry
+        .lens
+        .filter(|l| l.distortion != [0.0, 0.0, 0.0, 0.0] || l.ca != [0.0, 0.0]);
+    match (homography, lens) {
+        (h, Some(l)) => {
+            let base = h.unwrap_or_else(|| Transform::identity(extent));
+            let (center, inv_norm, radial) = lens_radial(extent, &l);
+            img = backend.warp(
+                &img,
+                &Warp {
+                    output: base.output,
+                    m: base.m,
+                    center,
+                    inv_norm,
+                    radial,
+                    channel_scale: [1.0 + l.ca[0], 1.0, 1.0 + l.ca[1]],
+                },
+            );
+        }
+        (Some(t), None) => img = backend.resample(&img, &t),
+        (None, None) => {}
     }
     if let Some(crop) = geometry.crop {
         img = crop_image(&img, crop);
+    }
+    // Creative vignette: a radial gain about the *output* (post-crop) frame
+    // center, normalized so the corners sit at r = 1. A gain, not a resample.
+    if let Some(amount) = geometry.vignette.filter(|a| *a != 0.0) {
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        backend.apply_radial_gain(
+            &mut img,
+            &RadialGain {
+                center: [(w - 1.0) / 2.0, (h - 1.0) / 2.0],
+                inv_norm: 2.0 / (w * w + h * h).sqrt(),
+                poly: [amount, 0.0, 0.0],
+                reciprocal: false,
+            },
+        );
     }
     img
 }
@@ -625,6 +896,47 @@ mod tests {
                 }
             }
             out
+        }
+
+        fn warp(&self, img: &ImageBuf, wp: &Warp) -> ImageBuf {
+            // Nearest-neighbor sampling through the general warp coordinate map,
+            // per channel when chromatic aberration is present.
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            let sample = |sx: f32, sy: f32| {
+                let (xi, yi) = (sx.round() as i32, sy.round() as i32);
+                if xi >= 0 && yi >= 0 && xi < w && yi < h {
+                    img.get(xi as u32, yi as u32)
+                } else {
+                    [0.0; 3]
+                }
+            };
+            let chromatic = wp.has_chromatic();
+            let mut out = ImageBuf::new(wp.output.width, wp.output.height);
+            for oy in 0..wp.output.height {
+                for ox in 0..wp.output.width {
+                    let px = if chromatic {
+                        std::array::from_fn(|c| {
+                            let (sx, sy) = wp.map_channel(ox as f32, oy as f32, c);
+                            sample(sx, sy)[c]
+                        })
+                    } else {
+                        let (sx, sy) = wp.map(ox as f32, oy as f32);
+                        sample(sx, sy)
+                    };
+                    out.set(ox, oy, px);
+                }
+            }
+            out
+        }
+
+        fn apply_radial_gain(&self, img: &mut ImageBuf, gain: &RadialGain) {
+            for y in 0..img.height() {
+                for x in 0..img.width() {
+                    let g = gain.at(x as f32, y as f32);
+                    let p = img.get(x, y);
+                    img.set(x, y, [p[0] * g, p[1] * g, p[2] * g]);
+                }
+            }
         }
 
         fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
@@ -935,6 +1247,9 @@ mod tests {
                     height: 1.0,
                 }),
                 straighten_degrees: 0.0,
+                perspective: None,
+                lens: None,
+                vignette: None,
             },
             ..Settings::default()
         };
@@ -954,6 +1269,9 @@ mod tests {
             geometry: Geometry {
                 crop: None,
                 straighten_degrees: 20.0,
+                perspective: None,
+                lens: None,
+                vignette: None,
             },
             ..Settings::default()
         };
@@ -1044,5 +1362,405 @@ mod tests {
             "bright unchanged: {:?}",
             out.get(1, 0)
         );
+    }
+
+    #[test]
+    fn affine_constructors_have_a_unit_bottom_row() {
+        let ext = Extent {
+            width: 4,
+            height: 3,
+        };
+        assert_eq!(Transform::identity(ext).m[2], [0.0, 0.0, 1.0]);
+        assert_eq!(Transform::rotation(ext, 0.3).m[2], [0.0, 0.0, 1.0]);
+        // Identity still maps every point to itself.
+        assert_eq!(Transform::identity(ext).map(2.0, 1.0), (2.0, 1.0));
+    }
+
+    #[test]
+    fn homography_applies_the_perspective_divide() {
+        // A pure perspective in x: w = 0.1·x + 1, so output (10, 20) maps to
+        // (10/2, 20/2) = (5, 10) after the divide.
+        let t = Transform {
+            output: Extent {
+                width: 16,
+                height: 16,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.1, 0.0, 1.0]],
+        };
+        let (sx, sy) = t.map(10.0, 20.0);
+        assert!(
+            (sx - 5.0).abs() < 1e-6 && (sy - 10.0).abs() < 1e-6,
+            "{sx}, {sy}"
+        );
+    }
+
+    #[test]
+    fn compose_equals_sequential_mapping() {
+        // A perspective B then an affine translation A. Composing the matrices
+        // must equal mapping through B, then A, point for point.
+        let ext = Extent {
+            width: 16,
+            height: 16,
+        };
+        let a = Transform {
+            output: ext,
+            m: [[1.0, 0.0, 3.0], [0.0, 1.0, -2.0], [0.0, 0.0, 1.0]],
+        };
+        let b = Transform {
+            output: ext,
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.1, 0.0, 1.0]],
+        };
+        let direct = a.compose(&b).map(10.0, 20.0);
+        let (bx, by) = b.map(10.0, 20.0);
+        let seq = a.map(bx, by);
+        assert!((direct.0 - seq.0).abs() < 1e-6 && (direct.1 - seq.1).abs() < 1e-6);
+        assert!(
+            (direct.0 - 8.0).abs() < 1e-6 && (direct.1 - 8.0).abs() < 1e-6,
+            "{direct:?}"
+        );
+    }
+
+    #[test]
+    fn testbackend_resamples_through_a_homography() {
+        // Per-pixel marker r = x + 8y; the perspective samples through the divide.
+        // Output (4, 0) → (4/1.4, 0) ≈ (2.86, 0) → nearest source (3, 0).
+        let mut src = ImageBuf::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                src.set(x, y, [(x + 8 * y) as f32, 0.0, 0.0]);
+            }
+        }
+        let t = Transform {
+            output: Extent {
+                width: 8,
+                height: 8,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.1, 0.0, 1.0]],
+        };
+        let out = TestBackend.resample(&src, &t);
+        assert_eq!(out.get(4, 0), [3.0, 0.0, 0.0]);
+        assert_eq!(out.get(0, 4), [32.0, 0.0, 0.0]); // w = 1 → (0, 4) exact
+    }
+
+    #[test]
+    fn keystone_straightens_converging_verticals() {
+        // Two bright source pixels lie on a line that converges toward the top
+        // (top point at x=8, lower point at x=6). A vertical keystone must lift
+        // them onto a single output column — i.e. straighten the vertical.
+        let mut src = ImageBuf::new(9, 9);
+        src.set(8, 0, [1.0, 1.0, 1.0]);
+        src.set(6, 6, [1.0, 1.0, 1.0]);
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: Some(Perspective {
+                    vertical: 0.3,
+                    horizontal: 0.0,
+                }),
+                lens: None,
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert_eq!((out.width(), out.height()), (9, 9));
+        assert_eq!(out.get(7, 1), [1.0, 1.0, 1.0]); // was source (8, 0)
+        assert_eq!(out.get(7, 7), [1.0, 1.0, 1.0]); // was source (6, 6)
+    }
+
+    #[test]
+    fn keystone_zero_is_a_no_op() {
+        let mut src = ImageBuf::new(6, 4);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [i as f32, 0.0, 0.0];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: Some(Perspective {
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                }),
+                lens: None,
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        assert_eq!(render(&src, &settings, &TestBackend), src);
+    }
+
+    #[test]
+    fn warp_with_zero_radial_equals_the_homography() {
+        let t = Transform {
+            output: Extent {
+                width: 8,
+                height: 8,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.1, 0.0, 1.0]],
+        };
+        let w = Warp::from_transform(&t);
+        assert_eq!(w.map(3.0, 5.0), t.map(3.0, 5.0));
+    }
+
+    #[test]
+    fn warp_map_composes_homography_then_radial() {
+        // Identity homography, unit normalization, an r² term d1 = 0.1: the point
+        // (3, 4) is r² = 25 from the origin, so it scales by 1 + 0.1·25 = 3.5.
+        let w = Warp {
+            output: Extent {
+                width: 8,
+                height: 8,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [0.0, 0.0],
+            inv_norm: 1.0,
+            radial: [0.0, 0.1, 0.0, 0.0],
+            channel_scale: [1.0, 1.0, 1.0],
+        };
+        let (sx, sy) = w.map(3.0, 4.0);
+        assert!(
+            (sx - 10.5).abs() < 1e-5 && (sy - 14.0).abs() < 1e-5,
+            "{sx}, {sy}"
+        );
+    }
+
+    #[test]
+    fn warp_map_handles_odd_radial_powers() {
+        // A pure r term (d0 = 0.1) — the odd power Brown–Conrady could not hold,
+        // needed for the PanoTools/PTLENS model. (3, 4) is r = 5 from the origin,
+        // so it scales by 1 + 0.1·5 = 1.5.
+        let w = Warp {
+            output: Extent {
+                width: 8,
+                height: 8,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [0.0, 0.0],
+            inv_norm: 1.0,
+            radial: [0.1, 0.0, 0.0, 0.0],
+            channel_scale: [1.0, 1.0, 1.0],
+        };
+        let (sx, sy) = w.map(3.0, 4.0);
+        assert!(
+            (sx - 4.5).abs() < 1e-5 && (sy - 6.0).abs() < 1e-5,
+            "{sx}, {sy}"
+        );
+    }
+
+    #[test]
+    fn extreme_keystone_behind_the_plane_maps_outside() {
+        // Both keystone amounts at the slider max put the homography weight w ≤ 0
+        // at a corner; the guard maps it outside the source (black), not to a
+        // sign-flipped or NaN coordinate.
+        let t = keystone_transform(
+            Extent {
+                width: 9,
+                height: 9,
+            },
+            0.8,
+            0.8,
+        );
+        assert_eq!(t.map(0.0, 0.0), (-1.0, -1.0));
+    }
+
+    #[test]
+    fn lens_distortion_straightens_a_barrel_grid() {
+        // Three bright source pixels bow outward at the middle (the barrel
+        // signature): columns 15, 16, 15 at rows 6, 10, 14. The distortion
+        // correction must pull them onto one straight output column (18).
+        let mut src = ImageBuf::new(21, 21);
+        src.set(16, 10, [1.0, 1.0, 1.0]);
+        src.set(15, 6, [1.0, 1.0, 1.0]);
+        src.set(15, 14, [1.0, 1.0, 1.0]);
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: Some(LensProfile {
+                    center: [0.5, 0.5],
+                    distortion: [0.0, -0.4, 0.0, 0.0],
+                    ca: [0.0, 0.0],
+                    vignetting: [0.0, 0.0, 0.0],
+                }),
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert_eq!((out.width(), out.height()), (21, 21));
+        assert_eq!(out.get(18, 10), [1.0, 1.0, 1.0]); // was source (16, 10)
+        assert_eq!(out.get(18, 4), [1.0, 1.0, 1.0]); // was source (15, 6)
+        assert_eq!(out.get(18, 16), [1.0, 1.0, 1.0]); // was source (15, 14)
+    }
+
+    #[test]
+    fn empty_lens_profile_is_a_no_op() {
+        let mut src = ImageBuf::new(6, 4);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [i as f32, 0.0, 0.0];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: Some(LensProfile {
+                    center: [0.5, 0.5],
+                    distortion: [0.0, 0.0, 0.0, 0.0],
+                    ca: [0.0, 0.0],
+                    vignetting: [0.0, 0.0, 0.0],
+                }),
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        assert_eq!(render(&src, &settings, &TestBackend), src);
+    }
+
+    #[test]
+    fn chromatic_aberration_recombines_a_split_target() {
+        // A laterally split feature: red fringed outward (x=16), green centered
+        // (x=15), blue inward (x=14). The per-channel CA correction samples each
+        // back onto one output pixel, recombining them to white.
+        let mut src = ImageBuf::new(17, 17);
+        src.set(16, 8, [1.0, 0.0, 0.0]);
+        src.set(15, 8, [0.0, 1.0, 0.0]);
+        src.set(14, 8, [0.0, 0.0, 1.0]);
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: Some(LensProfile {
+                    center: [0.5, 0.5],
+                    distortion: [0.0, 0.0, 0.0, 0.0],
+                    ca: [0.1, -0.1],
+                    vignetting: [0.0, 0.0, 0.0],
+                }),
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        assert_eq!(out.get(15, 8), [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn lens_vignetting_flattens_a_radial_falloff() {
+        // The captured image carries the lens's falloff (1 + v·r², v < 0, so
+        // corners are darker); correction divides it back out, flattening it.
+        let mut src = ImageBuf::new(9, 9);
+        for p in src.pixels_mut() {
+            *p = [0.5, 0.5, 0.5];
+        }
+        let falloff = RadialGain {
+            center: [4.0, 4.0],
+            inv_norm: 2.0 / 9.0,
+            poly: [-0.5, 0.0, 0.0],
+            reciprocal: false,
+        };
+        TestBackend.apply_radial_gain(&mut src, &falloff);
+        assert!(src.get(0, 0)[0] < src.get(4, 4)[0], "corners darkened");
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: Some(LensProfile {
+                    center: [0.5, 0.5],
+                    distortion: [0.0, 0.0, 0.0, 0.0],
+                    ca: [0.0, 0.0],
+                    vignetting: [-0.5, 0.0, 0.0],
+                }),
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        for p in out.pixels() {
+            assert!((p[0] - 0.5).abs() < 1e-5, "flattened: {p:?}");
+        }
+    }
+
+    #[test]
+    fn neutral_ca_leaves_color_unchanged() {
+        // ca = [0, 0] → all channels share one coordinate; with no distortion the
+        // color image is untouched (the single-sample fast path).
+        let mut src = ImageBuf::new(8, 8);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [i as f32, (2 * i) as f32, (3 * i) as f32];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: Some(LensProfile {
+                    center: [0.5, 0.5],
+                    distortion: [0.0, 0.0, 0.0, 0.0],
+                    ca: [0.0, 0.0],
+                    vignetting: [0.0, 0.0, 0.0],
+                }),
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        assert_eq!(render(&src, &settings, &TestBackend), src);
+    }
+
+    #[test]
+    fn creative_vignette_darkens_corners_and_keeps_center() {
+        let mut src = ImageBuf::new(11, 11);
+        for p in src.pixels_mut() {
+            *p = [0.6, 0.6, 0.6];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: None,
+                vignette: Some(-0.5),
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        // Center is untouched; corners darken by the modeled radial gain.
+        assert_eq!(out.get(5, 5), [0.6, 0.6, 0.6]);
+        let g = RadialGain {
+            center: [5.0, 5.0],
+            inv_norm: 2.0 / (11.0_f32 * 11.0 + 11.0 * 11.0).sqrt(),
+            poly: [-0.5, 0.0, 0.0],
+            reciprocal: false,
+        };
+        let expected = 0.6 * g.at(0.0, 0.0);
+        assert!(out.get(0, 0)[0] < 0.6, "corner darkened");
+        assert!(
+            (out.get(0, 0)[0] - expected).abs() < 1e-5,
+            "{:?}",
+            out.get(0, 0)
+        );
+    }
+
+    #[test]
+    fn no_vignette_leaves_the_image_unchanged() {
+        let mut src = ImageBuf::new(8, 8);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [i as f32, 0.0, 0.0];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                crop: None,
+                straighten_degrees: 0.0,
+                perspective: None,
+                lens: None,
+                vignette: None,
+            },
+            ..Settings::default()
+        };
+        assert_eq!(render(&src, &settings, &TestBackend), src);
     }
 }

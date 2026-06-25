@@ -9,6 +9,7 @@ members = [
     "latent-export",
     "latent-app",
     "latent-gpu",
+    "latent-lens",
 ]
 
 # Shared metadata; each crate inherits these via `field.workspace = true`.

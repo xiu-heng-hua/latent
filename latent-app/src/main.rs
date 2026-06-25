@@ -58,7 +58,7 @@ fn select_backend(use_gpu: bool) -> Box<dyn Backend> {
 /// normalize, white balance, demosaic, reconstruct blown highlights, then the
 /// camera→working color transform. This is the base the pipeline renders
 /// adjustments and geometry over.
-pub fn develop_to_image(input: &Path) -> Result<ImageBuf, Box<dyn Error>> {
+pub fn develop_to_image(input: &Path) -> Result<(ImageBuf, latent_raw::Metadata), Box<dyn Error>> {
     let raw = latent_raw::unpack(input)?;
     let mut mosaic = raw.normalized();
     raw.apply_white_balance(&mut mosaic);
@@ -67,11 +67,11 @@ pub fn develop_to_image(input: &Path) -> Result<ImageBuf, Box<dyn Error>> {
     let to_working = raw
         .color_matrix()
         .ok_or("camera color matrix is singular")?;
-    Ok(color::apply_matrix(&camera_rgb, &to_working))
+    Ok((color::apply_matrix(&camera_rgb, &to_working), raw.meta))
 }
 
 fn develop(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
-    let img = develop_to_image(input)?;
+    let (img, _) = develop_to_image(input)?;
     latent_export::save(&img, output)?;
     Ok(())
 }

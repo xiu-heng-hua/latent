@@ -1,5 +1,5 @@
-// Resample by inverse mapping: trace each output pixel back through the affine
-// transform into the source and bilinearly sample it. A neighbour outside the
+// Resample by inverse mapping: trace each output pixel back through the
+// homography into the source and bilinearly sample it. A neighbour outside the
 // source contributes black, so sampling past the border fades to black —
 // matching the CPU `resample` + `sample_bilinear`.
 
@@ -8,15 +8,20 @@ struct Params {
     out_height: u32,
     src_width: u32,
     src_height: u32,
-    // Row-major 2x3 affine: src = (m0·x + m1·y + m2, m3·x + m4·y + m5).
+    // Row-major 3x3 homography; src = (m0·x + m1·y + m2, m3·x + m4·y + m5) / w,
+    // where w = m6·x + m7·y + m8. Affine is the w ≡ 1 case (m6 = m7 = 0, m8 = 1).
     m0: f32,
     m1: f32,
     m2: f32,
     m3: f32,
     m4: f32,
     m5: f32,
+    m6: f32,
+    m7: f32,
+    m8: f32,
     _pad0: f32,
     _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -38,8 +43,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let ox = f32(gid.x);
     let oy = f32(gid.y);
-    let sx = p.m0 * ox + p.m1 * oy + p.m2;
-    let sy = p.m3 * ox + p.m4 * oy + p.m5;
+    let w = p.m6 * ox + p.m7 * oy + p.m8;
+    let sx = (p.m0 * ox + p.m1 * oy + p.m2) / w;
+    let sy = (p.m3 * ox + p.m4 * oy + p.m5) / w;
 
     let x0 = floor(sx);
     let y0 = floor(sy);

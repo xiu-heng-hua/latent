@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use latent_edit::{
     Adjustments, Brush, Clarity, ColorRange, Crop, Curves, Dab, Document, Gradient, History,
-    LocalAdjustment, LuminanceRange, Mask, MaskShape, NoiseReduction, Radial, SelectiveTone,
-    Settings, Sharpen, WhiteBalance,
+    LensProfile, LocalAdjustment, LuminanceRange, Mask, MaskShape, NoiseReduction, Perspective,
+    Radial, SelectiveTone, Settings, Sharpen, WhiteBalance,
 };
 use latent_image::ImageBuf;
 use latent_pipeline::{Backend, render};
@@ -22,19 +22,27 @@ const PREVIEW_MAX_DIM: u32 = 1600;
 /// Develop `input` and open the editor window, rendering with `backend`.
 pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>> {
     // Develop once at full res; the preview re-renders over a downscaled copy.
-    let full = crate::develop_to_image(input)?;
+    let (full, meta) = crate::develop_to_image(input)?;
     let preview = full.downscaled(PREVIEW_MAX_DIM);
     let title = format!("{}  ({}x{})", input.display(), full.width(), full.height());
     let output = input.with_extension("jpg").to_string_lossy().into_owned();
 
     // Reload edits from the sidecar (photo.nef → photo.ron) if present.
     let sidecar = input.with_extension("ron");
-    let mut document = std::fs::read_to_string(&sidecar)
+    let loaded = std::fs::read_to_string(&sidecar)
         .ok()
-        .and_then(|text| Document::from_ron(&text).ok())
-        .unwrap_or_default();
+        .and_then(|text| Document::from_ron(&text).ok());
+    let from_sidecar = loaded.is_some();
+    let mut document = loaded.unwrap_or_default();
     if document.variants.is_empty() {
         document.variants.push(Settings::default());
+    }
+    // On a fresh document (no sidecar), auto-apply a lens profile from the RAW's
+    // EXIF if lensfun has one. A saved sidecar always wins — we never overwrite it.
+    if !from_sidecar && let Some(profile) = auto_lens_profile(&meta) {
+        for variant in &mut document.variants {
+            variant.geometry.lens = Some(profile);
+        }
     }
     let saved = document.variants.clone();
     let variants = document.variants.into_iter().map(History::new).collect();
@@ -65,6 +73,24 @@ pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>
     )
     .map_err(|e| format!("could not start the editor window: {e}"))?;
     Ok(())
+}
+
+/// Query lensfun for a lens profile matching the RAW's EXIF metadata, or `None`
+/// when there's no usable metadata, no match, or no database installed. Focus
+/// distance defaults to far, where vignetting/distortion are effectively fixed.
+fn auto_lens_profile(meta: &latent_raw::Metadata) -> Option<LensProfile> {
+    if meta.model.is_empty() && meta.lens.is_empty() {
+        return None;
+    }
+    let db = latent_lens::Database::load().ok()?;
+    db.find_profile(
+        &meta.make,
+        &meta.model,
+        &meta.lens,
+        meta.focal_len,
+        meta.aperture,
+        1000.0,
+    )
 }
 
 struct App {
@@ -259,7 +285,9 @@ impl eframe::App for App {
             ui.separator();
             ui.heading("Geometry");
             dirty |= straighten_slider(ui, &mut self.variants[active]);
+            dirty |= keystone_block(ui, &mut self.variants[active]);
             dirty |= crop_block(ui, &mut self.variants[active]);
+            dirty |= vignette_slider(ui, &mut self.variants[active]);
 
             ui.separator();
             ui.heading("Local Adjustments");
@@ -632,6 +660,55 @@ fn straighten_slider(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool
     }
     if changed {
         history.current_mut().geometry.straighten_degrees = angle;
+    }
+    if commit {
+        history.commit();
+    }
+    changed
+}
+
+/// Creative vignette applied after the crop: negative darkens the corners,
+/// positive lightens them. Zero clears it (back to `None`).
+fn vignette_slider(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
+    let mut amount = history.current().geometry.vignette.unwrap_or(0.0);
+    let r = ui.add(egui::Slider::new(&mut amount, -1.0..=1.0).text("Vignette"));
+    let (begin, commit, changed) = gesture(&[&r]);
+    if begin {
+        history.begin();
+    }
+    if changed {
+        history.current_mut().geometry.vignette = (amount != 0.0).then_some(amount);
+    }
+    if commit {
+        history.commit();
+    }
+    changed
+}
+
+/// Keystone: two sliders correcting converging verticals and horizontals.
+/// Both at zero clears the correction (back to `None`).
+fn keystone_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
+    let p = history
+        .current()
+        .geometry
+        .perspective
+        .unwrap_or(Perspective {
+            vertical: 0.0,
+            horizontal: 0.0,
+        });
+    let (mut v, mut h) = (p.vertical, p.horizontal);
+    let rv = ui.add(egui::Slider::new(&mut v, -0.8..=0.8).text("Vertical"));
+    let rh = ui.add(egui::Slider::new(&mut h, -0.8..=0.8).text("Horizontal"));
+    let (begin, commit, changed) = gesture(&[&rv, &rh]);
+    if begin {
+        history.begin();
+    }
+    if changed {
+        history.current_mut().geometry.perspective =
+            (v != 0.0 || h != 0.0).then_some(Perspective {
+                vertical: v,
+                horizontal: h,
+            });
     }
     if commit {
         history.commit();

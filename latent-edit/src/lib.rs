@@ -488,12 +488,77 @@ pub struct Geometry {
     pub crop: Option<Crop>,
     /// Straighten angle in degrees (positive = counter-clockwise); `0` is level.
     pub straighten_degrees: f32,
+    /// Keystone (perspective) correction, or `None` for none.
+    pub perspective: Option<Perspective>,
+    /// Lens correction profile, or `None` for none. Applied in the geometry
+    /// stage, composed into the same single resample as straighten/keystone.
+    pub lens: Option<LensProfile>,
+    /// Creative vignette amount applied after crop (OUTPUT space): negative
+    /// darkens the corners, positive lightens them; `None` (or `0`) is none.
+    pub vignette: Option<f32>,
 }
 
 impl Geometry {
-    /// True if this geometry changes nothing (no crop, no rotation).
+    /// True if this geometry changes nothing (no crop, rotation, keystone, lens,
+    /// or vignette).
     pub fn is_identity(&self) -> bool {
-        self.crop.is_none() && self.straighten_degrees == 0.0
+        self.crop.is_none()
+            && self.straighten_degrees == 0.0
+            && self.perspective.is_none()
+            && self.lens.is_none()
+            && self.vignette.is_none()
+    }
+}
+
+/// Keystone (perspective) correction. `vertical` corrects converging verticals
+/// (the camera tilted up or down); `horizontal` corrects converging horizontals
+/// (panned left or right). Each is a normalized amount in roughly `[-1, 1]`,
+/// where `0` is no correction.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Perspective {
+    pub vertical: f32,
+    pub horizontal: f32,
+}
+
+/// Lens correction profile: the optical parameters that undo a lens's geometric
+/// distortion. Coefficients are pure data — a synthetic model in tests, or a
+/// lens database (lensfun) at runtime.
+///
+/// Two conventions are pinned here so a database lookup can map its coefficients
+/// in without silent mis-scaling: the radius for the distortion model is
+/// normalized by **half the shorter image side** (so `r = 1` at the midpoint of
+/// the short edges, matching lensfun), and the optical `center` is normalized to
+/// the frame, where `(0.5, 0.5)` is the image center.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LensProfile {
+    /// Optical center, normalized to the frame (`(0.5, 0.5)` = image center).
+    pub center: [f32; 2],
+    /// Radial distortion as a polynomial in the normalized radius `r`: the
+    /// corrected radius maps to `r·(1 + d0·r + d1·r² + d2·r³ + d3·r⁴)`. This
+    /// general form covers every lensfun model — the even-only Brown–Conrady
+    /// family (POLY3, POLY5; Brown 1966) and the PanoTools/Hugin "abc" model
+    /// (PTLENS), which also needs odd powers. All zero is no distortion.
+    pub distortion: [f32; 4],
+    /// Lateral (transverse) chromatic aberration: radial scale offsets for red
+    /// and blue relative to green (the reference). Red samples at radius
+    /// `×(1 + ca[0])`, blue at `×(1 + ca[1])`; `[0, 0]` is no CA.
+    pub ca: [f32; 2],
+    /// Vignetting falloff (lensfun's PA model): the captured brightness is
+    /// `ideal · (1 + v0·r² + v1·r⁴ + v2·r⁶)` at normalized radius `r` (the `v`s
+    /// are negative for darker corners), so correction divides it back out. All
+    /// zero is no vignetting.
+    pub vignetting: [f32; 3],
+}
+
+impl Default for LensProfile {
+    /// A centered, distortion-, aberration-, and vignetting-free profile (a no-op).
+    fn default() -> Self {
+        Self {
+            center: [0.5, 0.5],
+            distortion: [0.0, 0.0, 0.0, 0.0],
+            ca: [0.0, 0.0],
+            vignetting: [0.0, 0.0, 0.0],
+        }
     }
 }
 
@@ -576,8 +641,35 @@ mod tests {
         let tilted = Geometry {
             crop: None,
             straighten_degrees: 1.0,
+            perspective: None,
+            lens: None,
+            vignette: None,
         };
         assert!(!tilted.is_identity());
+        let keystoned = Geometry {
+            crop: None,
+            straighten_degrees: 0.0,
+            perspective: Some(Perspective {
+                vertical: 0.2,
+                horizontal: 0.0,
+            }),
+            lens: None,
+            vignette: None,
+        };
+        assert!(!keystoned.is_identity());
+        let corrected = Geometry {
+            crop: None,
+            straighten_degrees: 0.0,
+            perspective: None,
+            lens: Some(LensProfile {
+                center: [0.5, 0.5],
+                distortion: [0.0, -0.1, 0.0, 0.0],
+                ca: [0.0, 0.0],
+                vignetting: [0.0, 0.0, 0.0],
+            }),
+            vignette: None,
+        };
+        assert!(!corrected.is_identity());
     }
 
     #[test]
@@ -881,6 +973,17 @@ mod tests {
                     height: 0.8,
                 }),
                 straighten_degrees: 2.5,
+                perspective: Some(Perspective {
+                    vertical: -0.15,
+                    horizontal: 0.1,
+                }),
+                lens: Some(LensProfile {
+                    center: [0.49, 0.51],
+                    distortion: [0.0, -0.08, 0.0, 0.02],
+                    ca: [0.001, -0.002],
+                    vignetting: [-0.2, 0.05, 0.0],
+                }),
+                vignette: Some(0.3),
             },
         };
         // Two variants: a neutral one and the edited one.

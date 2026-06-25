@@ -18,7 +18,7 @@ use latent_cpu::CpuBackend;
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::tone;
-use latent_pipeline::{Backend, CombineKind, DenoiseParams, PointOp, Transform};
+use latent_pipeline::{Backend, CombineKind, DenoiseParams, PointOp, RadialGain, Transform, Warp};
 use wgpu::util::DeviceExt;
 
 /// Uniform parameters for the `map_pixels` compute shader. Layout matches the
@@ -65,8 +65,8 @@ struct ResampleParams {
     out_height: u32,
     src_width: u32,
     src_height: u32,
-    m: [f32; 6],
-    _pad: [f32; 2],
+    m: [f32; 9],
+    _pad: [f32; 3],
 }
 
 /// A rendering backend backed by a wgpu device.
@@ -516,8 +516,12 @@ impl Backend for GpuBackend {
             out_height: oh,
             src_width: img.width(),
             src_height: img.height(),
-            m: [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2]],
-            _pad: [0.0; 2],
+            m: [
+                m[0][0], m[0][1], m[0][2], //
+                m[1][0], m[1][1], m[1][2], //
+                m[2][0], m[2][1], m[2][2],
+            ],
+            _pad: [0.0; 3],
         };
         let n_floats = ow as usize * oh as usize * 3;
         let groups = (ow.div_ceil(IO_WORKGROUP), oh.div_ceil(IO_WORKGROUP));
@@ -530,6 +534,19 @@ impl Backend for GpuBackend {
             groups,
         );
         floats_to_image(ow, oh, &out)
+    }
+
+    fn warp(&self, img: &ImageBuf, w: &Warp) -> ImageBuf {
+        // The non-affine radial warp has no WGSL shader; delegate the whole
+        // geometry resample to the CPU so the composed (homography ∘ radial)
+        // lookup stays one interpolation. A WGSL port could follow later.
+        self.cpu.warp(img, w)
+    }
+
+    fn apply_radial_gain(&self, img: &mut ImageBuf, gain: &RadialGain) {
+        // A simple per-pixel radial multiply; delegate to the CPU for now (a WGSL
+        // port could follow later).
+        self.cpu.apply_radial_gain(img, gain);
     }
 
     fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
@@ -691,13 +708,36 @@ mod tests {
                 width: 15,
                 height: 15,
             },
-            m: [[1.0, 0.0, 10.3], [0.0, 1.0, 5.7]],
+            m: [[1.0, 0.0, 10.3], [0.0, 1.0, 5.7], [0.0, 0.0, 1.0]],
         };
         let on_gpu = gpu.resample(&src, &t);
         let on_cpu = CpuBackend.resample(&src, &t);
         assert_eq!((on_gpu.width(), on_gpu.height()), (15, 15));
         let diff = max_abs_diff(&on_gpu, &on_cpu);
         assert!(diff <= 1e-5, "GPU resample diverged from CPU by {diff}");
+    }
+
+    #[test]
+    fn resample_perspective_matches_cpu() {
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        // A genuine perspective (non-zero bottom row) so the shader must apply the
+        // divide; samples stay interior so the comparison isn't border-fragile.
+        let t = Transform {
+            output: Extent {
+                width: 15,
+                height: 15,
+            },
+            m: [[1.0, 0.0, 5.0], [0.0, 1.0, 5.0], [0.01, 0.0, 1.0]],
+        };
+        let on_gpu = gpu.resample(&src, &t);
+        let on_cpu = CpuBackend.resample(&src, &t);
+        assert_eq!((on_gpu.width(), on_gpu.height()), (15, 15));
+        let diff = max_abs_diff(&on_gpu, &on_cpu);
+        assert!(
+            diff <= 1e-5,
+            "GPU perspective resample diverged from CPU by {diff}"
+        );
     }
 
     /// The whole pipeline rendered through the GPU backend must match the CPU
@@ -707,8 +747,8 @@ mod tests {
     #[test]
     fn render_matches_cpu_across_the_pipeline() {
         use latent_edit::{
-            Adjustments, Clarity, Crop, Geometry, Gradient, LocalAdjustment, Mask, MaskShape,
-            NoiseReduction, SelectiveTone, Settings, Sharpen, WhiteBalance,
+            Adjustments, Clarity, Crop, Geometry, Gradient, LensProfile, LocalAdjustment, Mask,
+            MaskShape, NoiseReduction, Perspective, SelectiveTone, Settings, Sharpen, WhiteBalance,
         };
         use latent_pipeline::render;
 
@@ -774,6 +814,17 @@ mod tests {
                     height: 0.8,
                 }),
                 straighten_degrees: 3.0,
+                perspective: Some(Perspective {
+                    vertical: 0.12,
+                    horizontal: -0.08,
+                }),
+                lens: Some(LensProfile {
+                    center: [0.5, 0.5],
+                    distortion: [0.0, -0.05, 0.0, 0.0],
+                    ca: [0.004, -0.003],
+                    vignetting: [-0.1, 0.0, 0.0],
+                }),
+                vignette: Some(-0.25),
             },
         };
 

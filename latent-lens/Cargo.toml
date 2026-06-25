@@ -1,0 +1,12 @@
+[package]
+name = "latent-lens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+latent-edit = { path = "../latent-edit" }
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"

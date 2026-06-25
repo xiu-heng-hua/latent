@@ -4,8 +4,8 @@ use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::color::{Mat3, color_mix, luminance};
 use latent_pipeline::{
-    Backend, CombineKind, DenoiseParams, PointOp, Transform, bilateral_pixel, dehaze_dark_channel,
-    dehaze_recover, midtone_weight,
+    Backend, CombineKind, DenoiseParams, PointOp, RadialGain, Transform, Warp, bilateral_pixel,
+    dehaze_dark_channel, dehaze_recover, midtone_weight,
 };
 use rayon::prelude::*;
 
@@ -113,6 +113,47 @@ impl Backend for CpuBackend {
                 }
             });
         out
+    }
+
+    fn warp(&self, img: &ImageBuf, w: &Warp) -> ImageBuf {
+        // Same single-pass inverse mapping and sampler as `resample`, but through
+        // the general (homography ∘ radial ∘ per-channel) coordinate map — one
+        // interpolation. With chromatic aberration each channel samples at its
+        // own radius, so it takes one bilinear fetch per channel.
+        let chromatic = w.has_chromatic();
+        let mut out = ImageBuf::new(w.output.width, w.output.height);
+        let stride = w.output.width as usize;
+        out.pixels_mut()
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(oy, row)| {
+                for ox in 0..w.output.width {
+                    row[ox as usize] = if chromatic {
+                        std::array::from_fn(|c| {
+                            let (sx, sy) = w.map_channel(ox as f32, oy as f32, c);
+                            sample_bilinear(img, sx, sy)[c]
+                        })
+                    } else {
+                        let (sx, sy) = w.map(ox as f32, oy as f32);
+                        sample_bilinear(img, sx, sy)
+                    };
+                }
+            });
+        out
+    }
+
+    fn apply_radial_gain(&self, img: &mut ImageBuf, gain: &RadialGain) {
+        // Per-pixel multiply by a coordinate-dependent gain; rows are independent.
+        let stride = img.width() as usize;
+        img.pixels_mut()
+            .par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, px) in row.iter_mut().enumerate() {
+                    let g = gain.at(x as f32, y as f32);
+                    *px = [px[0] * g, px[1] * g, px[2] * g];
+                }
+            });
     }
 
     fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
@@ -550,6 +591,83 @@ mod tests {
             "center preserved, got {center:?}"
         );
         assert_eq!(out.get(0, 0), [0.0, 0.0, 0.0]); // corner outside source → black
+    }
+
+    #[test]
+    fn resample_applies_a_homography() {
+        // Red channel is the linear ramp r = x + 8y, so bilinear sampling is
+        // exact at any point. A perspective transform (non-affine bottom row)
+        // must apply the divide before sampling: output (5, 3) → w = 1.5 →
+        // source (5/1.5, 3/1.5) = (3.33…, 2.0), so r = 5/1.5 + 16.
+        let mut img = ImageBuf::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                img.set(x, y, [(x + 8 * y) as f32, 0.0, 0.0]);
+            }
+        }
+        let t = Transform {
+            output: Extent {
+                width: 8,
+                height: 8,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.1, 0.0, 1.0]],
+        };
+        let out = CpuBackend.resample(&img, &t);
+        assert!(
+            (out.get(5, 3)[0] - (5.0 / 1.5 + 16.0)).abs() < 1e-3,
+            "perspective divide applied: {:?}",
+            out.get(5, 3)
+        );
+        assert!((out.get(0, 5)[0] - 40.0).abs() < 1e-4); // w = 1 → (0, 5) exact
+    }
+
+    #[test]
+    fn warp_without_radial_matches_resample() {
+        // With no radial term the warp is exactly the homography resample —
+        // the affine/perspective path is unchanged.
+        let mut img = ImageBuf::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                img.set(x, y, [(x + 8 * y) as f32, 0.0, 0.0]);
+            }
+        }
+        let t = Transform {
+            output: Extent {
+                width: 8,
+                height: 8,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.1, 0.0, 1.0]],
+        };
+        assert_eq!(
+            CpuBackend.warp(&img, &Warp::from_transform(&t)),
+            CpuBackend.resample(&img, &t)
+        );
+    }
+
+    #[test]
+    fn warp_samples_through_a_radial_map() {
+        // Linear ramp r = x + 8y → bilinear is exact, so the warped output at a
+        // pixel equals the ramp sampled at that pixel's radially-warped source.
+        let mut img = ImageBuf::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                img.set(x, y, [(x + 8 * y) as f32, 0.0, 0.0]);
+            }
+        }
+        let w = Warp {
+            output: Extent {
+                width: 16,
+                height: 16,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [7.5, 7.5],
+            inv_norm: 1.0 / 7.5,
+            radial: [0.0, 0.2, 0.0, 0.0],
+            channel_scale: [1.0, 1.0, 1.0],
+        };
+        let out = CpuBackend.warp(&img, &w);
+        let (sx, sy) = w.map(12.0, 7.0);
+        assert!((out.get(12, 7)[0] - (sx + 8.0 * sy)).abs() < 1e-3);
     }
 
     #[test]

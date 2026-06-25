@@ -2022,6 +2022,7 @@ dependencies = [
  "latent-export",
  "latent-gpu",
  "latent-image",
+ "latent-lens",
  "latent-pipeline",
  "latent-raw",
 ]
@@ -2069,6 +2070,15 @@ dependencies = [
 [[package]]
 name = "latent-image"
 version = "0.1.0"
+
+[[package]]
+name = "latent-lens"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "latent-edit",
+ "pkg-config",
+]
 
 [[package]]
 name = "latent-pipeline"
