@@ -11,7 +11,7 @@ use latent_edit::{
     Perspective, SelectiveTone, Settings,
 };
 use latent_image::ImageBuf;
-use latent_image::color::luminance;
+use latent_image::color::{Lab, l_star, luminance};
 use latent_image::tone::{self, ToneCurve};
 
 /// A data-described per-pixel operation over linear-light RGB pixels.
@@ -44,9 +44,18 @@ pub enum PointOp {
 /// it. The second image is supplied to [`Backend::combine`] alongside the kind.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CombineKind {
-    /// Unsharp recombine: `other + gain·(img − other)`. With `other` the blurred
-    /// base, this amplifies the detail the image holds over its blur.
+    /// Per-channel unsharp recombine in linear light: `other + gain·(img −
+    /// other)`. With `other` the blurred base this amplifies the detail the image
+    /// holds over its blur, but independently per channel — kept for any
+    /// non-sharpen recombine; sharpening uses [`Self::UnsharpLuma`] instead.
     Unsharp { gain: f32 },
+    /// Unsharp recombine on **perceptual lightness only** (the capture sharpen):
+    /// the detail `L*(img) − L*(other)` is amplified by `gain` in L\*, and the
+    /// pixel's color (a\*, b\*) is carried from `img` and rebuilt around the
+    /// sharpened lightness — see [`unsharp_luma_pixel`]. Sharpening one perceptual
+    /// channel, not three linear ones, removes edge color fringing and makes the
+    /// overshoot perceptually symmetric. `other` is the blurred base, as above.
+    UnsharpLuma { gain: f32 },
     /// Midtone-weighted local contrast (clarity): `img + amount·m·(img − other)`,
     /// where `m` is a midtone window of the base (`other`) luminance — full in the
     /// midtones, zero at black/white. Adds broad local contrast without haloing
@@ -67,6 +76,30 @@ pub struct DenoiseParams {
     pub radius: f32,
     pub luma: f32,
     pub chroma: f32,
+}
+
+/// The integer half-window, in pixels, a fractional `radius` selects — the one
+/// meaning of "radius" the spatial filters share.
+///
+/// A radius is the half-width of a `(2·r+1)²` neighborhood; rounding it to that
+/// integer happens here and only here, so `blur`, `denoise`, the dark-channel
+/// patch, and the clarity/sharpen radii all agree on the window a given radius
+/// maps to. Rounding is round-half-up (`f32::round`), and a negative radius clamps
+/// to `0`. A window of `0` is a single pixel — i.e. an identity kernel — so
+/// anything that needs a meaningful neighborhood gates on [`radius_is_active`]
+/// rather than re-deriving a threshold of its own.
+pub fn radius_window(radius: f32) -> i32 {
+    radius.round().max(0.0) as i32
+}
+
+/// Whether a `radius` rounds to a window that does real work — `r ≥ 1`, i.e. at
+/// least a 3×3 neighborhood. The one identity threshold the spatial filters share:
+/// a radius below it is a clean no-op everywhere, so no value can pass a tool's
+/// enable check yet round down to an identity kernel inside it (the surprise where
+/// a radius of `0.3` reads as "on" but blurs nothing). Both the enable check and
+/// the kernel test the same predicate.
+pub fn radius_is_active(radius: f32) -> bool {
+    radius_window(radius) >= 1
 }
 
 /// Pixel dimensions of an image.
@@ -476,7 +509,7 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
         backend.map_pixels(&mut img, &PointOp::Matrix(matrix));
     }
     if let Some(nr) = global.noise_reduction
-        && nr.radius > 0.0
+        && radius_is_active(nr.radius)
         && (nr.luminance > 0.0 || nr.color > 0.0)
     {
         // Denoise before the contrast/sharpening tools so they don't amplify the
@@ -497,7 +530,7 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
     }
     if let Some(c) = global.clarity
         && c.amount != 0.0
-        && c.radius > 0.0
+        && radius_is_active(c.radius)
     {
         // Clarity is unsharp at a broad radius with midtone weighting: the same
         // recombine as sharpening, but the added local contrast tapers off toward
@@ -515,12 +548,14 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
     }
     if let Some(s) = global.sharpen
         && s.amount > 0.0
-        && s.radius > 0.0
+        && radius_is_active(s.radius)
     {
-        // Unsharp mask: blur to a base, then amplify the detail (img − base).
+        // Unsharp mask: blur to a low-pass base, then amplify the detail the image
+        // holds over it — but only in lightness, around which color is rebuilt, so
+        // the sharpen doesn't shift edge hue (see [`CombineKind::UnsharpLuma`]).
         let base = backend.blur(&img, s.radius);
         let gain = 1.0 + s.amount;
-        backend.combine(&mut img, &base, &CombineKind::Unsharp { gain });
+        backend.combine(&mut img, &base, &CombineKind::UnsharpLuma { gain });
     }
     img
 }
@@ -536,6 +571,36 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
 pub fn midtone_weight(base_luma: f32) -> f32 {
     let b = tone::encode(base_luma.clamp(0.0, 1.0));
     1.0 - (2.0 * b - 1.0) * (2.0 * b - 1.0)
+}
+
+/// One pixel of the perceptual-lightness unsharp recombine: sharpen the **L\***
+/// of `pixel` against the blurred base `base`, and rebuild the pixel's color
+/// around the sharpened lightness.
+///
+/// Both pixels are taken to CIE Lab (the shared perceptual path). The unsharp runs
+/// on lightness only — `L*_out = L*_base + gain·(L*_in − L*_base)` — while the
+/// input's `a*, b*` (its chroma and hue) are carried through untouched and the
+/// result is mapped Lab→working around `L*_out`. Sharpening a single perceptual
+/// channel rather than three linear ones is what removes edge color fringing (the
+/// channels can no longer overshoot independently and shift the edge's hue), and
+/// because L\* is perceptually uniform the over- and undershoot at an edge are
+/// equal perceptual steps — no brighter-side halo bias. `gain` of `1` (a sharpen
+/// amount of `0`) leaves `L*` unchanged, so the pixel is returned as-is.
+///
+/// L\* is *not* clamped to `[0, 100]`: a pixel may carry highlight headroom
+/// (`L* > 100`) after tone, and the Lab inverse stays finite and monotone there,
+/// so the headroom passes through rather than being crushed to the reference
+/// white. Factored out so the post-geometry output sharpen reuses the identical
+/// recombine.
+pub fn unsharp_luma_pixel(pixel: [f32; 3], base: [f32; 3], gain: f32) -> [f32; 3] {
+    let lab = Lab::from_working(pixel);
+    let base_l = Lab::from_working(base).l;
+    Lab {
+        l: base_l + gain * (lab.l - base_l),
+        a: lab.a,
+        b: lab.b,
+    }
+    .to_working()
 }
 
 /// Transmission floor for dehazing: the smallest transmission allowed, so the
@@ -855,35 +920,70 @@ pub fn dehaze_image(img: &ImageBuf, strength: f32) -> ImageBuf {
 
 /// One output pixel of the bilateral denoise filter at `(x, y)`.
 ///
-/// Each pixel splits into luminance `Y` and chroma `rgb − Y`, which are denoised
-/// on **separate** range scales and recombined: luminance carries the detail (so
-/// `params.luma` is kept gentle) while color noise is low-frequency blotches that
-/// `params.chroma` can smooth hard. Each component is a bilateral average over the
-/// `±radius` neighborhood — the weight is a spatial Gaussian times a range
-/// Gaussian on that component's own difference, so an edge (a large luminance
-/// *or* chroma step) gets a near-zero weight and is not blurred across. Stopping
-/// chroma on chroma difference preserves iso-luminant *color* edges; stopping
-/// luma on luma difference preserves luminance detail. Bilateral filtering:
-/// Tomasi & Manduchi, ICCV 1998. The spatial Gaussian uses `σ = radius/2` so it
-/// falls off across the support (window `2σ`) rather than behaving like a box. A
-/// component whose scale is `0` is left untouched. The caller guarantees
+/// This is the **luma/chroma variant** of the bilateral, not the single-distance
+/// Tomasi & Manduchi (ICCV 1998) filter: each pixel splits into a *luminance*
+/// channel and a *chromatic* one, denoised on **separate** range scales and
+/// recombined. Keeping the split is deliberate — luminance carries the detail, so
+/// `params.luma` is kept gentle, while color noise is low-frequency blotches that
+/// `params.chroma` can smooth far harder without touching detail. Each channel is
+/// a bilateral average over the `±radius` neighborhood — a spatial Gaussian times
+/// a range Gaussian on that channel's own difference, so an edge (a large
+/// luminance *or* color step) gets a near-zero weight and is not blurred across.
+///
+/// The luminance channel is the relative luminance `Y`; its range term stops on
+/// `ΔY`, preserving luminance detail. The chromatic channel is the **perceptual**
+/// `(a*, b*)` of CIE Lab (the shared Lab path), and its range term stops on the
+/// perceptual color distance `Δa*² + Δb*²` — so it tracks iso-luminant *color*
+/// edges as the eye sees them, not a linear-RGB offset. Measuring chroma in `a*b*`
+/// is also what keeps blue **luminance** detail out of the chroma channel: a plain
+/// `rgb − Y` split leaks most of blue (its luminance weight is ~0.0001) into the
+/// "chroma" component, where the hard chroma scale would erase it; `a*b*` carries
+/// no luminance, so the luminance lives only in `Y`. The smoothed `Y` and `(a*,
+/// b*)` are recombined through Lab (`L* = l_star(Y_out)`) back to working RGB. The
+/// chroma scale `params.chroma` is taken as a fraction of the perceptual chroma
+/// range and multiplied into `a*b*` units by [`CHROMA_LAB_SCALE`], so it keeps the
+/// "gentle…strong" feel of a `[0, 1]`-ish strength even though the distance it
+/// stops on now lives in Lab. The luma scale stays in linear-`Y` units, unchanged.
+///
+/// The spatial Gaussian uses `σ = radius/3`, so the `±radius` window is the
+/// standard `±3σ` support: the weight at the window edge is `≈ e^(−4.5) ≈ 0.011`,
+/// a smooth falloff rather than the hard `e^(−2) ≈ 0.135` step a `±2σ` (σ =
+/// radius/2) truncation would leave. Same tap count — only the weighting changes.
+/// A channel whose scale is `0` is left untouched. The caller guarantees
 /// `radius >= 1` and at least one positive scale.
 ///
+/// (Converting each tap to Lab inside the window is a cube-root per tap; for
+/// correctness that is fine. Precomputing the whole image's Lab once into a
+/// scratch buffer and reading from it is the O(N) speedup if profiling ever asks.)
+///
+/// Maps the chroma denoise strength `params.chroma` (a `[0, 1]`-ish fraction of
+/// the perceptual chroma range) into CIE Lab `a*b*` distance units, where the
+/// chroma range Gaussian now stops. Roughly `100` `a*b*` units spans a vivid
+/// color difference at a mid lightness, so a strength near `1` lets even strong
+/// color blotches average while a small one stops on faint color noise. Public so
+/// a backend evaluating the kernel itself scales the strength identically.
+pub const CHROMA_LAB_SCALE: f32 = 100.0;
+
 /// Public so a backend evaluating the filter itself reuses the identical kernel.
 pub fn bilateral_pixel(img: &ImageBuf, x: u32, y: u32, params: DenoiseParams) -> [f32; 3] {
-    let r = params.radius.round().max(1.0) as i32;
+    let r = radius_window(params.radius);
     let (w, h) = (img.width() as i32, img.height() as i32);
-    let sigma_s = r as f32 / 2.0;
-    let inv_2ss2 = 1.0 / (2.0 * sigma_s * sigma_s); // spatial (σ = radius/2)
+    let sigma_s = r as f32 / 3.0;
+    let inv_2ss2 = 1.0 / (2.0 * sigma_s * sigma_s); // spatial (σ = radius/3, ±3σ)
     let (do_luma, do_chroma) = (params.luma > 0.0, params.chroma > 0.0);
     let inv_2sl2 = 1.0 / (2.0 * params.luma * params.luma); // luminance range
-    let inv_2sc2 = 1.0 / (2.0 * params.chroma * params.chroma); // chroma range
+    // The chroma strength is a fraction of the perceptual chroma range; lift it
+    // into Lab a*b* units (where the chroma distance is measured).
+    let sigma_c = params.chroma * CHROMA_LAB_SCALE;
+    let inv_2sc2 = 1.0 / (2.0 * sigma_c * sigma_c); // chroma range (Lab a*b*)
 
     let c = img.get(x, y);
     let cy = luminance(c);
-    let cc: [f32; 3] = std::array::from_fn(|k| c[k] - cy);
+    // The center's chromatic coordinates (a*, b*); the luminance is kept as Y so
+    // the luma range scale stays in the same units the caller calibrated it for.
+    let clab = Lab::from_working(c);
     let (mut acc_y, mut wsum_y) = (0.0_f32, 0.0_f32);
-    let (mut acc_c, mut wsum_c) = ([0.0_f32; 3], 0.0_f32);
+    let (mut acc_ab, mut wsum_c) = ([0.0_f32; 2], 0.0_f32);
     for dy in -r..=r {
         for dx in -r..=r {
             let sx = (x as i32 + dx).clamp(0, w - 1) as u32;
@@ -898,21 +998,33 @@ pub fn bilateral_pixel(img: &ImageBuf, x: u32, y: u32, params: DenoiseParams) ->
                 wsum_y += wl;
             }
             if do_chroma {
-                let nc: [f32; 3] = std::array::from_fn(|k| n[k] - ny);
-                let dc2 = (0..3)
-                    .map(|k| (cc[k] - nc[k]) * (cc[k] - nc[k]))
-                    .sum::<f32>();
+                let nlab = Lab::from_working(n);
+                let (da, db) = (clab.a - nlab.a, clab.b - nlab.b);
+                let dc2 = da * da + db * db; // perceptual color distance (Lab a*b*)
                 let wc = (spatial - dc2 * inv_2sc2).exp();
-                for k in 0..3 {
-                    acc_c[k] += wc * nc[k];
-                }
+                acc_ab[0] += wc * nlab.a;
+                acc_ab[1] += wc * nlab.b;
                 wsum_c += wc;
             }
         }
     }
+    // Recombine the smoothed luminance and chromaticity through Lab: the
+    // lightness is the smoothed `Y` (carried in as L*), the a*/b* are the smoothed
+    // chromatic coordinates. A channel left off keeps its original value (the
+    // center's). Because L* alone fixes XYZ Y, the result's luminance is exactly
+    // `yout` regardless of a*/b*, so the two channels stay independent.
     let yout = if do_luma { acc_y / wsum_y } else { cy };
-    let cout: [f32; 3] = std::array::from_fn(|k| if do_chroma { acc_c[k] / wsum_c } else { cc[k] });
-    std::array::from_fn(|k| yout + cout[k])
+    let (aout, bout) = if do_chroma {
+        (acc_ab[0] / wsum_c, acc_ab[1] / wsum_c)
+    } else {
+        (clab.a, clab.b)
+    };
+    Lab {
+        l: l_star(yout),
+        a: aout,
+        b: bout,
+    }
+    .to_working()
 }
 
 /// The active tonal curves of a [`SelectiveTone`], in canonical order. A control
@@ -1263,7 +1375,9 @@ mod tests {
         ChannelMixer, Clarity, Gradient, Hsl, LuminanceRange, MaskShape, NoiseReduction, Sharpen,
         WhiteBalance,
     };
-    use latent_image::color::{Lab, Mat3, color_mix, luminance, saturate_chroma};
+    use latent_image::color::{
+        LCh, Lab, Mat3, color_mix, l_star, l_star_inv, luminance, saturate_chroma,
+    };
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
     /// backend lives in a crate that depends on this one. It gives each
@@ -1311,8 +1425,8 @@ mod tests {
         }
 
         fn blur(&self, img: &ImageBuf, radius: f32) -> ImageBuf {
-            let r = radius.round().max(0.0) as i32;
-            if r == 0 {
+            let r = radius_window(radius);
+            if r < 1 {
                 return img.clone();
             }
             let (w, h) = (img.width() as i32, img.height() as i32);
@@ -1343,6 +1457,11 @@ mod tests {
                 CombineKind::Unsharp { gain } => {
                     for (px, o) in img.pixels_mut().iter_mut().zip(other.pixels().iter()) {
                         *px = std::array::from_fn(|c| o[c] + gain * (px[c] - o[c]));
+                    }
+                }
+                CombineKind::UnsharpLuma { gain } => {
+                    for (px, o) in img.pixels_mut().iter_mut().zip(other.pixels().iter()) {
+                        *px = unsharp_luma_pixel(*px, *o, gain);
                     }
                 }
                 CombineKind::LocalContrast { amount } => {
@@ -1415,7 +1534,7 @@ mod tests {
         }
 
         fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
-            if params.radius.round() < 1.0 || (params.luma <= 0.0 && params.chroma <= 0.0) {
+            if !radius_is_active(params.radius) || (params.luma <= 0.0 && params.chroma <= 0.0) {
                 return img.clone();
             }
             let mut out = ImageBuf::new(img.width(), img.height());
@@ -1836,6 +1955,134 @@ mod tests {
         assert!(out.get(3, 0)[0] > 1.0, "bright side: {:?}", out.get(3, 0));
     }
 
+    /// Render a 1-D row through a capture sharpen of the given amount/radius.
+    fn sharpened_row(row: &[[f32; 3]], amount: f32, radius: f32) -> ImageBuf {
+        let mut src = ImageBuf::new(row.len() as u32, 1);
+        for (x, &px) in row.iter().enumerate() {
+            src.set(x as u32, 0, px);
+        }
+        let settings = Settings {
+            global: Adjustments {
+                sharpen: Some(Sharpen { amount, radius }),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        render(&src, &settings, &TestBackend)
+    }
+
+    #[test]
+    fn sharpen_zero_amount_is_identity() {
+        // A zero sharpen amount is a clean no-op: the lowering's amount gate keeps
+        // the unsharp from running, and even forced through, gain = 1 leaves L*
+        // unchanged so the recombine returns the pixel untouched.
+        let row = [[0.2, 0.1, 0.05], [0.7, 0.3, 0.1], [0.4, 0.5, 0.6]];
+        let out = sharpened_row(&row, 0.0, 1.0);
+        for (x, &px) in row.iter().enumerate() {
+            let o = out.get(x as u32, 0);
+            for c in 0..3 {
+                assert!((o[c] - px[c]).abs() < 1e-5, "amount 0 changed {o:?}");
+            }
+        }
+        // And the recombine helper itself is identity at gain = 1 (the output
+        // sharpen reuses it, so pin the no-op directly).
+        let same = unsharp_luma_pixel([0.6, 0.2, 0.3], [0.4, 0.4, 0.4], 1.0);
+        for c in 0..3 {
+            assert!((same[c] - [0.6, 0.2, 0.3][c]).abs() < 1e-5, "{same:?}");
+        }
+    }
+
+    #[test]
+    fn sharpen_in_lstar_has_no_color_fringing() {
+        // A saturated single-hue step (a dark and a bright version of *one* hue).
+        // Sharpening in L* lifts/darkens only the lightness, carrying a*/b* from
+        // the input — so the overshoot pixel keeps the edge's hue exactly. The old
+        // per-channel linear unsharp amplified each channel independently and
+        // shifted that hue; this asserts the hue is held.
+        let dark = LCh {
+            l: 30.0,
+            c: 40.0,
+            h: 0.7,
+        }
+        .to_lab()
+        .to_working();
+        let bright = LCh {
+            l: 75.0,
+            c: 40.0,
+            h: 0.7,
+        }
+        .to_lab()
+        .to_working();
+        let row = [dark, dark, dark, bright, bright];
+        let out = sharpened_row(&row, 1.0, 1.0);
+
+        let edge_hue = Lab::from_working(bright).to_lch().h;
+        // The bright-side overshoot pixel (index 3) keeps the source hue.
+        let over = Lab::from_working(out.get(3, 0)).to_lch();
+        let lstar_dh = (over.h - edge_hue).abs();
+        assert!(
+            lstar_dh < 1e-3,
+            "hue shifted at overshoot: {lstar_dh} ({over:?})"
+        );
+        // And it genuinely overshot in lightness (brighter than the bright input).
+        assert!(
+            over.l > Lab::from_working(bright).l,
+            "no overshoot: {over:?}"
+        );
+
+        // Contrast: a per-channel linear unsharp on the same edge shifts the hue,
+        // so the L* path is holding a hue the linear one drifts. The L* residual is
+        // an order of magnitude tighter than the linear one's drift.
+        let mut linear = ImageBuf::new(5, 1);
+        for (x, &px) in row.iter().enumerate() {
+            linear.set(x as u32, 0, px);
+        }
+        let base = TestBackend.blur(&linear, 1.0);
+        TestBackend.combine(&mut linear, &base, &CombineKind::Unsharp { gain: 2.0 });
+        let linear_dh = (Lab::from_working(linear.get(3, 0)).to_lch().h - edge_hue).abs();
+        assert!(
+            linear_dh > lstar_dh * 10.0,
+            "linear unsharp did not fringe more than L*: {linear_dh} vs {lstar_dh}"
+        );
+    }
+
+    #[test]
+    fn sharpen_overshoot_is_symmetric_in_lstar() {
+        // A neutral dark↔light step, symmetric in L* (±10 L* about L* 50). Doing
+        // the unsharp in the perceptually-uniform L* domain makes the dark-side
+        // undershoot and the bright-side overshoot far closer in magnitude than the
+        // linear-light per-channel unsharp, which biases the bright-side halo
+        // (equal linear deltas are unequal L* steps). Both still leave a residual
+        // asymmetry from the linear low-pass base, so the test asserts the L* path
+        // is *markedly* more balanced than the linear one on the same edge.
+        let lo = l_star_inv(40.0); // linear luminance whose L* is 40
+        let hi = l_star_inv(60.0); // L* 60
+        let row = [[lo; 3], [lo; 3], [lo; 3], [hi; 3], [hi; 3], [hi; 3]];
+
+        // The capture sharpen (L* domain).
+        let out = sharpened_row(&row, 1.0, 1.0);
+        let under = l_star(lo) - l_star(out.get(2, 0)[0]); // dark side dips below lo
+        let over = l_star(out.get(3, 0)[0]) - l_star(hi); // bright side rises above hi
+        assert!(under > 0.0 && over > 0.0, "no overshoot: {under}, {over}");
+        let lstar_asym = (under - over).abs();
+
+        // The old per-channel linear-light unsharp on the identical step.
+        let mut linear = ImageBuf::new(6, 1);
+        for (x, &px) in row.iter().enumerate() {
+            linear.set(x as u32, 0, px);
+        }
+        let base = TestBackend.blur(&linear, 1.0);
+        TestBackend.combine(&mut linear, &base, &CombineKind::Unsharp { gain: 2.0 });
+        let under_lin = l_star(lo) - l_star(linear.get(2, 0)[0]);
+        let over_lin = l_star(linear.get(3, 0)[0]) - l_star(hi);
+        let linear_asym = (under_lin - over_lin).abs();
+
+        assert!(
+            lstar_asym < linear_asym * 0.6,
+            "L* overshoot not more symmetric than linear: {lstar_asym} vs {linear_asym}"
+        );
+    }
+
     #[test]
     fn noise_reduction_smooths_a_tone_but_keeps_an_edge() {
         // A noisy dark region beside a bright one. The bilateral filter pulls the
@@ -1867,6 +2114,265 @@ mod tests {
             (out.get(3, 0)[0] - 0.80).abs() < 1e-3,
             "edge preserved: {:?}",
             out.get(3, 0)
+        );
+    }
+
+    #[test]
+    fn radius_window_is_one_convention_for_all_filters() {
+        // "Radius" rounds to one integer half-window — round-half-up, clamped at 0 —
+        // shared by blur, denoise, and the dark-channel patch. A sweep of
+        // fractional radii must produce the same window everywhere.
+        for r in [0.0_f32, 0.3, 0.49, 0.5, 0.9, 1.0, 1.4, 1.5, 2.6, 7.2] {
+            let w = radius_window(r);
+            assert_eq!(w, r.round().max(0.0) as i32, "round-half-up at {r}");
+            // The active predicate is exactly `window >= 1`.
+            assert_eq!(radius_is_active(r), w >= 1, "gate disagrees at {r}");
+        }
+        // Round-half-up specifically: 0.5 → 1, 1.5 → 2 (not banker's rounding).
+        assert_eq!(radius_window(0.5), 1);
+        assert_eq!(radius_window(1.5), 2);
+    }
+
+    #[test]
+    fn blur_radius_below_threshold_is_consistent_identity() {
+        // A sub-threshold radius (rounds to a 0 window) is an identity blur, and the
+        // *same* threshold gates denoise and the clarity/sharpen lowering — so a
+        // radius the tool reads as "on" can never round to a no-op kernel.
+        let mut img = ImageBuf::new(4, 1);
+        for (x, v) in [0.1, 0.6, 0.2, 0.9].into_iter().enumerate() {
+            img.set(x as u32, 0, [v; 3]);
+        }
+        for r in [0.0_f32, 0.3, 0.49] {
+            assert!(!radius_is_active(r), "{r} should be sub-threshold");
+            assert_eq!(TestBackend.blur(&img, r), img, "blur not identity at {r}");
+            // The denoise primitive gate and the bilateral's own window agree:
+            // sub-threshold disables it, so it never reaches a 0-window kernel.
+            assert_eq!(
+                TestBackend.denoise(
+                    &img,
+                    DenoiseParams {
+                        radius: r,
+                        luma: 0.1,
+                        chroma: 0.1,
+                    },
+                ),
+                img,
+                "denoise not identity at {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn radius_rounding_matches_across_blur_and_denoise() {
+        // The half-window `blur` uses and the one `bilateral_pixel` derives are the
+        // identical expression, so a fractional radius means the same window in
+        // both — no tool can round it one way while another rounds it the other.
+        for r in [0.5_f32, 0.9, 1.0, 1.4, 2.6, 3.5] {
+            let window = radius_window(r);
+            assert!(window >= 1, "sweep should be above threshold at {r}");
+            // A delta image: the blur's window size is observable as how far a single
+            // bright pixel spreads. Build it wide enough that the window fits.
+            let n = (2 * window + 3) as u32;
+            let mut img = ImageBuf::new(n, 1);
+            img.set(n / 2, 0, [1.0; 3]);
+            let blurred = TestBackend.blur(&img, r);
+            // The blurred spot spans exactly the window: the pixel `window` away from
+            // center is touched, the one `window + 1` away is not.
+            let c = (n / 2) as i32;
+            let inside = blurred.get((c + window) as u32, 0)[0];
+            let outside = blurred.get((c + window + 1) as u32, 0)[0];
+            assert!(inside > 0.0, "window short of {window} at radius {r}");
+            assert!(outside == 0.0, "window past {window} at radius {r}");
+        }
+    }
+
+    #[test]
+    fn no_radius_passes_gate_then_noops() {
+        // The headline regression: for every radius the enable gate accepts, the
+        // kernel does real work — there is no value that reads as "on" yet rounds to
+        // an identity kernel (the blur-radius-0.3 surprise). Sweep across the
+        // threshold and assert: gated-off ⇒ identity, gated-on ⇒ changes the image.
+        let mut img = ImageBuf::new(7, 1);
+        for (x, v) in [0.1, 0.8, 0.2, 0.7, 0.3, 0.9, 0.4].into_iter().enumerate() {
+            img.set(x as u32, 0, [v; 3]);
+        }
+        for r in [0.0_f32, 0.3, 0.49, 0.5, 0.8, 1.0, 1.6, 2.4] {
+            let blurred = TestBackend.blur(&img, r);
+            if radius_is_active(r) {
+                assert_ne!(blurred, img, "gate-on radius {r} blurred nothing");
+            } else {
+                assert_eq!(blurred, img, "gate-off radius {r} changed the image");
+            }
+        }
+    }
+
+    #[test]
+    fn dehaze_patch_radius_uses_the_unified_radius_convention() {
+        // The dark-channel patch is expressed in the same half-window units as blur
+        // and denoise: a non-negative integer radius, rounded the same way. Pin that
+        // it never collapses below its floor and is a valid (round-half-up) window.
+        for (w, h) in [(8u32, 8u32), (1024, 1024), (4096, 3000)] {
+            let patch = dehaze_patch_radius(w, h);
+            assert!(patch >= DEHAZE_PATCH_MIN, "patch below floor: {patch}");
+            // It is a window radius_window would accept as active.
+            assert!(radius_is_active(patch as f32), "patch not an active radius");
+        }
+    }
+
+    /// The spatial weight `bilateral_pixel` gives a tap at squared distance `d2`,
+    /// for a window radius `r` and a spatial σ of `r / sigma_div`. Used to predict
+    /// the σ = r/3 weighting and contrast it with the old σ = r/2.
+    fn spatial_weight(d2: f32, r: i32, sigma_div: f32) -> f32 {
+        let sigma = r as f32 / sigma_div;
+        (-d2 / (2.0 * sigma * sigma)).exp()
+    }
+
+    /// Recover, from a denoise of a neutral row, the normalized spatial weight the
+    /// kernel assigned the single differing neighbor at distance `r` from center.
+    /// All taps share one tone (range weights ≈ 1), so the center's smoothed value
+    /// is `A + (B − A)·w_edge/Σw`; solving returns `w_edge/Σw`.
+    fn recovered_edge_weight(r: i32) -> f32 {
+        let n = (2 * r + 1) as u32;
+        let (a, b) = (0.5_f32, 0.6_f32);
+        let mut img = ImageBuf::new(n, 1);
+        for x in 0..n {
+            img.set(x, 0, [a; 3]);
+        }
+        img.set(0, 0, [b; 3]); // the lone differing neighbor, at distance r from center
+        // Luma-only, with a huge range scale so the range term is ≈ 1 for every tap
+        // and only the spatial weighting shapes the average.
+        let out = bilateral_pixel(
+            &img,
+            r as u32,
+            0,
+            DenoiseParams {
+                radius: r as f32,
+                luma: 1e3,
+                chroma: 0.0,
+            },
+        );
+        (luminance(out) - a) / (b - a)
+    }
+
+    #[test]
+    fn bilateral_spatial_sigma_is_r_over_three() {
+        // The spatial Gaussian is σ = r/3, so the tap at the window edge (distance
+        // r, i.e. 3σ) carries weight ≈ e^(−4.5). Recover the kernel's edge weight
+        // and confirm it matches the σ = r/3 prediction, not the old σ = r/2.
+        for r in [3, 5] {
+            let got = recovered_edge_weight(r);
+            // Σ of the σ = r/3 spatial weights over the window (each tap once).
+            let sum_third: f32 = (0..2 * r + 1)
+                .map(|i| {
+                    let d = (i - r) as f32;
+                    spatial_weight(d * d, r, 3.0)
+                })
+                .sum();
+            let want_third = spatial_weight((r * r) as f32, r, 3.0) / sum_third;
+            assert!(
+                (got - want_third).abs() < 1e-4,
+                "r={r}: edge weight {got} != σ=r/3 prediction {want_third}"
+            );
+            // The old σ = r/2 would have put a much larger weight on the edge tap.
+            let sum_half: f32 = (0..2 * r + 1)
+                .map(|i| {
+                    let d = (i - r) as f32;
+                    spatial_weight(d * d, r, 2.0)
+                })
+                .sum();
+            let want_half = spatial_weight((r * r) as f32, r, 2.0) / sum_half;
+            assert!(
+                (got - want_half).abs() > 1e-2,
+                "r={r}: edge weight matches the old σ=r/2 ({want_half})"
+            );
+        }
+    }
+
+    #[test]
+    fn bilateral_boundary_weight_is_negligible() {
+        // At the window edge (3σ) the spatial weight is ≈ e^(−4.5) ≈ 0.011 — far
+        // below the e^(−2) ≈ 0.135 a σ = r/2 (±2σ) truncation would leave there. No
+        // boundary step.
+        let edge = spatial_weight(1.0, 1, 3.0); // r and d both 1: the corner of a unit window
+        assert!((edge - (-4.5_f32).exp()).abs() < 1e-6, "edge weight {edge}");
+        assert!(edge < 0.02, "boundary weight not negligible: {edge}");
+        assert!(
+            edge < spatial_weight(1.0, 1, 2.0) * 0.2,
+            "no improvement over ±2σ"
+        );
+    }
+
+    #[test]
+    fn chroma_metric_is_perceptual() {
+        // Two candidate neighbors of a neutral center, at essentially the *same*
+        // linear-RGB chroma-offset distance but very different *perceptual* (Lab
+        // a*b*) distances. The old `rgb − Y` metric treats them as the same color
+        // step (and would weight them the same); the perceptual metric separates
+        // them by ~3×. Measured directly on the distances each metric stops on.
+        let center = [0.5_f32, 0.5, 0.5];
+        let p_a = [0.62_f32, 0.38, 0.5]; // a red/green offset
+        let p_b = [0.40_f32, 0.45, 0.62]; // a bluer offset of the same RGB length
+
+        // Old metric: squared distance of the (rgb − Y) chroma offsets.
+        let cc = |p: [f32; 3]| {
+            let y = luminance(p);
+            [p[0] - y, p[1] - y, p[2] - y]
+        };
+        let lin = |p: [f32; 3]| {
+            let (a, b) = (cc(center), cc(p));
+            (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f32>()
+        };
+        assert!(
+            (lin(p_a) - lin(p_b)).abs() / lin(p_a) < 0.05,
+            "old metric must read these as ~the same color step: {} vs {}",
+            lin(p_a),
+            lin(p_b)
+        );
+
+        // New metric: squared a*b* distance in Lab — clearly separates them.
+        let lab_d = |p: [f32; 3]| {
+            let (c, q) = (Lab::from_working(center), Lab::from_working(p));
+            (c.a - q.a).powi(2) + (c.b - q.b).powi(2)
+        };
+        assert!(
+            lab_d(p_a) > lab_d(p_b) * 2.0,
+            "perceptual metric should separate them: {} vs {}",
+            lab_d(p_a),
+            lab_d(p_b)
+        );
+    }
+
+    #[test]
+    fn denoise_preserves_blue_luminance_detail() {
+        // A pure-blue region carrying a *luminance* step (constant hue, varying
+        // lightness). Hard chroma NR must keep the step: with the perceptual split,
+        // lightness lives in L* (the luma channel), not in the chroma channel, so
+        // the chroma smoother cannot eat it — unlike the old rgb − Y split, where
+        // blue's near-zero luma weight dumped its luminance into the chroma channel.
+        let dark_blue = [0.05_f32, 0.10, 0.45];
+        let bright_blue = [0.10_f32, 0.20, 0.90]; // same hue, ~2× lighter
+        let mut img = ImageBuf::new(6, 1);
+        for x in 0..3 {
+            img.set(x, 0, dark_blue);
+        }
+        for x in 3..6 {
+            img.set(x, 0, bright_blue);
+        }
+        // Chroma NR only, smoothing hard.
+        let out = TestBackend.denoise(
+            &img,
+            DenoiseParams {
+                radius: 2.0,
+                luma: 0.0,
+                chroma: 1.0,
+            },
+        );
+        // The luminance step across the edge survives chroma NR.
+        let step_in = luminance(bright_blue) - luminance(dark_blue);
+        let step_out = luminance(out.get(4, 0)) - luminance(out.get(1, 0));
+        assert!(
+            step_out > step_in * 0.9,
+            "blue luminance step eaten by chroma NR: {step_in} → {step_out}"
         );
     }
 

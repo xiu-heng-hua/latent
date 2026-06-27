@@ -18,7 +18,9 @@ use latent_cpu::CpuBackend;
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::tone;
-use latent_pipeline::{Backend, CombineKind, DenoiseParams, PointOp, RadialGain, Transform, Warp};
+use latent_pipeline::{
+    Backend, CombineKind, DenoiseParams, PointOp, RadialGain, Transform, Warp, radius_window,
+};
 use wgpu::util::DeviceExt;
 
 /// Uniform parameters for the `map_pixels` compute shader. Layout matches the
@@ -470,8 +472,11 @@ impl Backend for GpuBackend {
     }
 
     fn blur(&self, img: &ImageBuf, radius: f32) -> ImageBuf {
-        let r = radius.round().max(0.0) as u32;
-        if r == 0 || img.is_empty() {
+        // The host computes the half-window through the shared radius convention so
+        // the GPU box blur matches the CPU one tap for tap; the shader just takes
+        // the `u32` window it is handed.
+        let r = radius_window(radius) as u32;
+        if r < 1 || img.is_empty() {
             return img.clone();
         }
         let (w, h) = (img.width(), img.height());

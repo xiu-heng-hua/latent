@@ -6,7 +6,8 @@ use latent_image::color::{Mat3, color_mix, luminance, saturate_chroma};
 use latent_pipeline::{
     Backend, CombineKind, DEHAZE_GUIDE_EPS, DenoiseParams, PointOp, RadialGain, Transform, Warp,
     bilateral_pixel, dehaze_airlight, dehaze_dark_channel, dehaze_guide_radius,
-    dehaze_patch_radius, dehaze_recover, guided_filter, midtone_weight,
+    dehaze_patch_radius, dehaze_recover, guided_filter, midtone_weight, radius_is_active,
+    radius_window, unsharp_luma_pixel,
 };
 use rayon::prelude::*;
 
@@ -64,8 +65,8 @@ impl Backend for CpuBackend {
     fn blur(&self, img: &ImageBuf, radius: f32) -> ImageBuf {
         // A box blur is separable: a horizontal 1-D pass then a vertical one,
         // so the cost is O(radius) per pixel rather than O(radius²).
-        let r = radius.round().max(0.0) as i32;
-        if r == 0 {
+        let r = radius_window(radius);
+        if r < 1 {
             return img.clone();
         }
         let horizontal = blur_axis(img, r, false);
@@ -82,6 +83,15 @@ impl Backend for CpuBackend {
                     .for_each(|(px, o)| {
                         *px = std::array::from_fn(|c| o[c] + gain * (px[c] - o[c]))
                     });
+            }
+            CombineKind::UnsharpLuma { gain } => {
+                // Sharpen the L* lightness against the blurred base and rebuild the
+                // pixel's color around it: one perceptual channel, not three linear
+                // ones, so the edge keeps its hue and the overshoot is symmetric.
+                img.pixels_mut()
+                    .par_iter_mut()
+                    .zip(other.pixels().par_iter())
+                    .for_each(|(px, o)| *px = unsharp_luma_pixel(*px, *o, gain));
             }
             CombineKind::LocalContrast { amount } => {
                 img.pixels_mut()
@@ -158,8 +168,10 @@ impl Backend for CpuBackend {
     fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
         // Edge-preserving bilateral filter: each output pixel is an edge-aware
         // weighted average of its neighborhood, split into luma and chroma. A
-        // sub-pixel radius or two zero strengths is a no-op. Rows are independent.
-        if params.radius.round() < 1.0 || (params.luma <= 0.0 && params.chroma <= 0.0) {
+        // sub-window radius or two zero strengths is a no-op. The radius gate is
+        // the same predicate `blur` uses, so a radius that reads as "on" cannot
+        // round to an identity kernel. Rows are independent.
+        if !radius_is_active(params.radius) || (params.luma <= 0.0 && params.chroma <= 0.0) {
             return img.clone();
         }
         let stride = img.width() as usize;
@@ -327,8 +339,9 @@ fn sample_bilinear(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_edit::{Adjustments, ChannelMixer, Curves, Gradient, MaskShape, Settings};
-    use latent_pipeline::{Extent, render};
+    use latent_edit::{Adjustments, ChannelMixer, Curves, Gradient, MaskShape, Settings, Sharpen};
+    use latent_image::color::{Lab, l_star};
+    use latent_pipeline::{Extent, render, unsharp_luma_pixel};
 
     #[test]
     fn backend_is_send_and_sync() {
@@ -519,6 +532,108 @@ mod tests {
     }
 
     #[test]
+    fn unsharp_luma_overshoots_a_step_edge_in_lstar() {
+        // The capture sharpen recombine: on a step edge the dark side dips below and
+        // the bright side rises above — now measured in L*, the perceptual domain it
+        // operates in. A flat region is left untouched.
+        let mut img = ImageBuf::new(5, 1);
+        for (x, v) in [0.2, 0.2, 0.2, 0.8, 0.8].into_iter().enumerate() {
+            img.set(x as u32, 0, [v; 3]);
+        }
+        let before = img.clone();
+        let base = CpuBackend.blur(&img, 1.0);
+        CpuBackend.combine(&mut img, &base, &CombineKind::UnsharpLuma { gain: 2.0 });
+        let l_dark_in = l_star(before.get(2, 0)[0]);
+        let l_bright_in = l_star(before.get(3, 0)[0]);
+        assert!(
+            l_star(img.get(2, 0)[0]) < l_dark_in,
+            "dark side should undershoot in L*"
+        );
+        assert!(
+            l_star(img.get(3, 0)[0]) > l_bright_in,
+            "bright side should overshoot in L*"
+        );
+        for c in 0..3 {
+            assert!(
+                (img.get(0, 0)[c] - before.get(0, 0)[c]).abs() < 1e-5,
+                "flat region unchanged: {:?}",
+                img.get(0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn unsharp_luma_combine_matches_the_shared_recombine() {
+        // The CPU `combine` for the L* sharpen and the shared `unsharp_luma_pixel`
+        // helper (the pipeline reference, and what the output sharpen reuses) must
+        // agree pixel for pixel — the lockstep that keeps the backends from drifting.
+        let mut img = ImageBuf::new(3, 1);
+        let pixels = [[0.6, 0.2, 0.3], [0.1, 0.7, 0.4], [0.9, 0.9, 0.2]];
+        let bases = [[0.4, 0.3, 0.35], [0.2, 0.5, 0.45], [0.7, 0.8, 0.3]];
+        for x in 0..3 {
+            img.set(x, 0, pixels[x as usize]);
+        }
+        let mut base = ImageBuf::new(3, 1);
+        for x in 0..3 {
+            base.set(x, 0, bases[x as usize]);
+        }
+        CpuBackend.combine(&mut img, &base, &CombineKind::UnsharpLuma { gain: 1.7 });
+        for x in 0..3 {
+            let want = unsharp_luma_pixel(pixels[x as usize], bases[x as usize], 1.7);
+            for c in 0..3 {
+                assert!(
+                    (img.get(x, 0)[c] - want[c]).abs() < 1e-6,
+                    "combine drifted from the shared recombine at {x}: {:?} vs {want:?}",
+                    img.get(x, 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capture_sharpen_keeps_a_colored_edge_hue() {
+        // Routed through the full pipeline: a saturated single-hue step, sharpened,
+        // keeps its hue at the overshoot (the L* recombine carries a*/b* from the
+        // input). Zero edge color fringing.
+        let dark = Lab {
+            l: 30.0,
+            a: 35.0,
+            b: -20.0,
+        }
+        .to_working();
+        let bright = Lab {
+            l: 75.0,
+            a: 35.0,
+            b: -20.0,
+        }
+        .to_working();
+        let mut src = ImageBuf::new(5, 1);
+        for (x, &px) in [dark, dark, dark, bright, bright].iter().enumerate() {
+            src.set(x as u32, 0, px);
+        }
+        let settings = Settings {
+            global: Adjustments {
+                sharpen: Some(Sharpen {
+                    amount: 1.0,
+                    radius: 1.0,
+                }),
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &CpuBackend);
+        let edge = Lab::from_working(bright).to_lch();
+        let over = Lab::from_working(out.get(3, 0)).to_lch();
+        assert!(
+            (over.h - edge.h).abs() < 1e-3,
+            "hue fringed at the sharpened edge: {} vs {}",
+            over.h,
+            edge.h
+        );
+        assert!(over.l > edge.l, "no overshoot in lightness: {over:?}");
+    }
+
+    #[test]
     fn denoise_is_identity_when_off() {
         let mut img = ImageBuf::new(3, 1);
         img.set(0, 0, [0.1, 0.2, 0.3]);
@@ -574,22 +689,24 @@ mod tests {
         // A neutral row with one reddish chroma speckle at the same brightness.
         // Color NR (luma off) pulls the speckle's chroma toward its neutral
         // neighbors — reducing the color blotch — while leaving luminance alone.
-        let mut img = ImageBuf::new(5, 1);
-        for x in 0..5 {
+        // Radius 2 so the speckle has interior taps inside the σ = radius/3 window
+        // (at radius 1 the only neighbors sit at the ±3σ edge and barely weigh in).
+        let mut img = ImageBuf::new(7, 1);
+        for x in 0..7 {
             img.set(x, 0, [0.5, 0.5, 0.5]);
         }
         let speckle = [0.6, 0.45, 0.45]; // a color speckle, near the neutral luma
-        img.set(2, 0, speckle);
+        img.set(3, 0, speckle);
         let before = speckle[0] - speckle[1]; // chroma spread r vs g
         let out = CpuBackend.denoise(
             &img,
             DenoiseParams {
-                radius: 1.0,
+                radius: 2.0,
                 luma: 0.0,
                 chroma: 0.3,
             },
         );
-        let s = out.get(2, 0);
+        let s = out.get(3, 0);
         assert!(
             (s[0] - s[1]) < before - 0.02,
             "chroma noise reduced: {s:?} (spread {} → {})",
@@ -600,6 +717,38 @@ mod tests {
         assert!(
             (luminance(s) - luminance(speckle)).abs() < 1e-4,
             "luma preserved: {s:?}"
+        );
+    }
+
+    #[test]
+    fn denoise_chroma_keeps_blue_luminance_detail() {
+        // A pure-blue region with a luminance step (one hue, two lightnesses). Hard
+        // chroma NR must keep the step: with the perceptual split the lightness is
+        // in the luma channel, so the chroma smoother can't touch it — the old
+        // rgb − Y split leaked blue's luminance into the chroma channel and erased
+        // the step (blue's luma weight is ~0.0001).
+        let dark = [0.05_f32, 0.10, 0.45];
+        let bright = [0.10_f32, 0.20, 0.90];
+        let mut img = ImageBuf::new(6, 1);
+        for x in 0..3 {
+            img.set(x, 0, dark);
+        }
+        for x in 3..6 {
+            img.set(x, 0, bright);
+        }
+        let out = CpuBackend.denoise(
+            &img,
+            DenoiseParams {
+                radius: 2.0,
+                luma: 0.0,
+                chroma: 1.0,
+            },
+        );
+        let step_in = luminance(bright) - luminance(dark);
+        let step_out = luminance(out.get(4, 0)) - luminance(out.get(1, 0));
+        assert!(
+            step_out > step_in * 0.9,
+            "blue luminance step eaten by chroma NR: {step_in} → {step_out}"
         );
     }
 
