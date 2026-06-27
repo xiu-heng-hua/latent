@@ -670,8 +670,9 @@ mod tests {
             m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             center: [7.5, 7.5],
             inv_norm: 1.0 / 7.5,
+            model: latent_edit::DistortionModel::Poly5,
             radial: [0.0, 0.2, 0.0, 0.0],
-            channel_scale: [1.0, 1.0, 1.0],
+            channel_scale: [[0.0, 0.0, 1.0]; 3],
         };
         let out = CpuBackend.warp(&img, &w);
         let (sx, sy) = w.map(12.0, 7.0);

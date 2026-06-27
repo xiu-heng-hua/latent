@@ -7,8 +7,8 @@
 //! (SOURCE → OUTPUT).
 
 use latent_edit::{
-    Adjustments, Crop, Curves, Geometry, LensProfile, LocalAdjustment, Mask, Perspective,
-    SelectiveTone, Settings,
+    Adjustments, Crop, Curves, DistortionModel, Geometry, LensProfile, LocalAdjustment, Mask,
+    Perspective, SelectiveTone, Settings,
 };
 use latent_image::ImageBuf;
 use latent_image::color::luminance;
@@ -217,17 +217,25 @@ pub struct Warp {
     pub m: [[f32; 3]; 3],
     /// Center of the radial term, in source pixel coordinates.
     pub center: [f32; 2],
-    /// Reciprocal of the radius normalization, so radius math is a multiply.
+    /// Reciprocal of the radius normalization (lensfun's focal-scaled
+    /// half-diagonal `NormScale`), so radius math is a multiply.
     pub inv_norm: f32,
-    /// Radial distortion polynomial in the normalized radius `r`: a point at
-    /// radius `r` from `center` is mapped to `r·(1 + d0·r + d1·r² + d2·r³ + d3·r⁴)`.
-    /// The even-only subset is Brown–Conrady (Brown 1966); the odd terms let it
-    /// also express the PanoTools/Hugin model. All-zero = no radial term.
+    /// Which forward distortion model `radial` describes — it selects how the
+    /// output → source (undistort) map inverts the forward `r_d(r_u)`: Newton
+    /// iteration for the even POLY3/POLY5 models, a direct radial multiply for
+    /// the PanoTools/Hugin PTLENS model.
+    pub model: DistortionModel,
+    /// Forward radial distortion coefficients in the focal-normalized radius `r`,
+    /// laid out by `model` (see [`LensProfile::distortion`]): POLY3 carries `k1`
+    /// in slot 1; POLY5 carries `k1`, `k2` in slots 1 and 3; PTLENS carries
+    /// `[c, b, a, 0]`. All-zero (with `model` = `None`) is no radial term.
     pub radial: [f32; 4],
-    /// Per-channel `[r, g, b]` scale of the offset from `center`, for lateral
-    /// chromatic aberration: each channel samples at its own radius. `[1, 1, 1]`
-    /// is no CA — the channels share one coordinate and resample in one pass.
-    pub channel_scale: [f32; 3],
+    /// Per-channel `[r, g, b]` radial scale of the offset from `center`, for
+    /// lateral chromatic aberration: each channel `c` samples at radius
+    /// `r·(b_c·r² + c_c·r + v_c)` where `channel_scale[c] = [b_c, c_c, v_c]`.
+    /// Green is the reference `[0, 0, 1]`; when all three are the identity the
+    /// channels share one coordinate and resample in a single pass.
+    pub channel_scale: [[f32; 3]; 3],
 }
 
 impl Warp {
@@ -239,14 +247,22 @@ impl Warp {
             m: t.m,
             center: [0.0, 0.0],
             inv_norm: 0.0,
+            model: DistortionModel::None,
             radial: [0.0, 0.0, 0.0, 0.0],
-            channel_scale: [1.0, 1.0, 1.0],
+            channel_scale: [CA_IDENTITY; 3],
         }
     }
 
     /// The source coordinate an output pixel `(x, y)` maps to: the homography
     /// (with perspective divide), then the radial distortion about `center`. This
     /// is the geometric (CA-free) coordinate shared by all channels.
+    ///
+    /// The geometry stage runs output → source: an output (corrected) pixel is
+    /// inverse-mapped to the source (uncorrected raw) pixel to sample. This is
+    /// lensfun's `UnDist` step — solving `r_d(r_u) = r_out` for the source radius
+    /// `r_u` to look up. For the even POLY3/POLY5 models that has no closed form,
+    /// so it is solved by Newton iteration exactly as lensfun does; PTLENS keeps
+    /// the direct multiply where it is the defined operation.
     pub fn map(&self, x: f32, y: f32) -> (f32, f32) {
         let w = self.m[2][0] * x + self.m[2][1] * y + self.m[2][2];
         if w <= 0.0 {
@@ -255,38 +271,93 @@ impl Warp {
         }
         let ix = (self.m[0][0] * x + self.m[0][1] * y + self.m[0][2]) / w;
         let iy = (self.m[1][0] * x + self.m[1][1] * y + self.m[1][2]) / w;
-        if self.radial == [0.0, 0.0, 0.0, 0.0] {
+        if self.model == DistortionModel::None {
             return (ix, iy);
         }
         let (dx, dy) = (ix - self.center[0], iy - self.center[1]);
-        let r2 = (dx * dx + dy * dy) * self.inv_norm * self.inv_norm;
-        let r = r2.sqrt();
-        // s(r) = 1 + d0·r + d1·r² + d2·r³ + d3·r⁴ (Horner in r).
-        let [d0, d1, d2, d3] = self.radial;
-        let s = 1.0 + r * (d0 + r * (d1 + r * (d2 + r * d3)));
+        // `r_out` is the corrected-output radius (focal-normalized); `s` carries
+        // the offset onto the source radius that distorts back to it.
+        let r_out = (dx * dx + dy * dy).sqrt() * self.inv_norm;
+        let s = self.undistort_ratio(r_out);
         (self.center[0] + dx * s, self.center[1] + dy * s)
     }
 
-    /// The source coordinate channel `c` samples from: [`Self::map`] with the
-    /// per-channel CA scale applied to the offset from `center`.
-    pub fn map_channel(&self, x: f32, y: f32, c: usize) -> (f32, f32) {
-        let (bx, by) = self.map(x, y);
-        let f = self.channel_scale[c];
-        if f == 1.0 {
-            return (bx, by);
+    /// The ratio `r_src / r_out` mapping a corrected-output radius `r_out` to the
+    /// source radius that distorts back to it (lensfun's `UnDist`; both in the
+    /// focal-normalized frame). For the even models this solves `r_out = r_src·(1 +
+    /// …)` for `r_src` by a few Newton steps — the radius is monotone over the
+    /// image, so it converges to sub-pixel in two or three. PTLENS instead applies
+    /// the forward (`Dist`) multiply directly, the register's decision for it.
+    fn undistort_ratio(&self, r_out: f32) -> f32 {
+        if r_out == 0.0 {
+            return 1.0;
         }
-        (
-            self.center[0] + (bx - self.center[0]) * f,
-            self.center[1] + (by - self.center[1]) * f,
-        )
+        match self.model {
+            DistortionModel::None => 1.0,
+            // POLY3 focal form: r_out = r_src + k1·r_src³. Solve for r_src.
+            DistortionModel::Poly3 => {
+                let k1 = self.radial[1];
+                let mut ru = r_out;
+                for _ in 0..NEWTON_STEPS {
+                    let f = ru + k1 * ru * ru * ru - r_out;
+                    ru -= f / (1.0 + 3.0 * k1 * ru * ru);
+                }
+                ru / r_out
+            }
+            // POLY5 focal form: r_out = r_src(1 + k1·r_src² + k2·r_src⁴).
+            DistortionModel::Poly5 => {
+                let (k1, k2) = (self.radial[1], self.radial[3]);
+                let mut ru = r_out;
+                for _ in 0..NEWTON_STEPS {
+                    let ru2 = ru * ru;
+                    let f = ru * (1.0 + k1 * ru2 + k2 * ru2 * ru2) - r_out;
+                    ru -= f / (1.0 + 3.0 * k1 * ru2 + 5.0 * k2 * ru2 * ru2);
+                }
+                ru / r_out
+            }
+            // PTLENS keeps the direct radial multiply: s = 1 + c·r + b·r² + a·r³
+            // evaluated at the output radius (Horner), no Newton inversion.
+            DistortionModel::Ptlens => {
+                let [c, b, a, _] = self.radial;
+                1.0 + r_out * (c + r_out * (b + r_out * a))
+            }
+        }
     }
 
-    /// Whether any channel has a non-unit CA scale (so channels must be sampled
-    /// separately rather than in one shared lookup).
+    /// The source coordinate channel `c` samples from: [`Self::map`] for the
+    /// shared geometry, then the per-channel radial CA scale applied to the
+    /// offset from `center`. The scale `s_c(r) = b·r² + c·r + v` is evaluated at
+    /// the (post-distortion) radius the channel samples at — one resample, no
+    /// second CA pass.
+    pub fn map_channel(&self, x: f32, y: f32, c: usize) -> (f32, f32) {
+        let (bx, by) = self.map(x, y);
+        let [b, cc, v] = self.channel_scale[c];
+        if b == 0.0 && cc == 0.0 && v == 1.0 {
+            return (bx, by);
+        }
+        let (dx, dy) = (bx - self.center[0], by - self.center[1]);
+        let r = (dx * dx + dy * dy).sqrt() * self.inv_norm;
+        let s = v + r * (cc + r * b);
+        (self.center[0] + dx * s, self.center[1] + dy * s)
+    }
+
+    /// Whether any channel has a non-identity CA scale (so channels must be
+    /// sampled separately rather than in one shared lookup). Green is the
+    /// reference identity `[0, 0, 1]`.
     pub fn has_chromatic(&self) -> bool {
-        self.channel_scale != [1.0, 1.0, 1.0]
+        self.channel_scale.iter().any(|s| *s != CA_IDENTITY)
     }
 }
+
+/// The green-reference CA scale `[b, c, v] = [0, 0, 1]`: a unit radial scale with
+/// no offset, so the channel samples at the shared (distortion-only) coordinate.
+const CA_IDENTITY: [f32; 3] = [0.0, 0.0, 1.0];
+
+/// Newton iterations for the even-model radius inversion. The radius map is
+/// monotone over the image, so a fixed small count converges to well below a
+/// pixel at the corners; a fixed count (no tolerance branch) keeps the hot path
+/// branch-free and trivially portable to a GPU warp shader.
+const NEWTON_STEPS: usize = 3;
 
 /// The pixel-level primitives a rendering backend provides.
 ///
@@ -671,14 +742,52 @@ pub fn keystone_transform(extent: Extent, vertical: f32, horizontal: f32) -> Tra
 }
 
 /// The radial component of a [`LensProfile`] for an image of size `extent`, as
-/// the `(center, inv_norm, radial)` fields of a [`Warp`]: the optical center in
-/// source pixels, the reciprocal of the normalization radius (half the shorter
-/// side, the pinned convention), and the Brown–Conrady coefficients.
-fn lens_radial(extent: Extent, lens: &LensProfile) -> ([f32; 2], f32, [f32; 4]) {
+/// the `(center, inv_norm, model, radial)` fields of a [`Warp`].
+///
+/// The radius is normalized exactly as lensfun does — by the **focal-scaled
+/// half-diagonal**, so `r = 1` is one real focal length on the sensor (lensfun's
+/// natural unit), not the half-short-edge of the PanoTools/Hugin convention:
+///
+/// ```text
+/// NormScale = hypot(36, 24) / Crop / hypot(W + 1, H + 1) / RealFocal
+/// ```
+///
+/// where `W = width - 1`, `H = height - 1` are measured at the pixel centers.
+/// The distortion coefficients are carried in this same focal frame (rescaled at
+/// lookup), so the radius unit and the coefficients agree. The optical center
+/// offset is measured against the **shorter** side: `lens.center` is a fraction
+/// where `0.5` is the image center and a unit offset spans `min(w, h)/2` pixels.
+fn lens_radial(extent: Extent, lens: &LensProfile) -> ([f32; 2], f32, DistortionModel, [f32; 4]) {
     let (w, h) = (extent.width as f32, extent.height as f32);
-    let center = [lens.center[0] * (w - 1.0), lens.center[1] * (h - 1.0)];
-    let inv_norm = 2.0 / w.min(h);
-    (center, inv_norm, lens.distortion)
+    let center = optical_center(extent, lens);
+    let inv_norm = (36.0_f32).hypot(24.0) / lens.crop / (w + 1.0).hypot(h + 1.0) / lens.real_focal;
+    (center, inv_norm, lens.model, lens.distortion)
+}
+
+/// The optical center in source pixels. The `lens.center` fraction is anchored at
+/// the frame center (`0.5`); an offset is measured in half-shorter-side units,
+/// matching lensfun's `min(W, H)/2` divisor (the same on both axes), so an
+/// off-center calibration is right on a non-square frame.
+fn optical_center(extent: Extent, lens: &LensProfile) -> [f32; 2] {
+    let cap_w = (extent.width as f32 - 1.0).max(1.0);
+    let cap_h = (extent.height as f32 - 1.0).max(1.0);
+    let half_short = cap_w.min(cap_h) / 2.0;
+    [
+        cap_w / 2.0 + (lens.center[0] - 0.5) * 2.0 * half_short,
+        cap_h / 2.0 + (lens.center[1] - 0.5) * 2.0 * half_short,
+    ]
+}
+
+/// The corner-anchored radius normalization for the PA vignetting model, whose
+/// `r = 1` is the image **corner** (unlike distortion/TCA, whose `r = 1` is one
+/// focal length). Returns `(center, inv_norm)`: the optical center and the
+/// reciprocal of the half-diagonal in pixels, so an image corner sits at `r = 1`.
+/// Vignetting is measured about the optical axis, so it shares the center offset.
+fn lens_vignetting_radial(extent: Extent, lens: &LensProfile) -> ([f32; 2], f32) {
+    let (w, h) = (extent.width as f32, extent.height as f32);
+    let center = optical_center(extent, lens);
+    let inv_norm = 2.0 / (w * w + h * h).sqrt();
+    (center, inv_norm)
 }
 
 /// Stage: geometry — the single SOURCE → OUTPUT step.
@@ -698,9 +807,12 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
     };
     // Lens vignetting correction is a SOURCE-space radial gain applied *before*
     // any resample (matching lensfun's vignetting → geometry order): a flat-field
-    // multiply, not an interpolation.
+    // multiply, not an interpolation. The PA model's radius is corner-anchored
+    // (r = 1 at the image corner), a different unit from distortion/TCA, so it
+    // gets its own normalization; `reciprocal: true` divides the source by the
+    // measured falloff `1 + k1 r² + …` (lensfun's `C_d = C_s / (1 + …)`).
     if let Some(l) = geometry.lens.filter(|l| l.vignetting != [0.0, 0.0, 0.0]) {
-        let (center, inv_norm, _) = lens_radial(extent, &l);
+        let (center, inv_norm) = lens_vignetting_radial(extent, &l);
         backend.apply_radial_gain(
             &mut img,
             &RadialGain {
@@ -731,13 +843,13 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
     // Fold lens distortion and chromatic aberration into the *same* resample:
     // homography, then the radial term, then a per-channel scale — one
     // interpolation, never a second warp pass.
-    let lens = geometry
-        .lens
-        .filter(|l| l.distortion != [0.0, 0.0, 0.0, 0.0] || l.ca != [0.0, 0.0]);
+    let lens = geometry.lens.filter(|l| {
+        l.model != DistortionModel::None || l.ca[0] != CA_IDENTITY || l.ca[1] != CA_IDENTITY
+    });
     match (homography, lens) {
         (h, Some(l)) => {
             let base = h.unwrap_or_else(|| Transform::identity(extent));
-            let (center, inv_norm, radial) = lens_radial(extent, &l);
+            let (center, inv_norm, model, radial) = lens_radial(extent, &l);
             img = backend.warp(
                 &img,
                 &Warp {
@@ -745,8 +857,11 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
                     m: base.m,
                     center,
                     inv_norm,
+                    model,
                     radial,
-                    channel_scale: [1.0 + l.ca[0], 1.0, 1.0 + l.ca[1]],
+                    // Green is the reference identity; red/blue carry their POLY3
+                    // radial CA scale [b, c, v].
+                    channel_scale: [l.ca[0], CA_IDENTITY, l.ca[1]],
                 },
             );
         }
@@ -1511,8 +1626,9 @@ mod tests {
 
     #[test]
     fn warp_map_composes_homography_then_radial() {
-        // Identity homography, unit normalization, an r² term d1 = 0.1: the point
-        // (3, 4) is r² = 25 from the origin, so it scales by 1 + 0.1·25 = 3.5.
+        // PTLENS keeps the direct radial multiply. Identity homography, unit
+        // normalization, a b-term (r²) of 0.1: the point (3, 4) is r = 5 (r² = 25)
+        // from the origin, so it scales by 1 + 0.1·25 = 3.5.
         let w = Warp {
             output: Extent {
                 width: 8,
@@ -1521,8 +1637,9 @@ mod tests {
             m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             center: [0.0, 0.0],
             inv_norm: 1.0,
+            model: DistortionModel::Ptlens,
             radial: [0.0, 0.1, 0.0, 0.0],
-            channel_scale: [1.0, 1.0, 1.0],
+            channel_scale: [CA_IDENTITY; 3],
         };
         let (sx, sy) = w.map(3.0, 4.0);
         assert!(
@@ -1533,9 +1650,9 @@ mod tests {
 
     #[test]
     fn warp_map_handles_odd_radial_powers() {
-        // A pure r term (d0 = 0.1) — the odd power Brown–Conrady could not hold,
-        // needed for the PanoTools/PTLENS model. (3, 4) is r = 5 from the origin,
-        // so it scales by 1 + 0.1·5 = 1.5.
+        // The PTLENS direct multiply carries the odd `r` term Brown–Conrady could
+        // not hold (the c-coefficient). (3, 4) is r = 5 from the origin, so a c of
+        // 0.1 scales by 1 + 0.1·5 = 1.5.
         let w = Warp {
             output: Extent {
                 width: 8,
@@ -1544,8 +1661,9 @@ mod tests {
             m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             center: [0.0, 0.0],
             inv_norm: 1.0,
+            model: DistortionModel::Ptlens,
             radial: [0.1, 0.0, 0.0, 0.0],
-            channel_scale: [1.0, 1.0, 1.0],
+            channel_scale: [CA_IDENTITY; 3],
         };
         let (sx, sy) = w.map(3.0, 4.0);
         assert!(
@@ -1573,8 +1691,11 @@ mod tests {
     #[test]
     fn lens_distortion_straightens_a_barrel_grid() {
         // Three bright source pixels bow outward at the middle (the barrel
-        // signature): columns 15, 16, 15 at rows 6, 10, 14. The distortion
-        // correction must pull them onto one straight output column (18).
+        // signature): columns 15, 16, 15 at rows 6, 10, 14. The POLY5 distortion
+        // correction (Newton-inverted at lensfun's focal-scaled normalization)
+        // must pull them onto one straight output column (16). The crop/real_focal
+        // pick the focal-scaled `NormScale`; under the old half-short-edge scale
+        // the same coefficient would over- or under-correct.
         let mut src = ImageBuf::new(21, 21);
         src.set(16, 10, [1.0, 1.0, 1.0]);
         src.set(15, 6, [1.0, 1.0, 1.0]);
@@ -1585,10 +1706,11 @@ mod tests {
                 straighten_degrees: 0.0,
                 perspective: None,
                 lens: Some(LensProfile {
-                    center: [0.5, 0.5],
-                    distortion: [0.0, -0.4, 0.0, 0.0],
-                    ca: [0.0, 0.0],
-                    vignetting: [0.0, 0.0, 0.0],
+                    crop: 1.0,
+                    real_focal: 9.03,
+                    model: DistortionModel::Poly5,
+                    distortion: [0.0, 0.09, 0.0, 0.0],
+                    ..LensProfile::default()
                 }),
                 vignette: None,
             },
@@ -1596,9 +1718,9 @@ mod tests {
         };
         let out = render(&src, &settings, &TestBackend);
         assert_eq!((out.width(), out.height()), (21, 21));
-        assert_eq!(out.get(18, 10), [1.0, 1.0, 1.0]); // was source (16, 10)
-        assert_eq!(out.get(18, 4), [1.0, 1.0, 1.0]); // was source (15, 6)
-        assert_eq!(out.get(18, 16), [1.0, 1.0, 1.0]); // was source (15, 14)
+        assert_eq!(out.get(16, 10), [1.0, 1.0, 1.0]); // was source (16, 10)
+        assert_eq!(out.get(16, 6), [1.0, 1.0, 1.0]); // was source (15, 6)
+        assert_eq!(out.get(16, 14), [1.0, 1.0, 1.0]); // was source (15, 14)
     }
 
     #[test]
@@ -1612,12 +1734,7 @@ mod tests {
                 crop: None,
                 straighten_degrees: 0.0,
                 perspective: None,
-                lens: Some(LensProfile {
-                    center: [0.5, 0.5],
-                    distortion: [0.0, 0.0, 0.0, 0.0],
-                    ca: [0.0, 0.0],
-                    vignetting: [0.0, 0.0, 0.0],
-                }),
+                lens: Some(LensProfile::default()),
                 vignette: None,
             },
             ..Settings::default()
@@ -1628,8 +1745,9 @@ mod tests {
     #[test]
     fn chromatic_aberration_recombines_a_split_target() {
         // A laterally split feature: red fringed outward (x=16), green centered
-        // (x=15), blue inward (x=14). The per-channel CA correction samples each
-        // back onto one output pixel, recombining them to white.
+        // (x=15), blue inward (x=14). The per-channel (constant LINEAR) CA scale
+        // samples each back onto one output pixel, recombining them to white. With
+        // unit normalization the on-axis scale is the bare `v` term.
         let mut src = ImageBuf::new(17, 17);
         src.set(16, 8, [1.0, 0.0, 0.0]);
         src.set(15, 8, [0.0, 1.0, 0.0]);
@@ -1640,10 +1758,10 @@ mod tests {
                 straighten_degrees: 0.0,
                 perspective: None,
                 lens: Some(LensProfile {
-                    center: [0.5, 0.5],
-                    distortion: [0.0, 0.0, 0.0, 0.0],
-                    ca: [0.1, -0.1],
-                    vignetting: [0.0, 0.0, 0.0],
+                    crop: 1.0,
+                    real_focal: 1.0,
+                    ca: [[0.0, 0.0, 1.1], [0.0, 0.0, 0.9]],
+                    ..LensProfile::default()
                 }),
                 vignette: None,
             },
@@ -1655,15 +1773,24 @@ mod tests {
 
     #[test]
     fn lens_vignetting_flattens_a_radial_falloff() {
-        // The captured image carries the lens's falloff (1 + v·r², v < 0, so
-        // corners are darker); correction divides it back out, flattening it.
+        // The captured image carries the lens's PA falloff (1 + k·r², k < 0, so
+        // corners are darker), measured with the corner-anchored radius (r = 1 at
+        // the corner). Correction divides it back out at the same corner
+        // normalization, flattening it.
         let mut src = ImageBuf::new(9, 9);
         for p in src.pixels_mut() {
             *p = [0.5, 0.5, 0.5];
         }
+        let (center, inv_norm) = lens_vignetting_radial(
+            Extent {
+                width: 9,
+                height: 9,
+            },
+            &LensProfile::default(),
+        );
         let falloff = RadialGain {
-            center: [4.0, 4.0],
-            inv_norm: 2.0 / 9.0,
+            center,
+            inv_norm,
             poly: [-0.5, 0.0, 0.0],
             reciprocal: false,
         };
@@ -1675,10 +1802,8 @@ mod tests {
                 straighten_degrees: 0.0,
                 perspective: None,
                 lens: Some(LensProfile {
-                    center: [0.5, 0.5],
-                    distortion: [0.0, 0.0, 0.0, 0.0],
-                    ca: [0.0, 0.0],
                     vignetting: [-0.5, 0.0, 0.0],
+                    ..LensProfile::default()
                 }),
                 vignette: None,
             },
@@ -1692,8 +1817,8 @@ mod tests {
 
     #[test]
     fn neutral_ca_leaves_color_unchanged() {
-        // ca = [0, 0] → all channels share one coordinate; with no distortion the
-        // color image is untouched (the single-sample fast path).
+        // ca = identity → all channels share one coordinate; with no distortion
+        // the color image is untouched (the single-sample fast path).
         let mut src = ImageBuf::new(8, 8);
         for (i, p) in src.pixels_mut().iter_mut().enumerate() {
             *p = [i as f32, (2 * i) as f32, (3 * i) as f32];
@@ -1703,12 +1828,7 @@ mod tests {
                 crop: None,
                 straighten_degrees: 0.0,
                 perspective: None,
-                lens: Some(LensProfile {
-                    center: [0.5, 0.5],
-                    distortion: [0.0, 0.0, 0.0, 0.0],
-                    ca: [0.0, 0.0],
-                    vignetting: [0.0, 0.0, 0.0],
-                }),
+                lens: Some(LensProfile::default()),
                 vignette: None,
             },
             ..Settings::default()
@@ -1779,5 +1899,428 @@ mod tests {
         fn assert_send_sync<T: ?Sized + Send + Sync>() {}
         assert_send_sync::<TestBackend>();
         assert_send_sync::<dyn Backend>();
+    }
+
+    // --- Lens normalization, inversion, TCA, and vignetting (lensfun fidelity) -
+
+    /// The analytic forward distortion `r_d / r_u = s_fwd(r_u)` for a model, in
+    /// the focal-normalized frame — the reference the engine's `Warp::map` (which
+    /// runs output → distorted source) must reproduce.
+    fn forward_ratio(model: DistortionModel, radial: [f32; 4], ru: f32) -> f32 {
+        match model {
+            DistortionModel::None => 1.0,
+            DistortionModel::Poly3 => 1.0 + radial[1] * ru * ru,
+            DistortionModel::Poly5 => 1.0 + radial[1] * ru * ru + radial[3] * ru.powi(4),
+            DistortionModel::Ptlens => {
+                let [c, b, a, _] = radial;
+                1.0 + ru * (c + ru * (b + ru * a))
+            }
+        }
+    }
+
+    #[test]
+    fn norm_scale_matches_lensfun() {
+        // inv_norm is lensfun's focal-scaled half-diagonal NormScale, not the old
+        // half-short-edge 2/min(w,h).
+        let extent = Extent {
+            width: 6000,
+            height: 4000,
+        };
+        let lens = LensProfile {
+            crop: 1.6,
+            real_focal: 24.0,
+            model: DistortionModel::Poly5,
+            distortion: [0.0, 0.01, 0.0, 0.0],
+            ..LensProfile::default()
+        };
+        let (_, inv_norm, _, _) = lens_radial(extent, &lens);
+        let expected = (36.0_f32).hypot(24.0) / 1.6 / (6001.0_f32).hypot(4001.0) / 24.0;
+        assert!(
+            (inv_norm - expected).abs() < 1e-9,
+            "{inv_norm} vs {expected}"
+        );
+        // And it is *not* the old PanoTools unit (a clear, large divergence).
+        assert!((inv_norm - 2.0 / 4000.0).abs() > 1e-4);
+    }
+
+    #[test]
+    fn off_center_scales_by_min_dimension() {
+        // A non-zero CenterX on a non-square frame shifts the optical center by
+        // CenterX·min(w-1, h-1)/2 px — the same divisor on both axes (lensfun),
+        // not a fraction of each full dimension (which would differ per axis).
+        let extent = Extent {
+            width: 101,
+            height: 61,
+        };
+        let lens = LensProfile {
+            // 0.5 + 0.1 in x means a +0.1 offset in half-shorter-side units.
+            center: [0.6, 0.5],
+            ..LensProfile::default()
+        };
+        let (center, _, _, _) = lens_radial(extent, &lens);
+        let (cap_w, cap_h) = (100.0_f32, 60.0_f32);
+        let half_short = cap_w.min(cap_h) / 2.0;
+        assert!((center[0] - (cap_w / 2.0 + 0.1 * 2.0 * half_short)).abs() < 1e-4);
+        assert!((center[1] - cap_h / 2.0).abs() < 1e-4);
+        // The old "fraction of full width" mapping would have put it at
+        // 0.6·(w-1) = 60.0, a different (wrong) place on the long axis.
+        assert!((center[0] - 0.6 * cap_w).abs() > 1.0);
+    }
+
+    #[test]
+    fn vignetting_radius_is_corner_normalized() {
+        // The PA vignetting radius is r = 1 at the image corner, unlike the
+        // focal-scaled distortion normalization.
+        let extent = Extent {
+            width: 21,
+            height: 13,
+        };
+        let (center, inv_norm) = lens_vignetting_radial(extent, &LensProfile::default());
+        // The outer rim of the corner pixel (half a pixel past its center) sits at
+        // r = 1: distance hypot(w, h)/2 from center, times inv_norm = 2/hypot(w, h).
+        let rim_r = normalized_radius(-0.5, -0.5, center, inv_norm);
+        assert!((rim_r - 1.0).abs() < 1e-5, "corner rim r = {rim_r}");
+    }
+
+    /// The source radius (in the focal-normalized frame) a `Warp::map` produced
+    /// for the output point `(px, py)`, and the output radius it came from.
+    fn mapped_radii(w: &Warp, px: f32, py: f32) -> (f32, f32) {
+        let (sx, sy) = w.map(px, py);
+        let out_r = ((px - w.center[0]).powi(2) + (py - w.center[1]).powi(2)).sqrt() * w.inv_norm;
+        let src_r = ((sx - w.center[0]).powi(2) + (sy - w.center[1]).powi(2)).sqrt() * w.inv_norm;
+        (out_r, src_r)
+    }
+
+    #[test]
+    fn newton_inverts_poly3_to_subpixel() {
+        // The geometry stage maps a corrected output radius back to the smaller
+        // distorted source radius — lensfun's UnDist direction. Newton solves
+        // `r_out = r_src·(1 + k1·r_src²)` for `r_src`; forward-applying the model
+        // to the recovered source radius must return the output radius to
+        // sub-pixel (the round-trip the direct multiply cannot close exactly).
+        let (cx, cy) = (200.0_f32, 150.0_f32);
+        let inv_norm = 1.0 / 250.0; // r ≈ 1 near the corner.
+        let radial = [0.0, 0.05, 0.0, 0.0];
+        let w = Warp {
+            output: Extent {
+                width: 400,
+                height: 300,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [cx, cy],
+            inv_norm,
+            model: DistortionModel::Poly3,
+            radial,
+            channel_scale: [CA_IDENTITY; 3],
+        };
+        let (out_r, src_r) = mapped_radii(&w, cx + 200.0, cy + 120.0);
+        let recovered = src_r * forward_ratio(DistortionModel::Poly3, radial, src_r);
+        let err_px = (recovered - out_r).abs() / inv_norm;
+        assert!(err_px < 0.01, "poly3 round-trip off by {err_px} px");
+    }
+
+    #[test]
+    fn newton_inverts_poly5_to_subpixel() {
+        let (cx, cy) = (200.0_f32, 150.0_f32);
+        let inv_norm = 1.0 / 250.0;
+        let radial = [0.0, 0.03, 0.0, 0.01];
+        let w = Warp {
+            output: Extent {
+                width: 400,
+                height: 300,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [cx, cy],
+            inv_norm,
+            model: DistortionModel::Poly5,
+            radial,
+            channel_scale: [CA_IDENTITY; 3],
+        };
+        let (out_r, src_r) = mapped_radii(&w, cx + 200.0, cy + 120.0);
+        let recovered = src_r * forward_ratio(DistortionModel::Poly5, radial, src_r);
+        let err_px = (recovered - out_r).abs() / inv_norm;
+        assert!(err_px < 0.01, "poly5 round-trip off by {err_px} px");
+    }
+
+    #[test]
+    fn ptlens_uses_the_direct_multiply() {
+        // PTLENS keeps the direct radial multiply (no Newton): the source radius
+        // is exactly r_d = r·(1 + c·r + b·r² + a·r³) evaluated at the output
+        // radius. This pins the register's decision to leave PTLENS direct.
+        let (cx, cy) = (100.0_f32, 100.0_f32);
+        let inv_norm = 1.0 / 100.0;
+        let radial = [0.02, -0.01, 0.005, 0.0];
+        let w = Warp {
+            output: Extent {
+                width: 200,
+                height: 200,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [cx, cy],
+            inv_norm,
+            model: DistortionModel::Ptlens,
+            radial,
+            channel_scale: [CA_IDENTITY; 3],
+        };
+        let (px, py) = (cx + 60.0, cy + 80.0); // r = 100 px → r_d unit = 1.0
+        let (sx, sy) = w.map(px, py);
+        let r = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() * inv_norm;
+        let s = 1.0 + r * (radial[0] + r * (radial[1] + r * radial[2]));
+        assert!((sx - (cx + (px - cx) * s)).abs() < 1e-3, "{sx}");
+        assert!((sy - (cy + (py - cy) * s)).abs() < 1e-3, "{sy}");
+    }
+
+    #[test]
+    fn poly3_tca_corrects_radial_term() {
+        // The per-channel radial CA scale s_c(r) = b·r² + c·r + v is applied at the
+        // sampled radius — the full radius dependence, not just the on-axis v.
+        let (cx, cy) = (50.0_f32, 50.0_f32);
+        let inv_norm = 1.0 / 50.0;
+        let red = [0.01_f32, 0.02, 1.0]; // [b, c, v]
+        let w = Warp {
+            output: Extent {
+                width: 100,
+                height: 100,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [cx, cy],
+            inv_norm,
+            model: DistortionModel::None,
+            radial: [0.0, 0.0, 0.0, 0.0],
+            channel_scale: [red, CA_IDENTITY, CA_IDENTITY],
+        };
+        for &(px, py) in &[(cx + 10.0, cy), (cx + 30.0, cy), (cx + 40.0, cy + 20.0)] {
+            let (rx, _ry) = w.map_channel(px, py, 0);
+            let r = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() * inv_norm;
+            let s = red[2] + r * (red[1] + r * red[0]);
+            let expected_x = cx + (px - cx) * s;
+            assert!(
+                (rx - expected_x).abs() < 1e-4,
+                "r={r}: {rx} vs {expected_x}"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_tca_is_constant_scale() {
+        // LINEAR TCA is the degenerate [0, 0, k]: a constant radial scale at every
+        // radius (no b/c radius dependence).
+        let (cx, cy) = (50.0_f32, 50.0_f32);
+        let inv_norm = 1.0 / 50.0;
+        let red = [0.0_f32, 0.0, 1.05];
+        let w = Warp {
+            output: Extent {
+                width: 100,
+                height: 100,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [cx, cy],
+            inv_norm,
+            model: DistortionModel::None,
+            radial: [0.0, 0.0, 0.0, 0.0],
+            channel_scale: [red, CA_IDENTITY, CA_IDENTITY],
+        };
+        assert!(w.has_chromatic());
+        for &(px, py) in &[(cx + 10.0, cy), (cx + 40.0, cy + 25.0)] {
+            let (rx, _ry) = w.map_channel(px, py, 0);
+            assert!((rx - (cx + (px - cx) * 1.05)).abs() < 1e-4);
+        }
+        // Green is the untouched reference.
+        let green_w = Warp {
+            channel_scale: [CA_IDENTITY; 3],
+            ..w
+        };
+        assert!(!green_w.has_chromatic());
+    }
+
+    #[test]
+    fn pa_vignetting_flattens_known_falloff() {
+        // A flat field with a multi-term PA falloff baked in (corner-normalized,
+        // negative k's so the corners darken) returns to flat when the lens
+        // vignetting correction divides the same falloff back out.
+        let extent = Extent {
+            width: 17,
+            height: 11,
+        };
+        let mut src = ImageBuf::new(extent.width, extent.height);
+        for p in src.pixels_mut() {
+            *p = [0.5, 0.5, 0.5];
+        }
+        let terms = [-0.45_f32, 0.12, -0.05];
+        let (center, inv_norm) = lens_vignetting_radial(extent, &LensProfile::default());
+        TestBackend.apply_radial_gain(
+            &mut src,
+            &RadialGain {
+                center,
+                inv_norm,
+                poly: terms,
+                reciprocal: false,
+            },
+        );
+        // The corners really are darker than the center before correction.
+        assert!(src.get(0, 0)[0] < src.get(8, 5)[0]);
+        let settings = Settings {
+            geometry: Geometry {
+                lens: Some(LensProfile {
+                    vignetting: terms,
+                    ..LensProfile::default()
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        for p in out.pixels() {
+            assert!((p[0] - 0.5).abs() < 1e-5, "flattened: {p:?}");
+        }
+    }
+
+    #[test]
+    fn distortion_grid_straightens_to_lensfun() {
+        // For each model, a straight output grid maps (output → distorted source)
+        // to exactly the forward-distortion the lensfun model defines, at lensfun's
+        // focal-scaled normalization — proving the C2 scale and C3 inversion. An
+        // off-center, non-square frame exercises the center scaling (a square frame
+        // hides the min-dimension bug).
+        let extent = Extent {
+            width: 160,
+            height: 100,
+        };
+        let cases = [
+            (DistortionModel::Poly3, [0.0_f32, 0.06, 0.0, 0.0]),
+            (DistortionModel::Poly5, [0.0, 0.04, 0.0, 0.015]),
+            (DistortionModel::Ptlens, [0.01, -0.02, 0.008, 0.0]),
+        ];
+        for (model, radial) in cases {
+            let lens = LensProfile {
+                center: [0.55, 0.48], // off-center
+                crop: 1.5,
+                real_focal: 20.0,
+                model,
+                distortion: radial,
+                ..LensProfile::default()
+            };
+            let (center, inv_norm, m, r) = lens_radial(extent, &lens);
+            let w = Warp {
+                output: extent,
+                m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                center,
+                inv_norm,
+                model: m,
+                radial: r,
+                channel_scale: [CA_IDENTITY; 3],
+            };
+            // Sample a grid of straight output points spanning to the corners. For
+            // each, `map` lands on the distorted source; forward-applying the
+            // lensfun model to that source radius must return to the straight
+            // output point (sub-pixel). PTLENS closes this exactly via the direct
+            // multiply, POLY3/POLY5 via the Newton inverse.
+            for &gx in &[10.0_f32, 60.0, 110.0, 155.0] {
+                for &gy in &[5.0_f32, 40.0, 75.0, 95.0] {
+                    let (sx, sy) = w.map(gx, gy);
+                    let (sdx, sdy) = (sx - center[0], sy - center[1]);
+                    let src_r = (sdx * sdx + sdy * sdy).sqrt() * inv_norm;
+                    if src_r == 0.0 {
+                        continue;
+                    }
+                    // Forward-distort the source point back toward the output.
+                    let fwd = forward_ratio(model, radial, src_r);
+                    let (ex, ey) = (center[0] + sdx * fwd, center[1] + sdy * fwd);
+                    let err = ((gx - ex).powi(2) + (gy - ey).powi(2)).sqrt();
+                    assert!(err < 0.25, "{model:?} at ({gx},{gy}): off by {err} px");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tca_target_recombines_to_lensfun() {
+        // A point split into R/G/B by a POLY3 TCA forward fringe is recombined onto
+        // one output pixel by the per-channel radial correction. The red channel's
+        // corrected sample radius must equal r·s_red(r) at on-axis and corner
+        // radii — proving the radial term, not just the on-axis v.
+        let (cx, cy) = (80.0_f32, 60.0_f32);
+        let inv_norm = 1.0 / 100.0;
+        let red = [0.02_f32, 0.015, 1.0]; // [b, c, v]
+        let blue = [-0.018_f32, -0.012, 1.0];
+        let w = Warp {
+            output: Extent {
+                width: 160,
+                height: 120,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [cx, cy],
+            inv_norm,
+            model: DistortionModel::None,
+            radial: [0.0, 0.0, 0.0, 0.0],
+            channel_scale: [red, CA_IDENTITY, blue],
+        };
+        for &(px, py) in &[(cx + 5.0, cy + 2.0), (cx + 70.0, cy + 45.0)] {
+            let r = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() * inv_norm;
+            for (chan, poly) in [(0, red), (2, blue)] {
+                let (rx, ry) = w.map_channel(px, py, chan);
+                let s = poly[2] + r * (poly[1] + r * poly[0]);
+                let sample_r = (((rx - cx).powi(2) + (ry - cy).powi(2)).sqrt() * inv_norm) / r;
+                assert!(
+                    (sample_r - s).abs() < 1e-4,
+                    "chan {chan}: {sample_r} vs {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vignetting_flat_field_recovers_uniform() {
+        // A PA-darkened flat returns to uniform across center, edges, and corners
+        // — including an off-center optical axis on a non-square frame.
+        let extent = Extent {
+            width: 23,
+            height: 15,
+        };
+        let mut src = ImageBuf::new(extent.width, extent.height);
+        for p in src.pixels_mut() {
+            *p = [0.4, 0.4, 0.4];
+        }
+        let terms = [-0.4_f32, 0.1, -0.03];
+        // Off-center, non-square: the falloff is baked about the optical axis, and
+        // the correction must divide it out about the same off-center axis.
+        let profile = LensProfile {
+            center: [0.52, 0.47],
+            vignetting: terms,
+            ..LensProfile::default()
+        };
+        let (center, inv_norm) = lens_vignetting_radial(extent, &profile);
+        TestBackend.apply_radial_gain(
+            &mut src,
+            &RadialGain {
+                center,
+                inv_norm,
+                poly: terms,
+                reciprocal: false,
+            },
+        );
+        let settings = Settings {
+            geometry: Geometry {
+                lens: Some(profile),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        for &(x, y) in &[
+            (0, 0),
+            (22, 0),
+            (0, 14),
+            (22, 14),
+            (11, 7),
+            (22, 7),
+            (11, 0),
+        ] {
+            assert!(
+                (out.get(x, y)[0] - 0.4).abs() < 1e-5,
+                "({x},{y}) = {:?}",
+                out.get(x, y)
+            );
+        }
     }
 }

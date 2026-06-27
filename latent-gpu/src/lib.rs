@@ -819,10 +819,13 @@ mod tests {
                     horizontal: -0.08,
                 }),
                 lens: Some(LensProfile {
-                    center: [0.5, 0.5],
+                    crop: 1.5,
+                    real_focal: 24.0,
+                    model: latent_edit::DistortionModel::Poly5,
                     distortion: [0.0, -0.05, 0.0, 0.0],
-                    ca: [0.004, -0.003],
+                    ca: [[0.0, 0.0, 1.004], [0.0, 0.0, 0.997]],
                     vignetting: [-0.1, 0.0, 0.0],
+                    ..LensProfile::default()
                 }),
                 vignette: Some(-0.25),
             },

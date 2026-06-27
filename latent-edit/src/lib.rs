@@ -561,33 +561,76 @@ pub struct Perspective {
     pub horizontal: f32,
 }
 
+/// The forward distortion model a [`LensProfile`]'s coefficients describe.
+///
+/// The model determines how the engine *inverts* the forward map `r_d(r_u)` to
+/// undistort. The two even-order polynomial models (POLY3, POLY5; Brown 1966)
+/// have no closed-form inverse and are solved by Newton iteration; the
+/// PanoTools/Hugin "abc" model (PTLENS) keeps the direct radial multiply where
+/// it is the defined operation. `None` (an all-zero profile) skips distortion
+/// entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DistortionModel {
+    /// No distortion model (the coefficients are all zero — a no-op).
+    #[default]
+    None,
+    /// 3rd-order polynomial, `r_d = r_u·(1 + k1·r_u²)` once focal-normalized.
+    /// Inverted by Newton iteration.
+    Poly3,
+    /// 5th-order polynomial, `r_d = r_u·(1 + k1·r_u² + k2·r_u⁴)`. Inverted by
+    /// Newton iteration.
+    Poly5,
+    /// PanoTools/Hugin model, `r_d = r_u·(1 + c·r_u + b·r_u² + a·r_u³)` once
+    /// focal-normalized. Applied directly as a radial multiply.
+    Ptlens,
+}
+
 /// Lens correction profile: the optical parameters that undo a lens's geometric
 /// distortion. Coefficients are pure data — a synthetic model in tests, or a
 /// lens database (lensfun) at runtime.
 ///
-/// Two conventions are pinned here so a database lookup can map its coefficients
-/// in without silent mis-scaling: the radius for the distortion model is
-/// normalized by **half the shorter image side** (so `r = 1` at the midpoint of
-/// the short edges, matching lensfun), and the optical `center` is normalized to
-/// the frame, where `(0.5, 0.5)` is the image center.
+/// The conventions are pinned here so a database lookup can map its coefficients
+/// in without silent mis-scaling. The radius for the distortion and TCA models is
+/// normalized by the **focal-scaled half-diagonal** (lensfun's natural unit: `r`
+/// is the on-sensor distance in units of one real focal length), built from
+/// `crop` and `real_focal`; the `distortion`/`ca` coefficients are stored in that
+/// same focal frame. The optical `center` is normalized to the frame, where
+/// `(0.5, 0.5)` is the image center and an offset is measured against the
+/// **shorter** image side (`min(w, h)/2`, the same divisor on both axes).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LensProfile {
-    /// Optical center, normalized to the frame (`(0.5, 0.5)` = image center).
+    /// Optical center, normalized to the frame (`(0.5, 0.5)` = image center). An
+    /// offset from center is in units of half the shorter image side.
     pub center: [f32; 2],
-    /// Radial distortion as a polynomial in the normalized radius `r`: the
-    /// corrected radius maps to `r·(1 + d0·r + d1·r² + d2·r³ + d3·r⁴)`. This
-    /// general form covers every lensfun model — the even-only Brown–Conrady
-    /// family (POLY3, POLY5; Brown 1966) and the PanoTools/Hugin "abc" model
-    /// (PTLENS), which also needs odd powers. All zero is no distortion.
+    /// Camera crop factor (sensor diagonal relative to 35 mm full frame). Used,
+    /// with `real_focal`, to normalize the radius into lensfun's focal frame.
+    pub crop: f32,
+    /// Real focal length (mm) the calibration was measured at — lensfun's
+    /// `RealFocal`, which can differ from the nominal focal on some lenses.
+    pub real_focal: f32,
+    /// Which forward distortion model `distortion` describes (selects the
+    /// inversion path: Newton for POLY3/POLY5, direct multiply for PTLENS).
+    pub model: DistortionModel,
+    /// Radial distortion coefficients of the *forward* map, in the focal frame,
+    /// laid out by `model`:
+    /// - POLY3: `k1` in slot 1 (`r²`), `r_d = r_u·(1 + k1·r_u²)`.
+    /// - POLY5: `k1` in slot 1 (`r²`), `k2` in slot 3 (`r⁴`).
+    /// - PTLENS: `[c, b, a, 0]` so the direct multiply is
+    ///   `r_d = r_u·(1 + c·r + b·r² + a·r³)`.
+    ///
+    /// All zero (with `model` = `None`) is no distortion.
     pub distortion: [f32; 4],
-    /// Lateral (transverse) chromatic aberration: radial scale offsets for red
-    /// and blue relative to green (the reference). Red samples at radius
-    /// `×(1 + ca[0])`, blue at `×(1 + ca[1])`; `[0, 0]` is no CA.
-    pub ca: [f32; 2],
+    /// Lateral (transverse) chromatic aberration as lensfun's POLY3 per-channel
+    /// radial scale, for red and blue relative to green (the reference). Channel
+    /// `c` samples at radius `r·(b·r² + c·r + v)` where `ca[0] = [b_R, c_R, v_R]`
+    /// and `ca[1] = [b_B, c_B, v_B]`. Identity (`[0, 0, 1]`) is no CA; a LINEAR
+    /// model is the degenerate `[0, 0, k]`.
+    pub ca: [[f32; 3]; 2],
     /// Vignetting falloff (lensfun's PA model): the captured brightness is
-    /// `ideal · (1 + v0·r² + v1·r⁴ + v2·r⁶)` at normalized radius `r` (the `v`s
-    /// are negative for darker corners), so correction divides it back out. All
-    /// zero is no vignetting.
+    /// `ideal · (1 + v0·r² + v1·r⁴ + v2·r⁶)` at the corner-normalized radius `r`
+    /// (the `v`s are negative for darker corners), so correction divides it back
+    /// out. All zero is no vignetting.
     pub vignetting: [f32; 3],
 }
 
@@ -596,8 +639,11 @@ impl Default for LensProfile {
     fn default() -> Self {
         Self {
             center: [0.5, 0.5],
+            crop: 1.0,
+            real_focal: 1.0,
+            model: DistortionModel::None,
             distortion: [0.0, 0.0, 0.0, 0.0],
-            ca: [0.0, 0.0],
+            ca: [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
             vignetting: [0.0, 0.0, 0.0],
         }
     }
@@ -796,11 +842,19 @@ impl Geometry {
             // A non-finite optical center falls back to the frame center.
             lens.center[0] = finite_or(lens.center[0], 0.5);
             lens.center[1] = finite_or(lens.center[1], 0.5);
+            // The crop/focal divisors must be finite and non-zero or the radius
+            // normalization blows up; fall back to the no-op unit scale.
+            lens.crop = finite_clamped(lens.crop, 1.0, f32::MIN_POSITIVE, f32::MAX);
+            lens.real_focal = finite_clamped(lens.real_focal, 1.0, f32::MIN_POSITIVE, f32::MAX);
             for d in &mut lens.distortion {
                 *d = finite_or(*d, 0.0);
             }
-            for c in &mut lens.ca {
-                *c = finite_or(*c, 0.0);
+            for channel in &mut lens.ca {
+                // The radial CA terms default to the green-equivalent identity
+                // [b, c, v] = [0, 0, 1] (unit scale, no offset).
+                channel[0] = finite_or(channel[0], 0.0);
+                channel[1] = finite_or(channel[1], 0.0);
+                channel[2] = finite_or(channel[2], 1.0);
             }
             for v in &mut lens.vignetting {
                 *v = finite_or(*v, 0.0);
@@ -908,10 +962,9 @@ mod tests {
             straighten_degrees: 0.0,
             perspective: None,
             lens: Some(LensProfile {
-                center: [0.5, 0.5],
+                model: DistortionModel::Poly3,
                 distortion: [0.0, -0.1, 0.0, 0.0],
-                ca: [0.0, 0.0],
-                vignetting: [0.0, 0.0, 0.0],
+                ..LensProfile::default()
             }),
             vignette: None,
         };
@@ -1225,8 +1278,11 @@ mod tests {
                 }),
                 lens: Some(LensProfile {
                     center: [0.49, 0.51],
+                    crop: 1.6,
+                    real_focal: 24.0,
+                    model: DistortionModel::Poly5,
                     distortion: [0.0, -0.08, 0.0, 0.02],
-                    ca: [0.001, -0.002],
+                    ca: [[0.0, 0.0, 1.001], [0.0, 0.0, 0.998]],
                     vignetting: [-0.2, 0.05, 0.0],
                 }),
                 vignette: Some(0.3),
@@ -1253,6 +1309,30 @@ mod tests {
         assert_eq!(s.global.sharpen, None); // omitted → default
         assert!(s.locals.is_empty()); // omitted → default
         assert!(s.geometry.is_identity()); // omitted → default
+    }
+
+    #[test]
+    fn old_lens_sidecar_loads_with_default_focal_geometry() {
+        // A sidecar written before the focal-frame fields existed carries only
+        // `center`/`distortion`/`vignetting`. It must still load, the new
+        // `crop`/`real_focal`/`model`/`ca` falling back to the no-op defaults
+        // (`#[serde(default)]`) so the radius normalization stays well-defined.
+        let text = "(version: 1, variants: [(geometry: (lens: Some((\
+            center: (0.5, 0.5), distortion: (0.0, -0.1, 0.0, 0.0), \
+            vignetting: (-0.2, 0.05, 0.0)))))])";
+        let doc = Document::from_ron(text).expect("old lens sidecar should load");
+        let lens = doc.variants[0]
+            .geometry
+            .lens
+            .expect("lens should be present");
+        assert_eq!(lens.center, [0.5, 0.5]);
+        assert_eq!(lens.distortion, [0.0, -0.1, 0.0, 0.0]);
+        assert_eq!(lens.vignetting, [-0.2, 0.05, 0.0]);
+        // The omitted focal-frame fields take their neutral defaults.
+        assert_eq!(lens.crop, 1.0);
+        assert_eq!(lens.real_focal, 1.0);
+        assert_eq!(lens.model, DistortionModel::None);
+        assert_eq!(lens.ca, [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]);
     }
 
     #[test]
