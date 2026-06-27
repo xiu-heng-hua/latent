@@ -3,6 +3,92 @@
 pub mod color;
 pub mod tone;
 
+/// One of the eight dihedral display orientations — the rotation/flip that turns
+/// sensor-order pixels into an upright image.
+///
+/// The variants and the [`Orientation::from_libraw`] decode follow LibRaw's
+/// `sizes.flip` convention (the dcraw-derived code), **not** the EXIF 1..8
+/// numbering. In real files `0/3/5/6` cover the overwhelming majority (upright
+/// and the two 90° rotations plus 180°); `1/2/4/7` are the rarer mirrored
+/// variants. An unknown/negative code decodes to [`Orientation::Identity`], so a
+/// garbage value never rotates and never panics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orientation {
+    /// Already upright (landscape). `flip == 0`.
+    Identity,
+    /// Rotate 180°. `flip == 3`.
+    Rotate180,
+    /// Rotate 90° counter-clockwise. `flip == 5`. Swaps width and height.
+    Rotate90Ccw,
+    /// Rotate 90° clockwise. `flip == 6`. Swaps width and height.
+    Rotate90Cw,
+    /// Mirror left↔right. `flip == 1`.
+    MirrorH,
+    /// Mirror top↔bottom. `flip == 2`.
+    MirrorV,
+    /// Transpose (mirror across the main diagonal). `flip == 4`. Swaps width and
+    /// height.
+    Transpose,
+    /// Transverse (mirror across the anti-diagonal). `flip == 7`. Swaps width and
+    /// height.
+    Transverse,
+}
+
+impl Orientation {
+    /// Decode a LibRaw `sizes.flip` code into an [`Orientation`]. The mapping is
+    /// pinned here as the single home of the 8-case table; any code outside
+    /// `0..=7` (including LibRaw's `-1` "unknown") decodes to
+    /// [`Orientation::Identity`].
+    #[must_use]
+    pub fn from_libraw(flip: i32) -> Self {
+        match flip {
+            3 => Orientation::Rotate180,
+            5 => Orientation::Rotate90Ccw,
+            6 => Orientation::Rotate90Cw,
+            1 => Orientation::MirrorH,
+            2 => Orientation::MirrorV,
+            4 => Orientation::Transpose,
+            7 => Orientation::Transverse,
+            // `0` and anything out of range (e.g. LibRaw's `-1`) are no-ops.
+            _ => Orientation::Identity,
+        }
+    }
+
+    /// Whether this orientation exchanges the width and height axes (the 90°
+    /// rotations and the two diagonal mirrors).
+    #[must_use]
+    pub fn swaps_dimensions(self) -> bool {
+        matches!(
+            self,
+            Orientation::Rotate90Ccw
+                | Orientation::Rotate90Cw
+                | Orientation::Transpose
+                | Orientation::Transverse
+        )
+    }
+
+    /// Map a destination pixel `(dx, dy)` in the oriented image (of size
+    /// `dst_w × dst_h`) back to its source pixel `(sx, sy)` in an image of the
+    /// pre-orientation size. The destination dimensions are the source ones with
+    /// width/height swapped when [`Self::swaps_dimensions`] is true.
+    fn source_of(self, dx: u32, dy: u32, dst_w: u32, dst_h: u32) -> (u32, u32) {
+        // `dst_w - 1` / `dst_h - 1` are safe: callers only invoke this for
+        // in-bounds destination pixels of a non-empty image.
+        let (xmax, ymax) = (dst_w - 1, dst_h - 1);
+        match self {
+            Orientation::Identity => (dx, dy),
+            Orientation::Rotate180 => (xmax - dx, ymax - dy),
+            // Source is dst_h × dst_w (dimensions swapped).
+            Orientation::Rotate90Ccw => (ymax - dy, dx),
+            Orientation::Rotate90Cw => (dy, xmax - dx),
+            Orientation::MirrorH => (xmax - dx, dy),
+            Orientation::MirrorV => (dx, ymax - dy),
+            Orientation::Transpose => (dy, dx),
+            Orientation::Transverse => (ymax - dy, xmax - dx),
+        }
+    }
+}
+
 /// The image as it flows through the pipeline: always linear-light, f32 RGB.
 ///
 /// Pixels are stored row-major: pixel `(x, y)` is at index `y * width + x`.
@@ -152,6 +238,33 @@ impl ImageBuf {
         for ry in 0..h {
             for rx in 0..w {
                 out.set(rx, ry, self.get(x + rx, y + ry));
+            }
+        }
+        out
+    }
+
+    /// A copy with the dihedral `orientation` applied — the rotation/flip that
+    /// turns sensor-order pixels into an upright display image.
+    ///
+    /// This is pure pixel geometry: it permutes pixels into a fresh buffer (one
+    /// allocation, swapping width and height for the 90°/transpose cases) and
+    /// never changes a pixel's value. [`Orientation::Identity`] short-circuits to
+    /// a `clone`, mirroring [`Self::downscaled`]'s no-op early return; an empty
+    /// image is returned unchanged.
+    pub fn oriented(&self, orientation: Orientation) -> ImageBuf {
+        if orientation == Orientation::Identity || self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
+        let (dst_w, dst_h) = if orientation.swaps_dimensions() {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        let mut out = ImageBuf::new(dst_w, dst_h);
+        for dy in 0..dst_h {
+            for dx in 0..dst_w {
+                let (sx, sy) = orientation.source_of(dx, dy, dst_w, dst_h);
+                out.set(dx, dy, self.get(sx, sy));
             }
         }
         out
@@ -363,6 +476,117 @@ mod tests {
         assert_eq!(img.try_get(0, 2), None);
         assert_eq!(img.try_set(2, 0, [1.0; 3]), None);
         assert_eq!(img.try_set(0, 2, [1.0; 3]), None);
+    }
+
+    /// Build a 3×2 image whose every pixel carries a unique marker value
+    /// (`x + y*3` in the red channel) so a rotation/flip can be checked
+    /// pixel-by-pixel. Layout (red channel):
+    /// ```text
+    /// 0 1 2
+    /// 3 4 5
+    /// ```
+    fn marker_3x2() -> ImageBuf {
+        let mut img = ImageBuf::new(3, 2);
+        for y in 0..2 {
+            for x in 0..3 {
+                img.set(x, y, [(x + y * 3) as f32, 0.0, 0.0]);
+            }
+        }
+        img
+    }
+
+    fn red(img: &ImageBuf, x: u32, y: u32) -> u32 {
+        img.get(x, y)[0] as u32
+    }
+
+    #[test]
+    fn oriented_identity_and_unknown_are_no_ops() {
+        let img = marker_3x2();
+        // Identity and any out-of-range/negative LibRaw code decode to a no-op.
+        for flip in [0, -1, 8, 99, i32::MIN] {
+            let o = Orientation::from_libraw(flip);
+            assert_eq!(o, Orientation::Identity, "flip {flip} should be identity");
+            let out = img.oriented(o);
+            assert_eq!((out.width(), out.height()), (3, 2));
+            assert_eq!(out, img, "flip {flip} must leave the image unchanged");
+        }
+        // An empty image survives orientation without panicking.
+        let empty = ImageBuf::new(0, 0);
+        assert_eq!(empty.oriented(Orientation::Rotate90Cw), empty);
+    }
+
+    #[test]
+    fn oriented_rotates_each_flip_code() {
+        let img = marker_3x2();
+
+        // 0: identity — dimensions and the corner marker are unchanged.
+        let id = img.oriented(Orientation::from_libraw(0));
+        assert_eq!((id.width(), id.height()), (3, 2));
+        assert_eq!(red(&id, 0, 0), 0);
+
+        // 3: rotate 180° — dimensions unchanged, top-left marker lands
+        // bottom-right.
+        let r180 = img.oriented(Orientation::from_libraw(3));
+        assert_eq!((r180.width(), r180.height()), (3, 2));
+        assert_eq!(
+            red(&r180, 2, 1),
+            0,
+            "marker 0 should land at the far corner"
+        );
+        assert_eq!(red(&r180, 0, 0), 5);
+
+        // 5: rotate 90° CCW — dimensions swap (3×2 → 2×3). The source top-left
+        // (marker 0) lands at the destination bottom-left.
+        let ccw = img.oriented(Orientation::from_libraw(5));
+        assert_eq!((ccw.width(), ccw.height()), (2, 3), "5 swaps W and H");
+        assert_eq!(red(&ccw, 0, 2), 0, "CCW sends top-left to bottom-left");
+
+        // 6: rotate 90° CW — dimensions swap. The source top-left (marker 0)
+        // lands at the destination top-right.
+        let cw = img.oriented(Orientation::from_libraw(6));
+        assert_eq!((cw.width(), cw.height()), (2, 3), "6 swaps W and H");
+        assert_eq!(red(&cw, 1, 0), 0, "CW sends top-left to top-right");
+
+        // 5 and 6 must be opposite directions: the marker that CW puts top-right
+        // is the one CCW puts bottom-left — they can't both be the same rotation.
+        assert_ne!(
+            (red(&cw, 0, 0), red(&cw, 1, 0)),
+            (red(&ccw, 0, 0), red(&ccw, 1, 0)),
+            "5 and 6 must rotate in opposite directions"
+        );
+    }
+
+    #[test]
+    fn oriented_mirror_variants_map_correctly() {
+        let img = marker_3x2();
+
+        // 1: mirror horizontal — rows reverse, dimensions unchanged.
+        let mh = img.oriented(Orientation::from_libraw(1));
+        assert_eq!((mh.width(), mh.height()), (3, 2));
+        assert_eq!(red(&mh, 2, 0), 0);
+        assert_eq!(red(&mh, 0, 0), 2);
+
+        // 2: mirror vertical — columns reverse, dimensions unchanged.
+        let mv = img.oriented(Orientation::from_libraw(2));
+        assert_eq!((mv.width(), mv.height()), (3, 2));
+        assert_eq!(red(&mv, 0, 1), 0);
+        assert_eq!(red(&mv, 0, 0), 3);
+
+        // 4: transpose — dimensions swap, marker 0 stays at the origin (main
+        // diagonal is fixed).
+        let t = img.oriented(Orientation::from_libraw(4));
+        assert_eq!((t.width(), t.height()), (2, 3), "transpose swaps W and H");
+        assert_eq!(red(&t, 0, 0), 0);
+        assert_eq!(red(&t, 0, 1), 1, "source (1,0) lands at (0,1)");
+
+        // 7: transverse — dimensions swap, marker 0 lands at the far corner.
+        let tv = img.oriented(Orientation::from_libraw(7));
+        assert_eq!(
+            (tv.width(), tv.height()),
+            (2, 3),
+            "transverse swaps W and H"
+        );
+        assert_eq!(red(&tv, 1, 2), 0);
     }
 
     #[test]

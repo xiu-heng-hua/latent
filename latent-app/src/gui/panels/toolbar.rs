@@ -1,12 +1,11 @@
 //! The slim icon toolbar beneath the menu bar: undo/redo (sharing the single
-//! history path with the menu and keyboard) and the variant selector / new-
-//! variant button. Tool and zoom affordances are placeholders to be wired up
-//! later.
+//! history path with the menu and keyboard), the variant selector / new-variant
+//! button, the before/after toggle, and the zoom controls (fit / 100% / −/+).
 
 use eframe::egui;
 use latent_edit::History;
 
-use crate::gui::app::App;
+use crate::gui::app::{App, BeforeAfter};
 use crate::gui::icons;
 
 /// Show the toolbar. `do_undo` / `do_redo` are OR-ed with the toolbar's
@@ -46,12 +45,41 @@ pub(crate) fn show(
                 *dirty = true;
             }
 
-            // Planned: zoom controls and tool selection (crop / brush / mask).
-            // Placeholders kept disabled so the toolbar reads as the future home
-            // for those affordances without faking behavior.
             ui.separator();
-            icons::icon_button(ui, false, "zoom_fit", "Zoom to fit");
-            icons::icon_button(ui, false, "zoom_100", "Zoom to 100%");
+
+            // Before/after: cycle Off → Toggle → Split (also bound to `).
+            let before_label = match app.before {
+                BeforeAfter::Off => "After",
+                BeforeAfter::Toggle => "Before",
+                BeforeAfter::Split => "Split",
+            };
+            if ui
+                .selectable_label(app.before != BeforeAfter::Off, before_label)
+                .on_hover_text("Before / after (`)")
+                .clicked()
+            {
+                app.before = match app.before {
+                    BeforeAfter::Off => BeforeAfter::Toggle,
+                    BeforeAfter::Toggle => BeforeAfter::Split,
+                    BeforeAfter::Split => BeforeAfter::Off,
+                };
+            }
+
+            // Zoom controls. Fit / 100% snap the intent; −/+ step the ladder.
+            ui.separator();
+            if icons::icon_button(ui, true, "zoom_fit", "Zoom to fit (0)").clicked() {
+                app.zoom_fit();
+            }
+            if icons::icon_button(ui, true, "zoom_100", "Zoom to 100% (1)").clicked() {
+                app.zoom_actual();
+            }
+            if icons::icon_button(ui, true, "zoom_out", "Zoom out (−)").clicked() {
+                app.zoom_step(-1);
+            }
+            if icons::icon_button(ui, true, "zoom_in", "Zoom in (+)").clicked() {
+                app.zoom_step(1);
+            }
+            ui.label(format!("{}%", app.zoom_percent()));
         });
     });
 }

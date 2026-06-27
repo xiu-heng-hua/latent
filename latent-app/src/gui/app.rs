@@ -12,11 +12,25 @@ use eframe::egui;
 use latent_edit::{Document, History, Settings};
 use latent_image::ImageBuf;
 use latent_pipeline::Backend;
+use latent_pipeline::render;
 
 use super::canvas;
+use super::canvas::{PixelReadout, ViewTransform, Zoom};
 use super::panels;
 use super::state::{RenderJob, RenderOutput, RenderState, auto_lens_profile};
 use super::theme;
+
+/// Which before/after view the canvas is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BeforeAfter {
+    /// The live edit (the normal view).
+    #[default]
+    Off,
+    /// The cached unedited "before" in place of the live edit.
+    Toggle,
+    /// Before on the left, after on the right, split down the middle.
+    Split,
+}
 
 /// Longest side of the interactive preview, in pixels. Keeps re-render cheap
 /// during editing; export uses the full-resolution image.
@@ -109,6 +123,13 @@ pub fn run(
                 output,
                 status: String::new(),
                 texture: None,
+                before_texture: None,
+                preview_rendered: None,
+                zoom: Zoom::default(),
+                pan: egui::Vec2::ZERO,
+                last_transform: None,
+                before: BeforeAfter::default(),
+                pixel_readout: None,
                 render: RenderState::default(),
                 local_sel: 0,
                 brush_radius: 0.08,
@@ -160,6 +181,30 @@ pub struct App {
     pub(crate) output: String,
     pub(crate) status: String,
     pub(crate) texture: Option<egui::TextureHandle>,
+    /// The cached "before" texture: the develop base rendered once with
+    /// `Settings::default()`, drawn (in place of or beside the live edit) for the
+    /// before/after view. Built lazily on the first preview render and never
+    /// re-rendered on toggle — before/after is a draw choice, not a render.
+    pub(crate) before_texture: Option<egui::TextureHandle>,
+    /// The last rendered preview image, stashed so the hover readout (and later
+    /// the clipping read-back and the WB eyedropper) can sample the pixel under
+    /// the cursor without re-rendering.
+    pub(crate) preview_rendered: Option<ImageBuf>,
+    /// The current zoom intent (Fit, or a fixed percent). The transform is rebuilt
+    /// from this each frame.
+    pub(crate) zoom: Zoom,
+    /// The current pan offset (screen-space), applied on top of centering when
+    /// zoomed past fit. Zero when fitted.
+    pub(crate) pan: egui::Vec2,
+    /// The screen↔image transform built on the last frame, kept so the status bar
+    /// can report the live zoom %. The canvas is the sole owner; this is a
+    /// read-only snapshot.
+    pub(crate) last_transform: Option<ViewTransform>,
+    /// Which before/after view to draw.
+    pub(crate) before: BeforeAfter,
+    /// The pixel under the cursor this frame (sRGB display value), or `None` when
+    /// the cursor is off the image. Surfaced in the status bar.
+    pub(crate) pixel_readout: Option<PixelReadout>,
     /// The off-thread render in flight (if any) plus a coalescing flag.
     pub(crate) render: RenderState,
     /// Index of the local adjustment selected for editing in the panel.
@@ -283,7 +328,13 @@ impl App {
             Ok(out) => {
                 self.render.in_flight = None;
                 match out {
-                    RenderOutput::Preview(img) => self.load_texture(ctx, &img),
+                    RenderOutput::Preview(img) => {
+                        self.load_texture(ctx, &img);
+                        // Build the "before" texture once, on the first preview,
+                        // and stash the rendered preview for the hover readout.
+                        self.ensure_before_texture(ctx);
+                        self.preview_rendered = Some(img);
+                    }
                     RenderOutput::Export(status) => self.status = status,
                 }
                 // A request that arrived mid-render coalesced to one; run it now.
@@ -311,6 +362,99 @@ impl App {
             }
         }
     }
+
+    /// The fit scale for the last drawn frame — the anchor the zoom ladder steps
+    /// relative to. Falls back to `1.0` before the first frame draws.
+    fn last_fit_scale(&self) -> f32 {
+        self.last_transform.map(|t| t.fit_scale()).unwrap_or(1.0)
+    }
+
+    /// Step the zoom one notch in (`+1`) or out (`−1`) along the ladder.
+    pub(crate) fn zoom_step(&mut self, dir: i32) {
+        self.zoom = canvas::step_zoom(self.zoom, dir, self.last_fit_scale());
+    }
+
+    /// Snap the zoom to fit (and reset the pan, which is inert when fitted).
+    pub(crate) fn zoom_fit(&mut self) {
+        self.zoom = Zoom::Fit;
+        self.pan = egui::Vec2::ZERO;
+    }
+
+    /// Snap the zoom to 100% (one preview-pixel per screen-pixel).
+    pub(crate) fn zoom_actual(&mut self) {
+        self.zoom = Zoom::Percent(1.0);
+    }
+
+    /// The current zoom percentage to show in the status bar, derived from the
+    /// last drawn transform so `Fit` reports its true live scale.
+    pub(crate) fn zoom_percent(&self) -> u32 {
+        let scale = self
+            .last_transform
+            .map(|t| t.displayed_scale())
+            .unwrap_or(1.0);
+        (scale * 100.0).round().max(1.0) as u32
+    }
+
+    /// Apply the view keyboard shortcuts: `+`/`=` zoom in, `−` zoom out, `0` fit,
+    /// `1` 100%, `` ` `` cycle the before/after view. Skipped while a panel widget
+    /// (text field, slider entry) wants keyboard input, so typing isn't hijacked.
+    fn handle_view_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let mut zoom_in = false;
+        let mut zoom_out = false;
+        let mut fit = false;
+        let mut actual = false;
+        let mut cycle_before = false;
+        ctx.input(|i| {
+            // Don't collide with Cmd/Ctrl shortcuts (undo/redo etc.).
+            if i.modifiers.command {
+                return;
+            }
+            zoom_in = i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals);
+            zoom_out = i.key_pressed(egui::Key::Minus);
+            fit = i.key_pressed(egui::Key::Num0);
+            actual = i.key_pressed(egui::Key::Num1);
+            cycle_before = i.key_pressed(egui::Key::Backtick);
+        });
+        if zoom_in {
+            self.zoom_step(1);
+        }
+        if zoom_out {
+            self.zoom_step(-1);
+        }
+        if fit {
+            self.zoom_fit();
+        }
+        if actual {
+            self.zoom_actual();
+        }
+        if cycle_before {
+            self.before = match self.before {
+                BeforeAfter::Off => BeforeAfter::Toggle,
+                BeforeAfter::Toggle => BeforeAfter::Split,
+                BeforeAfter::Split => BeforeAfter::Off,
+            };
+            ctx.request_repaint();
+        }
+    }
+
+    /// Build the cached "before" texture once: the develop base rendered with
+    /// `Settings::default()` (the unedited develop), uploaded as a second texture
+    /// the before/after view draws. Cheap — it runs over the downscaled preview
+    /// base, only on the very first preview — and never re-renders on toggle. A
+    /// future "open a new file" path would clear this so the before tracks the new
+    /// base.
+    fn ensure_before_texture(&mut self, ctx: &egui::Context) {
+        if self.before_texture.is_some() {
+            return;
+        }
+        let base = render(&self.preview, &Settings::default(), self.backend.as_ref());
+        let color = canvas::to_color_image(&base);
+        self.before_texture =
+            Some(ctx.load_texture("before", color, egui::TextureOptions::default()));
+    }
 }
 
 impl eframe::App for App {
@@ -337,6 +481,10 @@ impl eframe::App for App {
                 do_redo = true;
             }
         });
+
+        // View shortcuts (zoom +/−/0/1, before/after `). Gated so a panel that
+        // wants the keyboard (a text field, a numeric slider entry) keeps it.
+        self.handle_view_shortcuts(ctx);
 
         // Chrome, in panel order: menu bar, toolbar, status bar, controls — then
         // the central canvas last so it takes the remaining space.

@@ -213,6 +213,15 @@ pub struct Metadata {
     pub focal_len: f32,
     /// Aperture (f-number) at capture, or `0` if unknown.
     pub aperture: f32,
+    /// Display orientation code, as LibRaw reports it in `sizes.flip`. This is
+    /// the dcraw-derived convention, **not** the EXIF 1..8 numbering: `0` is
+    /// already-upright, `3` is 180°, `5`/`6` are the two 90° rotations, and
+    /// `1/2/4/7` are the mirrored variants. It says how to rotate/flip the
+    /// developed pixels so the image displays upright; the geometry transform
+    /// itself lives in `latent_image::Orientation`. A negative/unknown code is
+    /// treated as identity by that decode. Sensor processing ignores this —
+    /// orientation is display geometry, applied only at the end of develop.
+    pub orientation: i32,
 }
 
 /// A decoded RAW file that owns its sensor data.
@@ -856,6 +865,10 @@ unsafe fn read_metadata(raw: *mut ffi::libraw_data_t) -> Metadata {
         lens: c_str_field(&lens.Lens),
         focal_len: other.focal_len,
         aperture: other.aperture,
+        // Display orientation in LibRaw's `flip` convention. Read here, applied
+        // (rotated/flipped) only at the end of develop — it never touches sensor
+        // processing.
+        orientation: sizes.flip,
     }
 }
 
@@ -899,6 +912,7 @@ mod tests {
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
+                orientation: 0,
             },
         }
     }
@@ -1148,6 +1162,7 @@ mod tests {
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
+                orientation: 0,
             },
         };
         // A neutral gray reads unequal per channel (∝ 1/gain): R, G, G, B.
@@ -1233,6 +1248,7 @@ mod tests {
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
+                orientation: 0,
             },
         };
         // A neutral highlight that blew the sensor demosaics to a colored cast.
@@ -1283,6 +1299,7 @@ mod tests {
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
+                orientation: 0,
             },
         }
     }

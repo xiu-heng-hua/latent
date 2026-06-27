@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gui::BackendKind;
 use latent_cpu::CpuBackend;
 use latent_image::ImageBuf;
-use latent_image::color;
+use latent_image::{Orientation, color};
 use latent_pipeline::Backend;
 
 /// A small, readable RAW developer.
@@ -79,10 +79,19 @@ fn select_backend(use_gpu: bool) -> (Box<dyn Backend>, BackendKind) {
     (Box::new(CpuBackend), BackendKind::Cpu)
 }
 
-/// Decode and develop a RAW into a linear working image in SOURCE coordinates:
-/// normalize, white balance, demosaic, reconstruct blown highlights, then the
-/// camera→working color transform. This is the base the pipeline renders
-/// adjustments and geometry over.
+/// Decode and develop a RAW into a linear working image: normalize, white
+/// balance, demosaic, reconstruct blown highlights, the camera→working color
+/// transform, and finally the display orientation. This is the base the pipeline
+/// renders adjustments and geometry over.
+///
+/// Orientation is applied **last**, after the color matrix: it is display
+/// geometry, not sensor processing (rotating before demosaic would break the CFA
+/// phase, and before the color matrix would scramble per-sensor-channel math), so
+/// every coordinate downstream — the texture, the fit, brush/mask normalized
+/// coords, crop — is already in upright display space. It permutes pixels only,
+/// never changing a value. A later manual rotate/flip composes *on top of* this
+/// already-upright base in the pipeline's geometry stage; it must not re-read the
+/// raw `flip` here.
 pub fn develop_to_image(input: &Path) -> Result<(ImageBuf, latent_raw::Metadata), Box<dyn Error>> {
     let raw = latent_raw::unpack(input)?;
     let mut mosaic = raw.normalized();
@@ -92,7 +101,9 @@ pub fn develop_to_image(input: &Path) -> Result<(ImageBuf, latent_raw::Metadata)
     let to_working = raw
         .color_matrix()
         .ok_or("camera color matrix is singular")?;
-    Ok((color::apply_matrix(&camera_rgb, &to_working), raw.meta))
+    let working = color::apply_matrix(&camera_rgb, &to_working);
+    let upright = working.oriented(Orientation::from_libraw(raw.meta.orientation));
+    Ok((upright, raw.meta))
 }
 
 /// Develop `input` and encode it to `output`. With no explicit `depth`, the depth
@@ -204,6 +215,26 @@ mod tests {
         assert!(!out.exists(), "no output should be written for a bad input");
 
         std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn orientation_seam_makes_a_portrait_upright() {
+        // `develop_to_image` applies orientation as its last step, decoding the
+        // LibRaw `flip` code into the geometry transform. A real RAW fixture is
+        // impractical here, so this pins the seam the develop wiring is a
+        // one-liner over: a landscape working image stays landscape for an
+        // upright code, and a `flip == 6` (90° CW) shot comes out with portrait
+        // dimensions (height > width).
+        let landscape = ImageBuf::new(4, 2);
+        let upright = landscape.oriented(Orientation::from_libraw(0));
+        assert_eq!((upright.width(), upright.height()), (4, 2));
+        let portrait = landscape.oriented(Orientation::from_libraw(6));
+        assert!(
+            portrait.height() > portrait.width(),
+            "a flip==6 shot must come out portrait: {}x{}",
+            portrait.width(),
+            portrait.height()
+        );
     }
 
     #[test]

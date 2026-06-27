@@ -63,11 +63,22 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context, do_undo: &mut bool, do_re
             });
 
             ui.menu_button("View", |ui| {
-                // Planned: zoom controls (fit / 100% / in / out).
-                ui.add_enabled(false, egui::Button::new("Zoom to fit"));
-                ui.add_enabled(false, egui::Button::new("Zoom to 100%"));
-                // Planned: before/after toggle.
-                ui.add_enabled(false, egui::Button::new("Before / After"));
+                if ui.button("Zoom to fit").clicked() {
+                    app.zoom_fit();
+                    ui.close();
+                }
+                if ui.button("Zoom to 100%").clicked() {
+                    app.zoom_actual();
+                    ui.close();
+                }
+                if ui.button("Before / After").clicked() {
+                    app.before = match app.before {
+                        crate::gui::app::BeforeAfter::Off => crate::gui::app::BeforeAfter::Toggle,
+                        crate::gui::app::BeforeAfter::Toggle => crate::gui::app::BeforeAfter::Split,
+                        crate::gui::app::BeforeAfter::Split => crate::gui::app::BeforeAfter::Off,
+                    };
+                    ui.close();
+                }
                 // Planned: scopes (histogram / clipping).
                 ui.add_enabled(false, egui::Button::new("Histogram"));
                 ui.separator();
