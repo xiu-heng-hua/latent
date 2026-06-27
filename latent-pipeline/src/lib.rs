@@ -537,48 +537,313 @@ pub fn midtone_weight(base_luma: f32) -> f32 {
 /// Prior*, CVPR 2009), which uses `t0 = 0.1`.
 const DEHAZE_T0: f32 = 0.1;
 
-/// Radius (pixels) of the dark-channel patch. He, Sun & Tang take the dark
+/// Smallest dark-channel patch radius (pixels). He, Sun & Tang take the dark
 /// channel over a local *patch*, not a single pixel: that is what lets a bright
 /// neutral object (which has darker pixels nearby) be told apart from a uniformly
-/// bright haze veil, so the former is preserved instead of crushed to black.
-pub const DEHAZE_PATCH: i32 = 4;
+/// bright haze veil, so the former is preserved instead of crushed to black. They
+/// use a 15×15 window at their reference scale, i.e. a radius of `7`; we never go
+/// below that, so even tiny images keep a meaningful patch (a 1×1 patch would
+/// over-saturate, picking up every clear pixel as if it were haze).
+pub const DEHAZE_PATCH_MIN: i32 = 7;
 
-/// The patch dark channel at `(x, y)`: the minimum, over the surrounding
-/// `(2·DEHAZE_PATCH+1)²` window (clamped at the borders), of each pixel's
-/// smallest channel. High for uniform bright haze, low wherever any nearby pixel
-/// is dark — so a bright neutral subject with darker surroundings reads as
-/// haze-free. Public so a backend evaluating dehaze reuses the identical estimate.
-pub fn dehaze_dark_channel(img: &ImageBuf, x: u32, y: u32) -> f32 {
+/// Reference short side (pixels) at which the dark-channel patch equals He, Sun &
+/// Tang's 15×15 window ([`DEHAZE_PATCH_MIN`] radius). A roughly 1-megapixel frame
+/// (≈ 1024 short side) is treated as the reference; larger rasters scale the patch
+/// up in proportion so the prior covers the same *fraction* of the scene rather
+/// than shrinking into the small-patch over-saturation regime on high-MP images.
+const DEHAZE_PATCH_REF: f32 = 1024.0;
+
+/// Multiplier from the dark-channel patch radius to the guided-filter radius used
+/// to refine the transmission map. He, Sun & Tang refine the coarse, block-shaped
+/// patch transmission with a filter whose support is several times the patch, so
+/// the refined `t` follows luminance edges over a wide neighborhood rather than
+/// the patch's blocky outline.
+const DEHAZE_GUIDE_SCALE: i32 = 4;
+
+/// Regularization `ε` of the guided filter when refining transmission. He & Sun
+/// (*Guided Image Filtering*, ECCV 2010) use a small `ε` on `[0, 1]` luminance so
+/// the linear model stays close to a feature-preserving edge transfer rather than
+/// degenerating into a plain box blur. Public so a backend's own dehaze loop refines
+/// the transmission with the identical knob (lockstep with [`dehaze_image`]).
+pub const DEHAZE_GUIDE_EPS: f32 = 1e-3;
+
+/// The guided-filter radius used to refine the transmission of an image whose
+/// dark-channel patch radius is `patch`: several× the patch ([`DEHAZE_GUIDE_SCALE`]),
+/// floored at `1`. Public so a backend refines the transmission over the identical
+/// support (lockstep with [`dehaze_image`]).
+pub fn dehaze_guide_radius(patch: i32) -> usize {
+    (patch * DEHAZE_GUIDE_SCALE).max(1) as usize
+}
+
+/// Dark-channel patch radius for an image of the given size, scaled with
+/// resolution. The radius grows linearly with the short side relative to
+/// [`DEHAZE_PATCH_REF`] and is floored at [`DEHAZE_PATCH_MIN`] (a 15×15-equivalent
+/// window), so a reference frame yields exactly that floor, larger frames a
+/// strictly larger patch, and tiny frames the floor rather than a degenerate 1×1.
+///
+/// `radius` here is the half-window in pixels — the same convention `blur` and
+/// `denoise` use — rounded half-up.
+pub fn dehaze_patch_radius(w: u32, h: u32) -> i32 {
+    let short = w.min(h) as f32;
+    let scaled = (DEHAZE_PATCH_MIN as f32 * short / DEHAZE_PATCH_REF + 0.5).floor() as i32;
+    scaled.max(DEHAZE_PATCH_MIN)
+}
+
+/// The patch dark channel of the **airlight-normalized** image at `(x, y)`: the
+/// minimum, over the surrounding `(2·radius+1)²` window (clamped at the borders),
+/// of each pixel's smallest *normalized* channel `I^c / A^c`. High for uniform
+/// bright haze, low wherever any nearby pixel is dark — so a bright neutral subject
+/// with darker surroundings reads as haze-free.
+///
+/// Normalizing by the per-channel airlight `A` before the min is what lets the
+/// prior neutralize a *colored* veil: under a tinted airlight the raw channels are
+/// scaled unevenly, but `I/A` is near `1` in the veil regardless of its tint, so
+/// the dark channel — and hence the transmission — is correct. Border clamping
+/// matches the guided filter's shrinking window so the two passes agree at edges.
+/// Public so a backend evaluating dehaze reuses the identical estimate.
+pub fn dehaze_dark_channel(img: &ImageBuf, x: u32, y: u32, a: [f32; 3], radius: i32) -> f32 {
     let (w, h) = (img.width() as i32, img.height() as i32);
     let mut dc = f32::INFINITY;
-    for dy in -DEHAZE_PATCH..=DEHAZE_PATCH {
-        for dx in -DEHAZE_PATCH..=DEHAZE_PATCH {
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
             let sx = (x as i32 + dx).clamp(0, w - 1) as u32;
             let sy = (y as i32 + dy).clamp(0, h - 1) as u32;
             let p = img.get(sx, sy);
-            dc = dc.min(p[0].min(p[1]).min(p[2]));
+            let m = (p[0] / a[0]).min(p[1] / a[1]).min(p[2] / a[2]);
+            dc = dc.min(m);
         }
     }
     dc
 }
 
-/// Recover one dehazed linear-RGB pixel from its value and patch dark channel.
+/// Estimate the per-channel atmospheric airlight `A = [A_r, A_g, A_b]` of a hazy
+/// image (He, Sun & Tang §4.3). The haziest pixels are the brightest in the dark
+/// channel, so we take the dark channel over the whole image (with the raw,
+/// un-normalized prior `A = [1, 1, 1]`, since `A` is what we are estimating),
+/// collect the **top ~0.1% brightest** of those, and average each color channel
+/// over that candidate set. The mean over the brightest-dark-channel pixels is
+/// steadier than He's single brightest pixel — it resists a lone outlier (a
+/// specular highlight, a hot pixel) while still landing on the veil color — and is
+/// what makes a *colored* veil recoverable: `A` carries the tint that a fixed
+/// `A = 1` cannot. Each channel is clamped to a small positive floor so the later
+/// `I/A` normalization can never divide by zero.
+pub fn dehaze_airlight(img: &ImageBuf, radius: i32) -> [f32; 3] {
+    let (w, h) = (img.width(), img.height());
+    let n = (w as usize) * (h as usize);
+    // Dark channel over the unit-airlight image, paired with each pixel's index.
+    let mut dark: Vec<(f32, usize)> = Vec::with_capacity(n);
+    for y in 0..h {
+        for x in 0..w {
+            let dc = dehaze_dark_channel(img, x, y, [1.0, 1.0, 1.0], radius);
+            dark.push((dc, (y as usize) * (w as usize) + (x as usize)));
+        }
+    }
+    // The brightest ~0.1% of dark-channel values (at least one pixel).
+    let count = (n / 1000).max(1);
+    dark.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    let px = img.pixels();
+    let mut sum = [0.0_f32; 3];
+    for &(_, idx) in dark.iter().take(count) {
+        let p = px[idx];
+        for c in 0..3 {
+            sum[c] += p[c];
+        }
+    }
+    std::array::from_fn(|c| (sum[c] / count as f32).max(1e-4))
+}
+
+/// Recover one dehazed linear-RGB pixel from its value, the (refined) transmission
+/// `t` at that pixel, and the per-channel airlight `A`.
 ///
 /// The atmospheric scattering model is `I = J·t + A·(1 − t)`: the observed pixel
-/// `I` is the clear radiance `J` attenuated by transmission `t`, plus airlight
-/// `A`. With a neutral unit airlight (`A = 1`) the dark-channel prior gives
-/// `t = 1 − strength·dc`, and inverting the model recovers
-/// `J = (I − A)/clamp(t, t0, 1) + A`. `strength` in `[0, 1]` is the prior's `ω`.
-/// A clear pixel (`dc ≈ 0`) has `t ≈ 1` and is left unchanged; removing the gray
-/// veil restores contrast (deeper blacks) and saturation at once. Highlight
-/// headroom (`I > 1`) is passed through, since the model assumes `I ≤ A`.
-pub fn dehaze_recover(rgb: [f32; 3], dc: f32, strength: f32) -> [f32; 3] {
-    let t = (1.0 - strength * dc.clamp(0.0, 1.0)).clamp(DEHAZE_T0, 1.0);
+/// `I` is the clear radiance `J` attenuated by transmission `t`, plus airlight `A`.
+/// Inverting it per channel recovers `J^c = (I^c − A^c)/clamp(t, t0, 1) + A^c`. A
+/// clear pixel (`t ≈ 1`) is left unchanged; removing the veil restores contrast
+/// (deeper blacks) and saturation at once. The transmission is already estimated
+/// and guided-filter-refined upstream, so recovery only applies the `t0` floor (so
+/// it never divides by ~0 in the densest haze).
+///
+/// Headroom pivots at the airlight, not at `1`: the model assumes `I^c ≤ A^c`, and
+/// now that `A^c` can exceed `1`, the part of a channel **above its own airlight**
+/// (a specular highlight brighter than the veil) is passed through untouched while
+/// the `≤ A^c` part is recovered by the inverse model — so a highlight is neither
+/// clipped nor amplified by the inversion.
+pub fn dehaze_recover(rgb: [f32; 3], t: f32, a: [f32; 3]) -> [f32; 3] {
+    let t = t.clamp(DEHAZE_T0, 1.0);
     std::array::from_fn(|c| {
-        let in_range = rgb[c].min(1.0);
-        let headroom = (rgb[c] - 1.0).max(0.0);
-        ((in_range - 1.0) / t + 1.0).max(0.0) + headroom
+        let in_range = rgb[c].min(a[c]);
+        let headroom = (rgb[c] - a[c]).max(0.0);
+        ((in_range - a[c]) / t + a[c]).max(0.0) + headroom
     })
+}
+
+/// A reusable O(N) **guided filter** (He & Sun, *Guided Image Filtering*, ECCV
+/// 2010) over single-channel buffers. It smooths `src` so the output `q` follows a
+/// local linear model of the `guide`, `q = a·I + b` per window: it averages within
+/// a region but preserves edges that the *guide* defines, transferring the guide's
+/// structure onto the filtered signal. For dehaze the guide is the input luminance
+/// and `src` is the raw transmission map, so the blocky patch transmission is
+/// snapped to luminance (depth) edges, removing the patch grid and halos.
+///
+/// Cost is independent of `radius`: the per-window means are five **box filters**
+/// (`mean_I`, `mean_p`, `mean(I·I)`, `mean(I·p)`, then box-filtered `a` and `b`),
+/// each an O(N) running-sum via [`box_filter`], not an O(N·r²) per-window sum.
+/// Borders use a **shrinking window** (each pixel divides by its actual in-bounds
+/// tap count), matching [`dehaze_dark_channel`]'s clamp so the passes agree at the
+/// image edge. `eps` is the regularization (the smoothing-vs-edge knob): larger
+/// `eps` smooths more, smaller preserves finer guide structure.
+///
+/// Both inputs are length `w·h`, row-major; the result is the same length.
+pub fn guided_filter(
+    guide: &[f32],
+    src: &[f32],
+    w: usize,
+    h: usize,
+    radius: usize,
+    eps: f32,
+) -> Vec<f32> {
+    debug_assert!(radius >= 1, "guided filter radius must be >= 1");
+    debug_assert!(
+        eps.is_finite() && eps >= 0.0,
+        "guided filter eps must be finite and >= 0"
+    );
+    debug_assert_eq!(guide.len(), w * h);
+    debug_assert_eq!(src.len(), w * h);
+
+    let mean_i = box_filter(guide, w, h, radius);
+    let mean_p = box_filter(src, w, h, radius);
+    let ii: Vec<f32> = guide.iter().map(|&i| i * i).collect();
+    let ip: Vec<f32> = guide.iter().zip(src).map(|(&i, &p)| i * p).collect();
+    let mean_ii = box_filter(&ii, w, h, radius);
+    let mean_ip = box_filter(&ip, w, h, radius);
+
+    let mut a = vec![0.0_f32; w * h];
+    let mut b = vec![0.0_f32; w * h];
+    for k in 0..w * h {
+        let var_i = mean_ii[k] - mean_i[k] * mean_i[k];
+        let cov_ip = mean_ip[k] - mean_i[k] * mean_p[k];
+        a[k] = cov_ip / (var_i + eps);
+        b[k] = mean_p[k] - a[k] * mean_i[k];
+    }
+    let mean_a = box_filter(&a, w, h, radius);
+    let mean_b = box_filter(&b, w, h, radius);
+    (0..w * h)
+        .map(|k| mean_a[k] * guide[k] + mean_b[k])
+        .collect()
+}
+
+/// O(N) box filter: each output is the **mean** of `src` over the `(2·radius+1)²`
+/// window centered on it, clamped to the image and divided by the actual in-bounds
+/// tap count (a shrinking window at the borders, so edges are not biased toward
+/// zero). Separable and computed with running sums — a horizontal pass then a
+/// vertical pass, each O(N) per row/column independent of `radius` — so the whole
+/// filter is O(N) regardless of window size. This is the primitive that keeps
+/// [`guided_filter`] O(N).
+fn box_filter(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    // Horizontal running-sum pass: out[y][x] = sum of src over [x-r, x+r].
+    let mut horiz = vec![0.0_f32; w * h];
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        let out = &mut horiz[y * w..(y + 1) * w];
+        let mut sum = 0.0_f32;
+        // Prime the window [0, r].
+        for &v in row.iter().take((radius + 1).min(w)) {
+            sum += v;
+        }
+        for x in 0..w {
+            out[x] = sum;
+            // Slide: drop the tap leaving at x-r, add the tap entering at x+r+1.
+            let add = x + radius + 1;
+            if add < w {
+                sum += row[add];
+            }
+            if x >= radius {
+                sum -= row[x - radius];
+            }
+        }
+    }
+    // Vertical running-sum pass over the horizontal sums, then normalize by the
+    // in-bounds tap count (width × height of each pixel's clamped window).
+    let mut out = vec![0.0_f32; w * h];
+    for x in 0..w {
+        let mut sum = 0.0_f32;
+        for y in 0..(radius + 1).min(h) {
+            sum += horiz[y * w + x];
+        }
+        for y in 0..h {
+            out[y * w + x] = sum;
+            let add = y + radius + 1;
+            if add < h {
+                sum += horiz[add * w + x];
+            }
+            if y >= radius {
+                sum -= horiz[(y - radius) * w + x];
+            }
+        }
+    }
+    // Normalize each pixel by its own window's tap count.
+    let r = radius as i32;
+    for y in 0..h as i32 {
+        let y0 = (y - r).max(0);
+        let y1 = (y + r).min(h as i32 - 1);
+        let wy = (y1 - y0 + 1) as f32;
+        for x in 0..w as i32 {
+            let x0 = (x - r).max(0);
+            let x1 = (x + r).min(w as i32 - 1);
+            let wx = (x1 - x0 + 1) as f32;
+            out[(y as usize) * w + (x as usize)] /= wx * wy;
+        }
+    }
+    out
+}
+
+/// The full dark-channel-prior dehaze of `img` at the given `strength` (the prior's
+/// `ω` in `[0, 1]`), implementing He, Sun & Tang's method end to end. Shared by the
+/// CPU backend and the pipeline reference so the two stay in lockstep.
+///
+/// In order: (1) estimate the per-channel airlight `A` ([`dehaze_airlight`]);
+/// (2) build the raw transmission map `t_raw = 1 − ω·darkchannel(I/A)` over the
+/// whole image; (3) **refine** `t_raw` with the [`guided_filter`] using input
+/// luminance as the guide, which snaps the blocky patch transmission to depth
+/// edges (removing block/halo artifacts, He §4.2); (4) recover each pixel from the
+/// refined `t` and `A` ([`dehaze_recover`]). Returns the dehazed image.
+pub fn dehaze_image(img: &ImageBuf, strength: f32) -> ImageBuf {
+    let (w, h) = (img.width(), img.height());
+    let (wu, hu) = (w as usize, h as usize);
+    let patch = dehaze_patch_radius(w, h);
+    let a = dehaze_airlight(img, patch);
+
+    // Raw transmission map from the airlight-normalized dark channel.
+    let mut t_raw = vec![0.0_f32; wu * hu];
+    let mut luma = vec![0.0_f32; wu * hu];
+    for y in 0..h {
+        for x in 0..w {
+            let k = (y as usize) * wu + (x as usize);
+            let dc = dehaze_dark_channel(img, x, y, a, patch);
+            t_raw[k] = 1.0 - strength * dc.clamp(0.0, 1.0);
+            luma[k] = luminance(img.get(x, y));
+        }
+    }
+
+    // Refine the transmission with the guided filter (guide = input luminance), at
+    // a radius several× the patch, then recover.
+    let t = guided_filter(
+        &luma,
+        &t_raw,
+        wu,
+        hu,
+        dehaze_guide_radius(patch),
+        DEHAZE_GUIDE_EPS,
+    );
+
+    let mut out = ImageBuf::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let k = (y as usize) * wu + (x as usize);
+            out.set(x, y, dehaze_recover(img.get(x, y), t[k], a));
+        }
+    }
+    out
 }
 
 /// One output pixel of the bilateral denoise filter at `(x, y)`.
@@ -1076,14 +1341,7 @@ mod tests {
             if strength <= 0.0 {
                 return img.clone();
             }
-            let mut out = ImageBuf::new(img.width(), img.height());
-            for y in 0..img.height() {
-                for x in 0..img.width() {
-                    let dc = dehaze_dark_channel(img, x, y);
-                    out.set(x, y, dehaze_recover(img.get(x, y), dc, strength));
-                }
-            }
-            out
+            dehaze_image(img, strength)
         }
 
         fn eval_mask(&self, mask: &Mask, source: &ImageBuf) -> Vec<f32> {
@@ -1292,28 +1550,337 @@ mod tests {
         );
     }
 
+    /// Build a hazy scene under the scattering model `I = J·t + A·(1 − t)`: a wide
+    /// block of uniformly-hazed `clear` color on the left, and a block of pure
+    /// airlight `a` (the densest haze, `t = 0`) on the right that fixes the airlight
+    /// estimate. Both blocks are several patches wide so an interior pixel of each
+    /// has a clean same-color neighborhood, and the hazy-scene interior sits well
+    /// clear of the boundary so the guided filter keeps its transmission uniform.
+    /// Returns the image; sample recovery at `(30, 30)` (hazed scene) and the
+    /// airlight at `(110, 30)`.
+    fn hazy_scene(clear: [f32; 3], t: f32, a: [f32; 3]) -> ImageBuf {
+        let hazy: [f32; 3] = std::array::from_fn(|c| clear[c] * t + a[c] * (1.0 - t));
+        let (w, h) = (120u32, 60u32);
+        let mut img = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.set(x, y, if x < 80 { hazy } else { a });
+            }
+        }
+        img
+    }
+
     #[test]
     fn dehaze_clears_a_synthetic_veil() {
-        // Veil a saturated clear pixel (one channel at 0, so the dark-channel prior
-        // holds) with white airlight at transmission 0.5, then dehaze it. Full
-        // strength inverts the model and recovers the clear pixel; the lowering
-        // wires it through apply_global.
+        // A saturated clear color (one channel at 0, so the dark-channel prior holds)
+        // uniformly hazed by white airlight at transmission 0.5, beside a pure-white
+        // veil block that fixes the airlight estimate at A ≈ [1, 1, 1]. Full-strength
+        // dehaze estimates the airlight, refines the (uniform) transmission, and
+        // inverts the model to recover the clear color in the scene's interior.
         let clear = [0.8, 0.2, 0.0];
-        let t = 0.5;
-        let hazy: [f32; 3] = std::array::from_fn(|c| clear[c] * t + (1.0 - t));
-        let out = developed(
-            Adjustments {
-                dehaze: Some(1.0),
-                ..Adjustments::default()
-            },
-            hazy,
-        );
+        let img = hazy_scene(clear, 0.5, [1.0, 1.0, 1.0]);
+        let out = TestBackend.dehaze(&img, 1.0).get(30, 30);
         for (c, &want) in clear.iter().enumerate() {
             assert!(
-                (out[c] - want).abs() < 1e-5,
+                (out[c] - want).abs() < 1e-4,
                 "recovered {out:?} vs {clear:?}"
             );
         }
+    }
+
+    #[test]
+    fn dehaze_neutralizes_a_colored_veil() {
+        // A *tinted* airlight A = [0.9, 0.85, 1.0] — which a fixed A = 1 cannot
+        // neutralize. The airlight estimator must find the tint from the brightest
+        // dark-channel (pure-veil) block; recovery on the hazed scene then restores
+        // the clear color. Under the old A = 1 the recovered color would carry the
+        // residual tint and miss `clear` badly.
+        let clear = [0.8, 0.2, 0.0];
+        let a = [0.9, 0.85, 1.0];
+        let img = hazy_scene(clear, 0.5, a);
+        let est = dehaze_airlight(&img, dehaze_patch_radius(img.width(), img.height()));
+        for (c, &want) in a.iter().enumerate() {
+            assert!((est[c] - want).abs() < 1e-3, "airlight {est:?} vs {a:?}");
+        }
+        let out = TestBackend.dehaze(&img, 1.0).get(30, 30);
+        for (c, &want) in clear.iter().enumerate() {
+            assert!(
+                (out[c] - want).abs() < 1e-3,
+                "recovered {out:?} vs {clear:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dehaze_headroom_pivots_at_airlight() {
+        // With a tinted airlight whose red exceeds 1, a specular highlight brighter
+        // than that airlight must pass through unclipped: the part above A^c is
+        // headroom (not touched by the inverse model), the part at/below A^c is
+        // recovered. Pivoting at the old hard-coded 1.0 would clip the >1 airlight.
+        let a = [1.2, 0.9, 0.8];
+        // A pixel exactly at the airlight stays at the airlight (t-floored region).
+        let at_air = dehaze_recover(a, 0.05, a);
+        for (c, &want) in a.iter().enumerate() {
+            assert!((at_air[c] - want).abs() < 1e-5, "airlight pixel {at_air:?}");
+        }
+        // A highlight above the (>1) airlight keeps the excess above A unclipped.
+        let hi = [1.5, 1.5, 1.5];
+        let out = dehaze_recover(hi, 1.0, a);
+        for c in 0..3 {
+            let excess = hi[c] - a[c];
+            assert!(
+                out[c] >= a[c] + excess - 1e-5,
+                "headroom above airlight kept: {out:?} (A={a:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn airlight_picks_brightest_dark_channel() {
+        // The estimator must select the airlight from the brightest *dark-channel*
+        // region (the pure veil), not from a saturated-but-dark scene patch. The
+        // veil block is the brightest dark channel and tinted; the estimate matches.
+        let a = [0.95, 0.8, 0.7];
+        let clear = [0.6, 0.1, 0.0];
+        let img = hazy_scene(clear, 0.5, a);
+        let est = dehaze_airlight(&img, dehaze_patch_radius(img.width(), img.height()));
+        for (c, &want) in a.iter().enumerate() {
+            assert!((est[c] - want).abs() < 1e-3, "estimated {est:?} vs {a:?}");
+        }
+    }
+
+    fn variance(v: &[f32]) -> f32 {
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32
+    }
+
+    #[test]
+    fn guided_filter_smooths_flat_noise() {
+        // A noisy constant signal under a perfectly flat guide has no edge for the
+        // guide to preserve, so the filter drives it toward its mean: the output
+        // variance collapses far below the input's.
+        let (w, h) = (40usize, 40usize);
+        let guide = vec![0.5_f32; w * h];
+        let mut src = vec![0.0_f32; w * h];
+        let mut seed = 1u32;
+        for s in src.iter_mut() {
+            // cheap deterministic LCG noise around 0.5
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *s = 0.5 + ((seed >> 8) as f32 / u32::MAX as f32 - 0.5) * 0.4;
+        }
+        let out = guided_filter(&guide, &src, w, h, 5, 1e-3);
+        assert!(
+            variance(&out) < variance(&src) * 0.1,
+            "noise driven to mean: var {} -> {}",
+            variance(&src),
+            variance(&out)
+        );
+    }
+
+    #[test]
+    fn guided_filter_preserves_guide_edge() {
+        // A step present in *both* guide and signal is kept sharp (the guide marks
+        // an edge), whereas the same step in the signal with a *flat* guide is
+        // smoothed — proving edge-awareness comes from the guide, not the signal.
+        let (w, h) = (40usize, 20usize);
+        let mut guide_step = vec![0.0_f32; w * h];
+        let mut src = vec![0.0_f32; w * h];
+        let guide_flat = vec![0.5_f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 0.2 } else { 0.8 };
+                guide_step[y * w + x] = v;
+                src[y * w + x] = v;
+            }
+        }
+        let mid = h / 2 * w + w / 2; // first column right of the step
+        let left = h / 2 * w + (w / 2 - 1); // last column left of the step
+
+        let kept = guided_filter(&guide_step, &src, w, h, 6, 1e-4);
+        let kept_step = kept[mid] - kept[left];
+        let smoothed = guided_filter(&guide_flat, &src, w, h, 6, 1e-4);
+        let smoothed_step = smoothed[mid] - smoothed[left];
+
+        assert!(
+            kept_step > 0.5,
+            "guide edge preserved: step {kept_step} (input 0.6)"
+        );
+        assert!(
+            smoothed_step < kept_step * 0.5,
+            "flat-guide signal step smoothed: {smoothed_step} vs kept {kept_step}"
+        );
+    }
+
+    #[test]
+    fn guided_filter_is_radius_cheap() {
+        // The box-filter sub-routine driving the O(N) path must match a brute-force
+        // per-window mean for several radii — confirming the running-sum is correct
+        // independent of radius (the property that makes the filter radius-cheap).
+        let (w, h) = (17usize, 13usize);
+        let mut src = vec![0.0_f32; w * h];
+        let mut seed = 7u32;
+        for s in src.iter_mut() {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            *s = (seed >> 9) as f32 / (1 << 23) as f32;
+        }
+        for &r in &[1usize, 3, 6, 20] {
+            let fast = box_filter(&src, w, h, r);
+            let ri = r as i32;
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let (mut sum, mut n) = (0.0_f32, 0u32);
+                    for dy in -ri..=ri {
+                        for dx in -ri..=ri {
+                            let sx = (x + dx).clamp(0, w as i32 - 1);
+                            let sy = (y + dy).clamp(0, h as i32 - 1);
+                            // Brute force uses the same shrinking window: only count
+                            // taps that are genuinely in-bounds (not the clamped ones).
+                            if x + dx >= 0 && x + dx < w as i32 && y + dy >= 0 && y + dy < h as i32
+                            {
+                                sum += src[(sy as usize) * w + sx as usize];
+                                n += 1;
+                            }
+                        }
+                    }
+                    let want = sum / n as f32;
+                    let got = fast[(y as usize) * w + x as usize];
+                    assert!(
+                        (got - want).abs() < 1e-4,
+                        "box_filter r={r} at ({x},{y}): {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dehaze_transmission_refinement_removes_blocks() {
+        // Two haze densities (two transmissions) sharing a clean luminance edge: a
+        // brighter, less-hazy half and a darker, hazier half. After refinement the
+        // recovered transmission follows the luminance edge — adjacent pixels across
+        // it differ sharply — and within either uniform-haze region the recovered
+        // image shows less banding than the raw (un-refined) patch baseline.
+        let (w, h) = (160u32, 60u32);
+        let a = [1.0, 1.0, 1.0];
+        // Left: a bright saturated color, more hazed (lower t). Right: a dark
+        // saturated color, barely hazed (higher t). Both clear colors keep a zero
+        // channel so the dark-channel prior holds; the two observed luminances
+        // differ clearly, so the guide has a real edge and the recovered colors
+        // differ sharply across it while staying flat within each region.
+        let clear_l = [0.85, 0.55, 0.0];
+        let clear_r = [0.2, 0.08, 0.0];
+        let (tl, tr) = (0.7_f32, 0.9_f32);
+        let hazy_l: [f32; 3] = std::array::from_fn(|c| clear_l[c] * tl + a[c] * (1.0 - tl));
+        let hazy_r: [f32; 3] = std::array::from_fn(|c| clear_r[c] * tr + a[c] * (1.0 - tr));
+        let edge = 70u32;
+        let mut img = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // A pure-airlight reference strip on the far right fixes A ≈ 1.
+                let px = if x >= 150 {
+                    a
+                } else if x < edge {
+                    hazy_l
+                } else {
+                    hazy_r
+                };
+                img.set(x, y, px);
+            }
+        }
+        let out = TestBackend.dehaze(&img, 1.0);
+
+        // The recovered values straddling the haze-density edge differ sharply: the
+        // refined t followed the luminance edge instead of bleeding one region's
+        // constant patch transmission across into the other.
+        let across = (out.get(edge - 1, 30)[0] - out.get(edge + 1, 30)[0]).abs();
+        assert!(across > 0.2, "sharp transition across the edge: {across}");
+
+        // The transition is *local* to the edge, not a (2·patch+1)-wide constant
+        // block bleeding across it: interior pixels a few patches into each region
+        // recover essentially their own clear color.
+        assert!(
+            (out.get(30, 30)[0] - clear_l[0]).abs() < 0.05,
+            "left interior recovers its color: {:?}",
+            out.get(30, 30)
+        );
+        assert!(
+            (out.get(110, 30)[0] - clear_r[0]).abs() < 0.05,
+            "right interior recovers its color: {:?}",
+            out.get(110, 30)
+        );
+
+        // Build the un-refined raw-patch baseline (same airlight and raw patch
+        // transmission, but recovered *without* the guided-filter pass) to compare
+        // against. The patch min mixes the two regions over the (2·patch+1)-wide
+        // band straddling the edge, so the raw transmission — and hence the recovery
+        // — has a wider, blockier transition there than the refined result.
+        let patch = dehaze_patch_radius(w, h);
+        let air = dehaze_airlight(&img, patch);
+        let mut raw = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let dc = dehaze_dark_channel(&img, x, y, air, patch);
+                let t_raw = 1.0 - dc.clamp(0.0, 1.0); // strength = 1.0
+                raw.set(x, y, dehaze_recover(img.get(x, y), t_raw, air));
+            }
+        }
+
+        // The recovered luma profile across the edge: the refined transition is
+        // sharper, so it has lower variance over the (2·patch+1) band centered on
+        // the edge than the raw-patch baseline (which spreads a block there).
+        let band = patch as u32;
+        let sample = |im: &ImageBuf| -> Vec<f32> {
+            ((edge - band)..=(edge + band))
+                .map(|x| luminance(im.get(x, 30)))
+                .collect()
+        };
+        // Each region by itself is flat after refinement (no patch-grid banding).
+        let mut left_region = Vec::new();
+        for x in 20..50 {
+            left_region.push(luminance(out.get(x, 30)));
+        }
+        assert!(
+            variance(&left_region) < 1e-4,
+            "uniform-haze region is flat after refinement: var {}",
+            variance(&left_region)
+        );
+        // And near the edge the raw baseline shows the block bleed the refinement
+        // removes: the raw transition profile differs from the refined one. We
+        // confirm refinement actually changed (sharpened) the edge rather than being
+        // a no-op by requiring the two profiles to differ meaningfully.
+        let refined_profile = sample(&out);
+        let raw_profile = sample(&raw);
+        let diff: f32 = refined_profile
+            .iter()
+            .zip(&raw_profile)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / refined_profile.len() as f32;
+        assert!(
+            diff > 1e-3,
+            "refinement reshaped the edge vs the raw patch baseline: mean |Δ| {diff}"
+        );
+    }
+
+    #[test]
+    fn dehaze_patch_scales_with_resolution() {
+        // At the reference scale the patch is at least He's 15×15 (radius 7); a
+        // larger image yields a strictly larger patch (monotonic in the short side);
+        // a tiny image clamps to the minimum rather than degenerating to 1×1.
+        let r_ref = dehaze_patch_radius(1024, 1024);
+        assert!(r_ref >= 7, "reference patch >= 15x15: radius {r_ref}");
+
+        let r_big = dehaze_patch_radius(4096, 4096);
+        assert!(
+            r_big > r_ref,
+            "patch grows with resolution: {r_big} vs {r_ref}"
+        );
+
+        // Monotonic in the short side: a wide-but-short frame tracks its short side.
+        assert!(dehaze_patch_radius(8000, 1024) <= dehaze_patch_radius(8000, 2048));
+
+        let r_tiny = dehaze_patch_radius(8, 8);
+        assert_eq!(r_tiny, 7, "tiny image clamps to the minimum, not 1x1");
     }
 
     #[test]

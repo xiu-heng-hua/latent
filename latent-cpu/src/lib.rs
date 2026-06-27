@@ -4,8 +4,9 @@ use latent_edit::Mask;
 use latent_image::ImageBuf;
 use latent_image::color::{Mat3, color_mix, luminance};
 use latent_pipeline::{
-    Backend, CombineKind, DenoiseParams, PointOp, RadialGain, Transform, Warp, bilateral_pixel,
-    dehaze_dark_channel, dehaze_recover, midtone_weight,
+    Backend, CombineKind, DEHAZE_GUIDE_EPS, DenoiseParams, PointOp, RadialGain, Transform, Warp,
+    bilateral_pixel, dehaze_airlight, dehaze_dark_channel, dehaze_guide_radius,
+    dehaze_patch_radius, dehaze_recover, guided_filter, midtone_weight,
 };
 use rayon::prelude::*;
 
@@ -177,21 +178,53 @@ impl Backend for CpuBackend {
     }
 
     fn dehaze(&self, img: &ImageBuf, strength: f32) -> ImageBuf {
-        // Dark-channel-prior dehaze: estimate the veil from a patch dark channel,
-        // then invert the scattering model per pixel. Rows are independent →
-        // parallel; the patch min is what spares bright neutral subjects.
+        // Dark-channel-prior dehaze (He, Sun & Tang): estimate the per-channel
+        // airlight A, build the raw transmission from the airlight-normalized patch
+        // dark channel, refine it with a guided filter (guide = luminance) so it
+        // follows depth edges instead of the blocky patch grid, then invert the
+        // scattering model per pixel. The dark-channel and recovery passes are
+        // per-pixel independent → parallel; the patch min is what spares bright
+        // neutral subjects.
         if strength <= 0.0 {
             return img.clone();
         }
-        let stride = img.width() as usize;
-        let mut out = ImageBuf::new(img.width(), img.height());
+        let (w, h) = (img.width(), img.height());
+        let (wu, hu) = (w as usize, h as usize);
+        let patch = dehaze_patch_radius(w, h);
+        let a = dehaze_airlight(img, patch);
+
+        // Raw transmission map and the luminance guide, in parallel by row.
+        let mut t_raw = vec![0.0_f32; wu * hu];
+        let mut luma = vec![0.0_f32; wu * hu];
+        t_raw
+            .par_chunks_mut(wu)
+            .zip(luma.par_chunks_mut(wu))
+            .enumerate()
+            .for_each(|(y, (trow, lrow))| {
+                for x in 0..w {
+                    let dc = dehaze_dark_channel(img, x, y as u32, a, patch);
+                    trow[x as usize] = 1.0 - strength * dc.clamp(0.0, 1.0);
+                    lrow[x as usize] = luminance(img.get(x, y as u32));
+                }
+            });
+
+        // Refine the transmission, then recover in parallel by row.
+        let t = guided_filter(
+            &luma,
+            &t_raw,
+            wu,
+            hu,
+            dehaze_guide_radius(patch),
+            DEHAZE_GUIDE_EPS,
+        );
+        let mut out = ImageBuf::new(w, h);
         out.pixels_mut()
-            .par_chunks_mut(stride)
+            .par_chunks_mut(wu)
             .enumerate()
             .for_each(|(y, row)| {
-                for x in 0..img.width() {
-                    let dc = dehaze_dark_channel(img, x, y as u32);
-                    row[x as usize] = dehaze_recover(img.get(x, y as u32), dc, strength);
+                let base = y * wu;
+                for x in 0..wu {
+                    row[x] = dehaze_recover(img.get(x as u32, y as u32), t[base + x], a);
                 }
             });
         out
@@ -329,30 +362,38 @@ mod tests {
 
     #[test]
     fn dehaze_recovers_a_uniform_veil_and_spares_a_clear_region() {
-        // A uniform region veiled by white airlight at transmission 0.5 (so the
-        // patch dark channel reflects the haze, not a clear neighbor); full
-        // strength inverts the scattering model and recovers the clear color.
+        // A scene uniformly veiled by white airlight at transmission 0.5, beside a
+        // pure-white veil block that fixes the airlight estimate at A ≈ [1, 1, 1].
+        // Full strength estimates the airlight, refines the transmission, and
+        // inverts the scattering model to recover the clear color in the interior.
         let clear = [0.8, 0.2, 0.0];
+        let a = [1.0, 1.0, 1.0];
         let t = 0.5;
-        let hazy: [f32; 3] = std::array::from_fn(|c| clear[c] * t + (1.0 - t));
-        let mut img = ImageBuf::new(4, 4);
-        for p in img.pixels_mut() {
-            *p = hazy;
+        let hazy: [f32; 3] = std::array::from_fn(|c| clear[c] * t + a[c] * (1.0 - t));
+        let (w, h) = (120u32, 60u32);
+        let mut img = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.set(x, y, if x < 80 { hazy } else { a });
+            }
         }
-        let out = CpuBackend.dehaze(&img, 1.0);
-        let c = out.get(2, 2);
+        let c = CpuBackend.dehaze(&img, 1.0).get(30, 30);
         for (i, &want) in clear.iter().enumerate() {
-            assert!((c[i] - want).abs() < 1e-5, "veil cleared: {c:?}");
+            assert!((c[i] - want).abs() < 1e-4, "veil cleared: {c:?}");
         }
         // A region that is already clear (a channel at 0 → dark channel 0) has no
-        // veil to remove and is left untouched (to within float round-trip error).
-        let mut clear_img = ImageBuf::new(4, 4);
-        for p in clear_img.pixels_mut() {
-            *p = clear;
+        // veil to remove and is left essentially untouched. Here a clear color fills
+        // the scene and the white reference block (the brightest dark channel) still
+        // fixes A ≈ 1, so the clear interior recovers itself.
+        let mut clear_img = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                clear_img.set(x, y, if x < 80 { clear } else { a });
+            }
         }
-        let kept = CpuBackend.dehaze(&clear_img, 1.0).get(2, 2);
+        let kept = CpuBackend.dehaze(&clear_img, 1.0).get(30, 30);
         for (i, &want) in clear.iter().enumerate() {
-            assert!((kept[i] - want).abs() < 1e-6, "clear untouched: {kept:?}");
+            assert!((kept[i] - want).abs() < 1e-3, "clear untouched: {kept:?}");
         }
     }
 
