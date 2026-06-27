@@ -418,10 +418,11 @@ impl RawImage {
     /// The camera → linear-working color matrix built from this file's metadata.
     ///
     /// `cam_xyz` is the XYZ → camera matrix (its first three rows form the 3x3
-    /// used here); composing its inverse with XYZ → working lifts demosaiced
-    /// camera RGB into the working space. White balance is already applied once on
-    /// the mosaic, so the result is row-normalized to keep a neutral input neutral
-    /// (no double white-balance). Returns `None` if the matrix is singular.
+    /// used here). [`color::camera_to_working`] inverts it to camera→XYZ and
+    /// Bradford-adapts the capture illuminant to the D50 working white (the DNG
+    /// color model). White balance is applied once, upstream on the mosaic by
+    /// [`apply_white_balance`], so this matrix receives white-balanced camera RGB
+    /// and never re-balances it. Returns `None` if the matrix is singular.
     pub fn color_matrix(&self) -> Option<Mat3> {
         let x = self.meta.cam_xyz;
         let xyz_to_cam = Mat3([x[0], x[1], x[2]]);
@@ -649,14 +650,38 @@ mod tests {
             [0.0; 3],
         ];
         let m = raw.color_matrix().expect("invertible");
-        // A white-balanced neutral patch is camera RGB [v,v,v]; the color matrix
-        // must keep it neutral (white balance applied exactly once, not twice).
+        // A white-balanced neutral patch is camera RGB [v,v,v]; the DNG color
+        // matrix must keep it neutral (white balance applied exactly once on the
+        // mosaic, never re-applied by this matrix).
         for v in [0.25_f32, 0.5, 1.0] {
             let out = m.mul_vec([v, v, v]);
             for c in out {
                 assert!((c - v).abs() < 1e-5, "drifted from neutral: {out:?}");
             }
         }
+    }
+
+    #[test]
+    fn color_matrix_does_not_double_apply_white_balance() {
+        // Regression: a neutral that has been white-balanced on the mosaic must not
+        // be darkened or tinted by the color matrix re-applying its own implicit
+        // balance. A pure-neutral [v,v,v] in, the exact same gray out — and the
+        // three channels stay equal to each other to machine precision.
+        let mut raw = raw_grid(4, 4);
+        raw.meta.cam_xyz = [
+            [1.4, -0.3, -0.1],
+            [-0.5, 1.6, -0.1],
+            [0.0, -0.4, 1.5],
+            [0.0; 3],
+        ];
+        let m = raw.color_matrix().expect("invertible");
+        let out = m.mul_vec([0.6, 0.6, 0.6]);
+        let spread = out[0].max(out[1]).max(out[2]) - out[0].min(out[1]).min(out[2]);
+        assert!(spread < 1e-5, "neutral picked up a tint: {out:?}");
+        assert!(
+            (out[1] - 0.6).abs() < 1e-5,
+            "neutral darkened/lifted: {out:?}"
+        );
     }
 
     #[test]

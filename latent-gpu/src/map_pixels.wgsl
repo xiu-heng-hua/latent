@@ -21,9 +21,9 @@ struct Params {
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var<storage, read> lut: array<f32>;
 
-// Working-space (ProPhoto primaries, D65) luma weights — must match
+// Working-space (ProPhoto primaries, D50) luma weights — must match
 // latent_image::color::LUMA_WEIGHTS exactly (saturation equivalence relies on it).
-const LUMA = vec3<f32>(0.27881965, 0.72106725, 0.000113055);
+const LUMA = vec3<f32>(0.28807107, 0.71184325, 0.0000856539);
 const LUT_LAST: u32 = 255u;
 
 // Apply the tone curve to one channel: encode to the perceptual domain, look up

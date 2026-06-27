@@ -28,9 +28,13 @@ pub fn srgb_decode(c: f32) -> f32 {
     }
 }
 
-/// Highlight rolloff, **anchored at white**: values up to the knee (just below
-/// 1.0) pass through unchanged, and everything from there up — including headroom
-/// above 1.0 — is compressed smoothly toward, but never reaching, 1.0.
+/// The highlight-rolloff knee: values up to here pass through untouched.
+const ROLLOFF_KNEE: f32 = 0.98;
+
+/// Compress a single brightness value into display range, **anchored at white**:
+/// values up to the knee (just below 1.0) pass through unchanged, and everything
+/// from there up — including headroom above 1.0 — is compressed smoothly toward,
+/// but never reaching, 1.0.
 ///
 /// The knee sits at 0.98 so display `[0, 1]` stays faithful to within ~1 code
 /// (white maps to 254, not 255), while highlights above 1.0 keep a gradient
@@ -40,22 +44,42 @@ pub fn srgb_decode(c: f32) -> f32 {
 /// headroom gradient in a fixed-range output; 0.98 is the
 /// faithful-within-tolerance compromise.)
 pub fn highlight_rolloff(x: f32) -> f32 {
-    const KNEE: f32 = 0.98;
-    if x <= KNEE {
+    if x <= ROLLOFF_KNEE {
         x
     } else {
-        let span = 1.0 - KNEE;
-        let excess = x - KNEE;
-        KNEE + span * (excess / (excess + span))
+        let span = 1.0 - ROLLOFF_KNEE;
+        let excess = x - ROLLOFF_KNEE;
+        ROLLOFF_KNEE + span * (excess / (excess + span))
     }
 }
 
+/// Hue-preserving highlight rolloff for a linear RGB triplet: derive **one**
+/// compression factor from the brightest channel and scale the whole triplet by
+/// it, so the color keeps its channel ratios (its hue) as it compresses into
+/// display range.
+///
+/// Per-channel rolloff would compress only the hot channel of a near-clipped
+/// color, dragging its hue toward the secondaries on blown highlights; a single
+/// shared factor avoids that. Below the knee (and for a non-positive max) the
+/// factor is exactly `1.0`, so every in-range color is untouched and there is no
+/// division by zero. A neutral triplet `[v,v,v]` reduces to [`highlight_rolloff`]
+/// of `v` on each channel, so the pinned neutral display codes are unchanged.
+fn highlight_rolloff_rgb(rgb: [f32; 3]) -> [f32; 3] {
+    let m = rgb[0].max(rgb[1]).max(rgb[2]);
+    if m <= ROLLOFF_KNEE {
+        return rgb;
+    }
+    let factor = highlight_rolloff(m) / m;
+    std::array::from_fn(|c| rgb[c] * factor)
+}
+
 /// The full output transform for one working-space pixel: working → linear sRGB,
-/// highlight rolloff, sRGB OETF, clamped to display `[0, 1]`. Shared by the 8-bit
-/// and 16-bit encoders so they agree exactly bar quantization.
+/// hue-preserving highlight rolloff, sRGB OETF, clamped to display `[0, 1]`.
+/// Shared by the 8-bit and 16-bit encoders so they agree exactly bar
+/// quantization.
 fn to_display(working: [f32; 3], to_srgb: &Mat3) -> [f32; 3] {
-    let lin = to_srgb.mul_vec(working);
-    std::array::from_fn(|c| srgb_encode(highlight_rolloff(lin[c])).clamp(0.0, 1.0))
+    let lin = highlight_rolloff_rgb(to_srgb.mul_vec(working));
+    std::array::from_fn(|c| srgb_encode(lin[c]).clamp(0.0, 1.0))
 }
 
 /// Apply the output transform to a whole working-space image and return row-major
@@ -181,16 +205,41 @@ mod tests {
 
     #[test]
     fn highlight_rolloff_is_identity_below_knee_and_monotone_above() {
-        assert_eq!(highlight_rolloff(0.0), 0.0);
-        assert_eq!(highlight_rolloff(0.9), 0.9); // below the 0.98 knee: unchanged
+        // The triplet form on a neutral input reduces to the scalar curve on each
+        // channel: identity below the knee, monotone and bounded above it.
+        let roll = |v: f32| highlight_rolloff_rgb([v, v, v])[0];
+        assert_eq!(roll(0.0), 0.0);
+        assert_eq!(roll(0.9), 0.9); // below the 0.98 knee: unchanged
         // From the knee up: strictly increasing, always < 1.0 (room kept for more),
         // and white (1.0) barely moves so display stays faithful.
-        let (a, b, c) = (
-            highlight_rolloff(1.0),
-            highlight_rolloff(2.0),
-            highlight_rolloff(8.0),
-        );
+        let (a, b, c) = (roll(1.0), roll(2.0), roll(8.0));
         assert!(0.98 < a && a < b && b < c && c < 1.0, "{a} {b} {c}");
+    }
+
+    #[test]
+    fn highlight_rolloff_preserves_hue_on_a_saturated_color() {
+        // A hot, near-clipped color: per-channel rolloff would compress only the
+        // brightest channel, shifting the channel ratios (its hue). The shared
+        // factor scales the whole triplet, so the ratios are preserved.
+        let hot = [3.0_f32, 1.5, 0.5];
+        let out = highlight_rolloff_rgb(hot);
+        // Same compression factor on every channel → ratios unchanged.
+        let f = out[0] / hot[0];
+        for c in 0..3 {
+            assert!((out[c] - hot[c] * f).abs() < 1e-6, "ratio drift: {out:?}");
+        }
+        // And it genuinely compressed (max came down below 1.0, the rolloff target).
+        assert!(out[0] < 1.0 && out[0] > 0.98, "max not rolled: {out:?}");
+
+        // Contrast with the old per-channel form, which would shift the hue: the
+        // green/red ratio changes because only the hot channel is compressed.
+        let per_channel: [f32; 3] = std::array::from_fn(|c| highlight_rolloff(hot[c]));
+        let shared_ratio = out[1] / out[0];
+        let per_ratio = per_channel[1] / per_channel[0];
+        assert!(
+            (shared_ratio - per_ratio).abs() > 1e-3,
+            "shared and per-channel should differ on a hot color"
+        );
     }
 
     #[test]
