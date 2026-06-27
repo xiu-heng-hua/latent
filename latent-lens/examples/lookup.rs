@@ -17,7 +17,13 @@ fn main() {
         .map_or("Samsung NX 30mm f/2 Pancake", String::as_str);
     let focal: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30.0);
 
-    let db = Database::load().expect("load the lensfun database (install liblensfun-data)");
+    let db = match Database::load() {
+        Ok(db) => db,
+        Err(_) => {
+            println!("lensfun database not found (install the lensfun-data package)");
+            return;
+        }
+    };
     match db.find_profile(maker, model, lens, focal, 8.0, 1000.0) {
         Some(p) => println!(
             "{lens} @ {focal}mm:\n  center      = {:?}\n  distortion  = {:?}\n  ca          = {:?}\n  vignetting  = {:?}",

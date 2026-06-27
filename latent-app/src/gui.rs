@@ -5,6 +5,8 @@
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui;
 use latent_edit::{
@@ -22,8 +24,13 @@ const PREVIEW_MAX_DIM: u32 = 1600;
 /// Develop `input` and open the editor window, rendering with `backend`.
 pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>> {
     // Develop once at full res; the preview re-renders over a downscaled copy.
+    // The bases are read-only during a render and are shared with the render
+    // worker by `Arc`, so a full-res export never deep-copies the image.
     let (full, meta) = crate::develop_to_image(input)?;
-    let preview = full.downscaled(PREVIEW_MAX_DIM);
+    let preview = Arc::new(full.downscaled(PREVIEW_MAX_DIM));
+    let full = Arc::new(full);
+    // The trait is `Send + Sync`, so the backend can be shared with the worker.
+    let backend: Arc<dyn Backend> = Arc::from(backend);
     let title = format!("{}  ({}x{})", input.display(), full.width(), full.height());
     let output = input.with_extension("jpg").to_string_lossy().into_owned();
 
@@ -62,6 +69,7 @@ pub fn run(input: &Path, backend: Box<dyn Backend>) -> Result<(), Box<dyn Error>
                 output,
                 status: String::new(),
                 texture: None,
+                render: RenderState::default(),
                 local_sel: 0,
                 brush_radius: 0.08,
                 brush_feather: 0.04,
@@ -94,10 +102,11 @@ fn auto_lens_profile(meta: &latent_raw::Metadata) -> Option<LensProfile> {
 }
 
 struct App {
-    /// Full-resolution working base, rendered over for export.
-    full: ImageBuf,
+    /// Full-resolution working base, rendered over for export. Shared with the
+    /// render worker by `Arc` (read-only during a render).
+    full: Arc<ImageBuf>,
     /// Downscaled working base, rendered over for the live preview.
-    preview: ImageBuf,
+    preview: Arc<ImageBuf>,
     /// One independent edit history per variant; never empty.
     variants: Vec<History<Settings>>,
     /// Index of the variant currently being edited and previewed.
@@ -111,6 +120,8 @@ struct App {
     output: String,
     status: String,
     texture: Option<egui::TextureHandle>,
+    /// The off-thread render in flight (if any) plus a coalescing flag.
+    render: RenderState,
     /// Index of the local adjustment selected for editing in the panel.
     local_sel: usize,
     /// Brush tool settings for painting dabs onto a brush mask (normalized).
@@ -119,8 +130,91 @@ struct App {
     brush_erase: bool,
     /// Which curve channel the editor edits (0 = master, 1/2/3 = R/G/B).
     curve_channel: usize,
-    /// The rendering backend (CPU, or GPU when selected and available).
-    backend: Box<dyn Backend>,
+    /// The rendering backend (CPU, or GPU when selected and available). Shared
+    /// with the render worker by `Arc` — the trait is `Send + Sync`.
+    backend: Arc<dyn Backend>,
+}
+
+/// What the render worker produces back to the main thread: a freshly rendered
+/// preview image (the main thread uploads it as a texture, which must stay on the
+/// egui thread), or the status line for a finished export.
+enum RenderOutput {
+    /// A rendered preview base, to be uploaded into the preview texture.
+    Preview(ImageBuf),
+    /// The result of a finished export, already formatted for the status line.
+    Export(String),
+}
+
+/// Tracks the single in-flight render and whether another is queued. Only one
+/// render runs at a time; a request that arrives while one is in flight sets
+/// `pending` (latest-wins), and the next idle frame spawns it. The lensfun
+/// `Database` is never part of this — the render reads the already-resolved
+/// [`LensProfile`] in [`Settings`], so nothing non-`Send` crosses the boundary.
+#[derive(Default)]
+struct RenderState {
+    /// The channel a spawned worker reports back on, while it runs.
+    in_flight: Option<Receiver<RenderOutput>>,
+    /// A preview re-render was requested while one was in flight; coalesce to one.
+    pending: bool,
+}
+
+impl RenderState {
+    /// Whether a render is currently running on the worker.
+    fn is_busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+}
+
+/// A self-contained render request the worker owns outright: the base to render
+/// over, the settings to apply, the backend, and what to do with the result. All
+/// fields are `Send` — no lensfun `Database`, only plain resolved data — so the
+/// job can move to a worker thread.
+struct RenderJob {
+    base: Arc<ImageBuf>,
+    settings: Settings,
+    backend: Arc<dyn Backend>,
+    kind: JobKind,
+}
+
+/// Whether a [`RenderJob`] feeds the live preview or writes an export file.
+enum JobKind {
+    /// Render for the on-screen preview; the rendered image is handed back.
+    Preview,
+    /// Render at full resolution and write to this path; a status line is handed
+    /// back. The bit depth follows the file format (16-bit for tif/tiff/png).
+    Export { output: PathBuf },
+}
+
+impl RenderJob {
+    /// Run the render (and, for an export, the file write) and produce the result
+    /// the main thread consumes. Pure with respect to the UI — no egui, no
+    /// shared state — so it is unit-testable without a window.
+    fn run(self) -> RenderOutput {
+        let rendered = render(&self.base, &self.settings, self.backend.as_ref());
+        match self.kind {
+            JobKind::Preview => RenderOutput::Preview(rendered),
+            JobKind::Export { output } => {
+                let result = latent_export::save_auto(&rendered, &output, None);
+                RenderOutput::Export(export_status(&output.to_string_lossy(), result))
+            }
+        }
+    }
+}
+
+/// The status line for a finished export: success names the path, failure names
+/// the error. Factored out of the worker so it can be tested as a pure mapping.
+fn export_status(path: &str, result: image::ImageResult<()>) -> String {
+    match result {
+        Ok(()) => format!("Exported to {path}"),
+        Err(e) => format!("Export failed: {e}"),
+    }
+}
+
+/// Clamp a selection index to a list of `len` items: the last valid index, or 0
+/// when the list is empty. Shared by the local-adjustment list mutations so the
+/// two clamp sites cannot drift.
+fn clamp_selection(sel: &mut usize, len: usize) {
+    *sel = (*sel).min(len.saturating_sub(1));
 }
 
 impl App {
@@ -152,14 +246,92 @@ impl App {
         }
     }
 
-    /// Re-render the active variant over the preview base and refresh the texture.
+    /// Request a preview re-render of the active variant. Spawns the render on a
+    /// worker thread so the UI keeps repainting; if one is already in flight the
+    /// request is coalesced (latest-wins) and spawned when the current one
+    /// finishes. The worker calls `ctx.request_repaint()` on completion so the
+    /// main thread wakes to upload the result.
     fn render_preview(&mut self, ctx: &egui::Context) {
-        let rendered = render(
-            &self.preview,
-            self.variants[self.active].current(),
-            self.backend.as_ref(),
-        );
-        let color = to_color_image(&rendered);
+        if self.render.is_busy() {
+            self.render.pending = true;
+            return;
+        }
+        let job = RenderJob {
+            base: Arc::clone(&self.preview),
+            settings: self.variants[self.active].current().clone(),
+            backend: Arc::clone(&self.backend),
+            kind: JobKind::Preview,
+        };
+        self.spawn(ctx, job);
+    }
+
+    /// Render the active variant at full resolution and write it to `self.output`,
+    /// off the UI thread. While it runs the window keeps repainting; the result
+    /// lands on the status line. Skipped if a render is already in flight (the
+    /// Export button is disabled in that state).
+    fn export(&mut self, ctx: &egui::Context) {
+        if self.render.is_busy() {
+            return;
+        }
+        let job = RenderJob {
+            base: Arc::clone(&self.full),
+            settings: self.variants[self.active].current().clone(),
+            backend: Arc::clone(&self.backend),
+            kind: JobKind::Export {
+                output: PathBuf::from(&self.output),
+            },
+        };
+        self.status = "Exporting…".to_owned();
+        self.spawn(ctx, job);
+    }
+
+    /// Spawn `job` on a worker thread, recording the receiver as the in-flight
+    /// render. The worker requests a repaint when done so the main thread wakes
+    /// and consumes the result in [`Self::poll_render`].
+    fn spawn(&mut self, ctx: &egui::Context, job: RenderJob) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let out = job.run();
+            // If the main thread has dropped the receiver (window closing), the
+            // send simply fails; nothing to clean up.
+            let _ = tx.send(out);
+            ctx.request_repaint();
+        });
+        self.render.in_flight = Some(rx);
+    }
+
+    /// Consume a finished render if the worker has reported one: upload a fresh
+    /// preview as the texture, or post an export's status line. Then, if a preview
+    /// re-render was coalesced while this one ran, spawn it. Called once per frame.
+    fn poll_render(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.render.in_flight else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(out) => {
+                self.render.in_flight = None;
+                match out {
+                    RenderOutput::Preview(img) => self.load_texture(ctx, &img),
+                    RenderOutput::Export(status) => self.status = status,
+                }
+                // A request that arrived mid-render coalesced to one; run it now.
+                if std::mem::take(&mut self.render.pending) {
+                    self.render_preview(ctx);
+                }
+            }
+            // Still running, or the worker vanished; either way leave the slot.
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.render.in_flight = None;
+            }
+        }
+    }
+
+    /// Upload a rendered preview image into the preview texture (creating it on
+    /// the first frame). The texture upload must run on the egui thread.
+    fn load_texture(&mut self, ctx: &egui::Context, img: &ImageBuf) {
+        let color = to_color_image(img);
         match &mut self.texture {
             Some(tex) => tex.set(color, egui::TextureOptions::default()),
             None => {
@@ -168,24 +340,16 @@ impl App {
             }
         }
     }
-
-    /// Render the active variant at full resolution and write it to `self.output`.
-    fn export(&mut self) {
-        let rendered = render(
-            &self.full,
-            self.variants[self.active].current(),
-            self.backend.as_ref(),
-        );
-        self.status = match latent_export::save(&rendered, Path::new(&self.output)) {
-            Ok(()) => format!("Exported to {}", self.output),
-            Err(e) => format!("Export failed: {e}"),
-        };
-    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut dirty = self.texture.is_none();
+        // Pick up a finished render (preview texture or export status) first.
+        self.poll_render(ctx);
+
+        // The first frame needs an initial render; once one is in flight or
+        // queued we wait for it rather than re-triggering every frame.
+        let mut dirty = self.texture.is_none() && !self.render.is_busy() && !self.render.pending;
 
         // Keyboard: Cmd/Ctrl+Z undo, Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y redo.
         let (mut do_undo, mut do_redo) = (false, false);
@@ -313,8 +477,15 @@ impl eframe::App for App {
                 ui.label("Path:");
                 ui.text_edit_singleline(&mut self.output);
             });
-            if ui.button("Export (full resolution)").clicked() {
-                self.export();
+            // Disable Export while a render/export is in flight (one at a time).
+            if ui
+                .add_enabled(
+                    !self.render.is_busy(),
+                    egui::Button::new("Export (full resolution)"),
+                )
+                .clicked()
+            {
+                self.export(ctx);
             }
             if !self.status.is_empty() {
                 ui.label(&self.status);
@@ -336,8 +507,18 @@ impl eframe::App for App {
             self.render_preview(ctx);
         }
 
-        let tex_id = self.texture.as_ref().unwrap().id();
-        let tex_size = self.texture.as_ref().unwrap().size_vec2();
+        // The preview renders off-thread, so the texture is not ready on the
+        // first frame(s). Until it arrives, show a placeholder rather than
+        // unwrapping a `None` texture, and keep waiting for the worker.
+        let Some(texture) = &self.texture else {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| ui.label("Rendering…"));
+            });
+            ctx.request_repaint();
+            return;
+        };
+        let tex_id = texture.id();
+        let tex_size = texture.size_vec2();
         let mut painted = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
@@ -882,7 +1063,7 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
         ui.label("(none)");
         return dirty;
     }
-    *sel = (*sel).min(history.current().locals.len() - 1);
+    clamp_selection(sel, history.current().locals.len());
 
     ui.horizontal(|ui| {
         let count = history.current().locals.len();
@@ -905,7 +1086,7 @@ fn local_adjustments(ui: &mut egui::Ui, history: &mut History<Settings>, sel: &m
     if history.current().locals.is_empty() {
         return dirty;
     }
-    *sel = (*sel).min(history.current().locals.len() - 1);
+    clamp_selection(sel, history.current().locals.len());
     let i = *sel;
 
     dirty |= local_shape_block(ui, history, i);
@@ -1073,5 +1254,91 @@ mod tests {
         assert_eq!(ci.pixels[0], egui::Color32::from_rgb(0, 0, 0));
         assert_eq!(ci.pixels[1], egui::Color32::from_rgb(188, 188, 188));
         assert_eq!(ci.pixels[2], egui::Color32::from_rgb(254, 254, 254));
+    }
+
+    #[test]
+    fn export_status_maps_ok_and_err() {
+        // The status line names the path on success and the error on failure.
+        assert_eq!(
+            export_status("out.tiff", Ok(())),
+            "Exported to out.tiff".to_owned()
+        );
+        let err = latent_export::save(&ImageBuf::new(0, 0), Path::new("out.png"))
+            .expect_err("zero dimension errors");
+        let msg = export_status("out.png", Err(err));
+        assert!(msg.starts_with("Export failed:"), "{msg}");
+    }
+
+    #[test]
+    fn clamp_selection_keeps_in_range() {
+        // Clamps to the last valid index, leaves an in-range index untouched, and
+        // collapses to 0 on an empty list.
+        let mut sel = 5;
+        clamp_selection(&mut sel, 3);
+        assert_eq!(sel, 2);
+        let mut sel = 1;
+        clamp_selection(&mut sel, 3);
+        assert_eq!(sel, 1);
+        let mut sel = 4;
+        clamp_selection(&mut sel, 0);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn render_state_gate_coalesces_to_one() {
+        // The in-flight gate runs at most one render at a time. A fresh state is
+        // idle; once a render is recorded it is busy, and a second request while
+        // busy must coalesce (set `pending`) rather than spawn another.
+        let mut state = RenderState::default();
+        assert!(!state.is_busy());
+
+        // Simulate a render in flight by recording a receiver.
+        let (_tx, rx) = channel::<RenderOutput>();
+        state.in_flight = Some(rx);
+        assert!(state.is_busy());
+
+        // A request arriving while busy coalesces instead of spawning.
+        if state.is_busy() {
+            state.pending = true;
+        }
+        assert!(state.pending, "a request during a render must be queued");
+
+        // When the render finishes the slot clears and the queued one can run.
+        state.in_flight = None;
+        assert!(!state.is_busy());
+        assert!(std::mem::take(&mut state.pending));
+    }
+
+    #[test]
+    fn render_job_export_writes_and_reports() {
+        // A `RenderJob` export runs the render and the file write off any UI, and
+        // reports a success status. `CpuBackend` with default settings renders
+        // the base unchanged, so a tiny image exercises the path cheaply.
+        let mut base = ImageBuf::new(2, 1);
+        base.set(0, 0, [0.0, 0.0, 0.0]);
+        base.set(1, 0, [0.5, 0.5, 0.5]);
+        let out = std::env::temp_dir().join("latent_render_job_export_test.tiff");
+        std::fs::remove_file(&out).ok();
+
+        let job = RenderJob {
+            base: Arc::new(base),
+            settings: Settings::default(),
+            backend: Arc::new(latent_cpu::CpuBackend),
+            kind: JobKind::Export {
+                output: out.clone(),
+            },
+        };
+        match job.run() {
+            RenderOutput::Export(status) => {
+                assert!(status.starts_with("Exported to"), "{status}");
+            }
+            RenderOutput::Preview(_) => panic!("an export job must report an export status"),
+        }
+        // A .tiff export is 16-bit by the format default.
+        assert!(matches!(
+            image::open(&out).unwrap().color(),
+            image::ColorType::Rgb16
+        ));
+        std::fs::remove_file(&out).ok();
     }
 }

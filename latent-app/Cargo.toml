@@ -20,3 +20,4 @@ latent-gpu = { path = "../latent-gpu" }
 latent-export = { path = "../latent-export" }
 clap = { version = "4", features = ["derive"] }
 eframe = "0.32"
+image = "0.25"

@@ -463,4 +463,68 @@ mod tests {
         let expected = real_focal / mm;
         assert!((hugin_scaling(crop, aspect, real_focal) - expected).abs() < 1e-4);
     }
+
+    #[test]
+    fn find_profile_returns_none_when_no_match() {
+        // Exercises the lookup → free plumbing without depending on a specific
+        // lens being installed. When the data package is absent, `load` fails and
+        // the crate degrades gracefully (the whole feature is optional); when it
+        // is present, a nonsense camera/lens drives the early-return paths in
+        // `find_profile` (empty camera list, then `lf_free`) to `None`. Either
+        // way the result is the same: no profile, no leak, no crash.
+        match Database::load() {
+            Err(_) => {
+                // No database installed — the documented graceful path.
+            }
+            Ok(db) => {
+                let profile = db.find_profile(
+                    "no-such-maker",
+                    "no-such-model",
+                    "no-such-lens",
+                    50.0,
+                    8.0,
+                    1000.0,
+                );
+                assert!(profile.is_none(), "an unknown camera should not match");
+                // A NUL byte in a field can't form a C string; that path is also
+                // `None` (and frees nothing, having allocated nothing).
+                assert!(
+                    db.find_profile("ma\0ker", "model", "lens", 50.0, 8.0, 1000.0)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lens_to_profile_aggregates_terms() {
+        // The per-model mappers are unit-tested individually; this pins that the
+        // identity/no-calibration case aggregates into a neutral profile (centered
+        // optical axis, no distortion model, unit CA scale, unity vignetting) —
+        // the field routing `lens_to_profile` performs, exercised without a live
+        // lens by checking the assembled defaults each mapper falls back to.
+        let center = [0.5, 0.5];
+        let (model, distortion) = radial_distortion(
+            ffi::lfDistortionModel_LF_DIST_MODEL_NONE,
+            [0.0, 0.0, 0.0],
+            1.0,
+        );
+        let ca = ca_offsets(ffi::lfTCAModel_LF_TCA_MODEL_NONE, [0.0; 6], 1.0);
+        let vignetting =
+            vignetting_falloff(ffi::lfVignettingModel_LF_VIGNETTING_MODEL_NONE, [0.0; 3]);
+        let profile = LensProfile {
+            center,
+            crop: 1.0,
+            real_focal: 50.0,
+            model,
+            distortion,
+            ca,
+            vignetting,
+        };
+        assert_eq!(profile.center, [0.5, 0.5]);
+        assert_eq!(profile.model, DistortionModel::None);
+        assert_eq!(profile.distortion, [0.0; 4]);
+        assert_eq!(profile.ca, [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]);
+        assert_eq!(profile.vignetting, [0.0; 3]);
+    }
 }

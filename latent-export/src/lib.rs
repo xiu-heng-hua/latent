@@ -100,23 +100,81 @@ pub fn to_srgb8(img: &ImageBuf) -> Vec<u8> {
     bytes
 }
 
+/// The output extensions we encode with the sRGB ICC profile embedded, lowercased
+/// and listed once so the rejection in [`save_buffer_with_icc`] and the depth
+/// default in [`recommended_depth`] cannot drift apart.
+const SUPPORTED_EXTENSIONS: &[&str] = &["png", "tif", "tiff", "jpg", "jpeg"];
+
+/// The lowercased extension of `path` if it is one we can write (carrying the
+/// sRGB profile), else `None` — for an unsupported or missing extension. The one
+/// place that classifies an output path by format.
+fn supported_extension(path: &Path) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    SUPPORTED_EXTENSIONS.contains(&ext.as_str()).then_some(ext)
+}
+
+/// A bit depth for an encoded file: 8 bits ([`save`]) or 16 ([`save_16`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    Eight,
+    Sixteen,
+}
+
+/// The depth that best suits a path's format: 16-bit for the formats whose extra
+/// precision the wide-gamut, highlight-rolled pipeline can fill (`tif`/`tiff`,
+/// and `png`, which has a real `Rgb16`), 8-bit for JPEG (no 16-bit path).
+/// `None` for an unsupported extension — the caller surfaces that as the same
+/// rejection [`save_buffer_with_icc`] would raise.
+pub fn recommended_depth(path: &Path) -> Option<Depth> {
+    supported_extension(path).map(|ext| match ext.as_str() {
+        "jpg" | "jpeg" => Depth::Eight,
+        _ => Depth::Sixteen,
+    })
+}
+
+/// A typed error for an image that cannot be encoded because a dimension is zero
+/// (`to_srgb8` would yield an empty buffer the encoders mishandle), or because
+/// the pixel buffer would overflow the requested dimensions.
+fn invalid_dimensions(message: &str) -> image::ImageError {
+    image::ImageError::Parameter(image::error::ParameterError::from_kind(
+        image::error::ParameterErrorKind::Generic(message.to_owned()),
+    ))
+}
+
 /// Encode a linear-light **working-space** image to 8-bit sRGB and write it to
 /// `path`.
 ///
 /// Converts the working space (wide-gamut linear) to linear sRGB, rolls off
 /// highlights into display range, gamma-encodes (sRGB OETF), and quantizes to
 /// 8 bits via [`to_srgb8`]. The format is chosen from the path's extension
-/// (e.g. `.jpg`, `.png`, `.tiff`); an sRGB ICC profile is embedded.
+/// (e.g. `.jpg`, `.png`, `.tiff`); an sRGB ICC profile is embedded. Returns an
+/// error for a zero dimension or an unsupported extension — never a degenerate
+/// or untagged file.
 pub fn save(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
+    if img.width() == 0 || img.height() == 0 {
+        return Err(invalid_dimensions(
+            "cannot encode an image with a zero dimension",
+        ));
+    }
     let out = image::RgbImage::from_raw(img.width(), img.height(), to_srgb8(img))
-        .expect("buffer length matches the image dimensions");
+        .ok_or_else(|| invalid_dimensions("image dimensions overflow the pixel buffer"))?;
     save_buffer_with_icc(&out, path)
 }
 
 /// Encode the image to **16-bit** sRGB (same output transform as [`save`]) and
 /// write it to `path`. The extra depth preserves the gradients a wide-gamut,
-/// highlight-rolled working pipeline produces, which 8 bits would band.
+/// highlight-rolled working pipeline produces, which 8 bits would band. Returns
+/// an error for a zero dimension or an unsupported extension.
 pub fn save_16(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
+    if img.width() == 0 || img.height() == 0 {
+        return Err(invalid_dimensions(
+            "cannot encode an image with a zero dimension",
+        ));
+    }
     let to_srgb = color::linear_working_to_linear_srgb();
     let mut out = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(img.width(), img.height());
     for y in 0..img.height() {
@@ -127,6 +185,21 @@ pub fn save_16(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
         }
     }
     save_buffer_with_icc(&out, path)
+}
+
+/// Encode `img` to `path` at the given depth, or — when `depth` is `None` — at
+/// the depth [`recommended_depth`] picks for the path's format. The single entry
+/// point both the CLI and the editor route exports through, so they cannot drift
+/// on which format gets 16 bits. An unsupported extension is rejected by the
+/// underlying [`save`]/[`save_16`] (it reaches [`save_buffer_with_icc`] either
+/// way), so it surfaces the same typed error regardless of the chosen depth.
+pub fn save_auto(img: &ImageBuf, path: &Path, depth: Option<Depth>) -> image::ImageResult<()> {
+    // Default by format; for an unsupported extension fall through to `save`,
+    // which routes to `save_buffer_with_icc` and raises the extension error.
+    match depth.or_else(|| recommended_depth(path)) {
+        Some(Depth::Sixteen) => save_16(img, path),
+        _ => save(img, path),
+    }
 }
 
 /// The sRGB ICC profile bytes for tagging output — our output transform produces
@@ -140,7 +213,9 @@ fn srgb_icc() -> Vec<u8> {
 
 /// Write an 8- or 16-bit RGB buffer to `path` with the sRGB ICC profile embedded
 /// via the per-format encoder (the high-level `save` can't carry ICC). Format is
-/// chosen by extension; an unknown extension falls back to an untagged save.
+/// chosen by extension. An unknown or missing extension is **rejected** with a
+/// typed error rather than written untagged — every file this tool emits carries
+/// the sRGB profile, so a color-managed viewer reads it correctly.
 fn save_buffer_with_icc<P>(
     buf: &image::ImageBuffer<P, Vec<P::Subpixel>>,
     path: &Path,
@@ -150,12 +225,19 @@ where
     [P::Subpixel]: image::EncodableLayout,
 {
     use image::ImageEncoder;
+    let Some(ext) = supported_extension(path) else {
+        // The empty/no-extension case lands here too (`""` is not supported).
+        let bad = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        return Err(image::ImageError::Parameter(
+            image::error::ParameterError::from_kind(image::error::ParameterErrorKind::Generic(
+                format!("unsupported output extension '{bad}'; use png, tif/tiff, or jpg/jpeg"),
+            )),
+        ));
+    };
     let icc = srgb_icc();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     match ext.as_str() {
         "png" => {
             let mut enc = image::codecs::png::PngEncoder::new(std::fs::File::create(path)?);
@@ -169,13 +251,13 @@ where
                 .map_err(image::ImageError::Unsupported)?;
             buf.write_with_encoder(enc)
         }
-        "jpg" | "jpeg" => {
+        // The supported set guarantees this is `jpg`/`jpeg`.
+        _ => {
             let mut enc = image::codecs::jpeg::JpegEncoder::new(std::fs::File::create(path)?);
             enc.set_icc_profile(icc)
                 .map_err(image::ImageError::Unsupported)?;
             buf.write_with_encoder(enc)
         }
-        _ => buf.save(path),
     }
 }
 
@@ -315,6 +397,132 @@ mod tests {
             "output should carry an embedded ICC profile"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_jpg_embeds_icc() {
+        // The JPEG path shares `save_buffer_with_icc` with png/tiff, but only
+        // png/tiff were covered; pin that a `.jpg` carries the profile too.
+        use image::ImageDecoder;
+        let mut img = ImageBuf::new(1, 1);
+        img.set(0, 0, [0.5, 0.5, 0.5]);
+        let path = std::env::temp_dir().join("latent_export_icc_jpg_test.jpg");
+        save(&img, &path).expect("save should succeed");
+
+        let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::BufReader::new(
+            std::fs::File::open(&path).unwrap(),
+        ))
+        .expect("decode jpeg");
+        let embedded = decoder.icc_profile().expect("icc read ok");
+        assert!(
+            embedded.is_some_and(|p| !p.is_empty()),
+            "jpeg output should carry an embedded ICC profile"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_rejects_unknown_extension() {
+        // An unsupported or typo'd extension must never write an untagged file;
+        // it returns an error naming the bad extension and the supported set.
+        let mut img = ImageBuf::new(1, 1);
+        img.set(0, 0, [0.5, 0.5, 0.5]);
+        let path = std::env::temp_dir().join("latent_export_unknown_ext_test.bmp");
+        std::fs::remove_file(&path).ok();
+
+        let err = save(&img, &path).expect_err("unsupported extension should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bmp"),
+            "message names the bad extension: {msg}"
+        );
+        assert!(
+            msg.contains("png"),
+            "message names the supported set: {msg}"
+        );
+        // No file written on the rejected path.
+        assert!(
+            !path.exists(),
+            "no file should be written for a rejected extension"
+        );
+
+        // The 16-bit and no-extension paths reject identically.
+        assert!(save_16(&img, &path).is_err());
+        let no_ext = std::env::temp_dir().join("latent_export_no_ext_test");
+        assert!(save(&img, &no_ext).is_err());
+        assert!(!no_ext.exists());
+    }
+
+    #[test]
+    fn save_rejects_zero_dimension() {
+        // A zero-dimension image yields an empty buffer that slips past the
+        // length check; both encoders must return an error and write nothing.
+        let zero_w = ImageBuf::new(0, 4);
+        let zero_h = ImageBuf::new(4, 0);
+        let zero = ImageBuf::new(0, 0);
+
+        for img in [&zero_w, &zero_h, &zero] {
+            let path = std::env::temp_dir().join("latent_export_zero_dim_test.png");
+            std::fs::remove_file(&path).ok();
+            let err = save(img, &path).expect_err("zero dimension should error");
+            assert!(err.to_string().contains("zero dimension"), "message: {err}");
+            assert!(
+                !path.exists(),
+                "no file should be written for a zero dimension"
+            );
+
+            let tpath = std::env::temp_dir().join("latent_export_zero_dim16_test.tiff");
+            std::fs::remove_file(&tpath).ok();
+            assert!(save_16(img, &tpath).is_err());
+            assert!(!tpath.exists());
+        }
+    }
+
+    #[test]
+    fn recommended_depth_routes_by_format() {
+        // 16-bit for the formats whose precision the pipeline can fill, 8-bit for
+        // JPEG, and `None` (deferred to the extension rejection) for the rest.
+        assert_eq!(recommended_depth(Path::new("o.tiff")), Some(Depth::Sixteen));
+        assert_eq!(recommended_depth(Path::new("o.tif")), Some(Depth::Sixteen));
+        assert_eq!(recommended_depth(Path::new("o.png")), Some(Depth::Sixteen));
+        assert_eq!(recommended_depth(Path::new("o.jpg")), Some(Depth::Eight));
+        assert_eq!(recommended_depth(Path::new("o.jpeg")), Some(Depth::Eight));
+        assert_eq!(recommended_depth(Path::new("o.bmp")), None);
+        assert_eq!(recommended_depth(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn save_auto_picks_16bit_for_tiff_and_8bit_for_jpeg() {
+        // `save_auto` with no explicit depth must produce a 16-bit TIFF and an
+        // 8-bit JPEG, and honor an explicit override.
+        let mut img = ImageBuf::new(2, 1);
+        img.set(0, 0, [0.0, 0.0, 0.0]);
+        img.set(1, 0, [0.5, 0.5, 0.5]);
+
+        let tiff = std::env::temp_dir().join("latent_export_auto_tiff_test.tiff");
+        save_auto(&img, &tiff, None).expect("auto tiff");
+        assert!(matches!(
+            image::open(&tiff).unwrap().color(),
+            image::ColorType::Rgb16
+        ));
+        std::fs::remove_file(&tiff).ok();
+
+        let jpg = std::env::temp_dir().join("latent_export_auto_jpg_test.jpg");
+        save_auto(&img, &jpg, None).expect("auto jpg");
+        assert!(matches!(
+            image::open(&jpg).unwrap().color(),
+            image::ColorType::Rgb8
+        ));
+        std::fs::remove_file(&jpg).ok();
+
+        // An explicit 8-bit override forces Rgb8 even on a .tiff.
+        let tiff8 = std::env::temp_dir().join("latent_export_auto_tiff8_test.tiff");
+        save_auto(&img, &tiff8, Some(Depth::Eight)).expect("forced 8-bit tiff");
+        assert!(matches!(
+            image::open(&tiff8).unwrap().color(),
+            image::ColorType::Rgb8
+        ));
+        std::fs::remove_file(&tiff8).ok();
     }
 
     #[test]
