@@ -10,18 +10,20 @@
 //! software rasterizer); [`GpuBackend::new`] returns an error in that case so
 //! the caller can stay on the CPU. No type here assumes a GPU is present.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use latent_cpu::CpuBackend;
-use latent_edit::Mask;
+use latent_edit::{DistortionModel, Mask};
 use latent_image::ImageBuf;
 use latent_image::tone;
 use latent_pipeline::{
     Backend, CombineKind, DenoiseParams, PointOp, RadialGain, Transform, Warp, radius_window,
 };
-use wgpu::util::DeviceExt;
 
 /// Uniform parameters for the `map_pixels` compute shader. Layout matches the
 /// `Params` struct in `map_pixels.wgsl` (all 4-byte scalars, 32 bytes total).
@@ -57,8 +59,12 @@ struct BlurParams {
     vertical: u32,
 }
 
-/// Uniform parameters for `resample.wgsl`. Layout matches the WGSL `Params`
-/// (16 scalar fields padded to a 16-byte multiple).
+/// Uniform parameters for `resample.wgsl`. Layout matches the WGSL `Params`.
+///
+/// The trailing `_pad: [f32; 3]` rounds the 13-scalar (52-byte) body up to a
+/// 16-byte multiple (64 B) to satisfy std140 uniform struct alignment. The
+/// scalars are laid out as plain 4-aligned `f32`s (no `vec`/`array` fields) to
+/// dodge the std140 stride trap; do not remove the padding.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ResampleParams {
@@ -68,6 +74,155 @@ struct ResampleParams {
     src_height: u32,
     m: [f32; 9],
     _pad: [f32; 3],
+}
+
+/// Uniform parameters for `warp.wgsl`. Layout matches the WGSL `Params`.
+///
+/// As with [`ResampleParams`], every field is a 4-aligned scalar (no `vec`/
+/// `array` fields) so the std140 layout is the contiguous packing bytemuck
+/// produces, and the trailing `_pad` rounds the 35-scalar (140-byte) body up to a
+/// 16-byte multiple (144 B) to satisfy std140 uniform struct alignment; do not
+/// remove the padding.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WarpParams {
+    out_width: u32,
+    out_height: u32,
+    src_width: u32,
+    src_height: u32,
+    m: [f32; 9],
+    center: [f32; 2],
+    inv_norm: f32,
+    radial: [f32; 4],
+    model: u32,
+    chromatic: u32,
+    /// Per-channel CA scale `[b, c, v]` for r, g, b (green is `[0, 0, 1]`).
+    ca: [f32; 9],
+    _pad: [f32; 1],
+}
+
+/// Distortion model discriminants matching the `warp.wgsl` switch (None, Poly3,
+/// Poly5, PTLens).
+const MODEL_NONE: u32 = 0;
+const MODEL_POLY3: u32 = 1;
+const MODEL_POLY5: u32 = 2;
+const MODEL_PTLENS: u32 = 3;
+
+/// Uniform parameters for `radial_gain.wgsl`. Layout matches the WGSL `Params`.
+///
+/// As with the other uniforms, the fields are 4-aligned scalars and the trailing
+/// `_pad` rounds the 9-scalar (36-byte) body up to a 16-byte multiple (48 B) to
+/// satisfy std140 uniform struct alignment; do not remove the padding.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RadialGainParams {
+    width: u32,
+    height: u32,
+    center: [f32; 2],
+    inv_norm: f32,
+    poly: [f32; 3],
+    reciprocal: u32,
+    _pad: [f32; 3],
+}
+
+/// Uniform parameters for `combine.wgsl`. Four 4-byte scalars (16 B) — already a
+/// 16-byte multiple, so no std140 padding is needed.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CombineParams {
+    n_pixels: u32,
+    row_stride: u32,
+    kind: u32,
+    gain: f32,
+}
+
+const COMBINE_UNSHARP: u32 = 0;
+const COMBINE_LOCAL_CONTRAST: u32 = 1;
+
+/// A small pool of reusable GPU buffers, keyed by `(usage, size)`, so the hot
+/// primitives don't allocate a fresh `data`/`params`/`staging` buffer on every
+/// call. A render fires the same handful of buffer shapes over and over (the
+/// working image size, the uniform sizes), so recycling them cuts the per-call
+/// allocation churn the round-trips otherwise pay for. Buffers are taken on
+/// acquire and returned on drop of the [`PooledBuffer`] guard.
+#[derive(Default)]
+struct BufferPool {
+    free: Mutex<HashMap<(wgpu::BufferUsages, u64), Vec<wgpu::Buffer>>>,
+    /// Number of fresh `create_buffer` calls the pool could not satisfy from its
+    /// free list — i.e. genuine allocations. Used by the tests to prove buffers
+    /// are reused across a multi-primitive render.
+    allocations: AtomicU64,
+}
+
+impl BufferPool {
+    /// Take a buffer of exactly `size` bytes with `usage` from the free list, or
+    /// allocate one if none is available.
+    fn acquire(&self, device: &wgpu::Device, usage: wgpu::BufferUsages, size: u64) -> wgpu::Buffer {
+        let key = (usage, size);
+        if let Some(buf) = self
+            .free
+            .lock()
+            .expect("buffer pool poisoned")
+            .get_mut(&key)
+            .and_then(Vec::pop)
+        {
+            return buf;
+        }
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pool"),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Return a buffer to the free list, keyed by its usage and size.
+    fn release(&self, usage: wgpu::BufferUsages, size: u64, buf: wgpu::Buffer) {
+        self.free
+            .lock()
+            .expect("buffer pool poisoned")
+            .entry((usage, size))
+            .or_default()
+            .push(buf);
+    }
+}
+
+/// A buffer borrowed from a [`BufferPool`], returned to it on drop.
+struct PooledBuffer<'a> {
+    pool: &'a BufferPool,
+    usage: wgpu::BufferUsages,
+    size: u64,
+    buf: Option<wgpu::Buffer>,
+}
+
+impl<'a> PooledBuffer<'a> {
+    fn new(
+        pool: &'a BufferPool,
+        device: &wgpu::Device,
+        usage: wgpu::BufferUsages,
+        size: u64,
+    ) -> Self {
+        let buf = pool.acquire(device, usage, size);
+        Self {
+            pool,
+            usage,
+            size,
+            buf: Some(buf),
+        }
+    }
+
+    fn buffer(&self) -> &wgpu::Buffer {
+        self.buf.as_ref().expect("pooled buffer present")
+    }
+}
+
+impl Drop for PooledBuffer<'_> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.release(self.usage, self.size, buf);
+        }
+    }
 }
 
 /// A rendering backend backed by a wgpu device.
@@ -81,12 +236,32 @@ pub struct GpuBackend {
     /// Compute pipeline for the `map_pixels` primitive.
     map_pipeline: wgpu::ComputePipeline,
     map_bind_group_layout: wgpu::BindGroupLayout,
-    /// Compute pipelines for the input→output primitives (blur, resample).
+    /// Compute pipelines for the input→output primitives (blur, resample, warp).
     blur_pipeline: wgpu::ComputePipeline,
     resample_pipeline: wgpu::ComputePipeline,
+    warp_pipeline: wgpu::ComputePipeline,
     /// Shared layout for input→output primitives: src (read), dst (read/write),
     /// params (uniform).
     io_bind_group_layout: wgpu::BindGroupLayout,
+    /// Compute pipeline for the in-place radial gain primitive.
+    radial_gain_pipeline: wgpu::ComputePipeline,
+    /// Layout for the in-place radial gain: data (read/write), params (uniform).
+    radial_gain_bind_group_layout: wgpu::BindGroupLayout,
+    /// Compute pipeline for the two-input element-wise combine primitive.
+    combine_pipeline: wgpu::ComputePipeline,
+    /// Layout for combine: img (read/write), other (read), params (uniform).
+    combine_bind_group_layout: wgpu::BindGroupLayout,
+    /// Reusable buffers, recycled across primitive calls to cut allocation churn.
+    pool: BufferPool,
+    /// Count of GPU→host readbacks (one per dispatched primitive). Instrumentation
+    /// for the tests; a render that delegates a primitive to the CPU does not bump
+    /// it, so it tracks the true round-trip count.
+    readbacks: AtomicU64,
+    /// Test-only switch that makes [`read_staging`](Self::read_staging) report a
+    /// device-loss error on its next call, so the CPU-fallback path can be
+    /// exercised deterministically without an actual device loss.
+    #[cfg(test)]
+    force_readback_error: std::sync::atomic::AtomicBool,
     cpu: CpuBackend,
 }
 
@@ -102,6 +277,21 @@ impl fmt::Display for GpuUnavailable {
 }
 
 impl Error for GpuUnavailable {}
+
+/// A recoverable error from a GPU primitive — most importantly a mid-render
+/// device loss (`Outdated`/`Lost`) surfacing at poll/map time. The `Backend`
+/// impls catch it and re-run the primitive on the embedded CPU backend, so a lost
+/// device degrades the render to CPU rather than panicking.
+#[derive(Debug)]
+struct GpuError(String);
+
+impl fmt::Display for GpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GPU primitive failed: {}", self.0)
+    }
+}
+
+impl Error for GpuError {}
 
 impl GpuBackend {
     /// Try to acquire a GPU device and build a backend. Returns
@@ -173,6 +363,42 @@ impl GpuBackend {
             &io_bind_group_layout,
             include_str!("resample.wgsl"),
         );
+        let warp_pipeline = compute_pipeline(
+            &device,
+            "warp",
+            &io_bind_group_layout,
+            include_str!("warp.wgsl"),
+        );
+
+        // radial_gain: pixel data (read/write), params.
+        let radial_gain_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("radial_gain"),
+                entries: &[storage_entry(0, false), uniform_entry(1)],
+            });
+        let radial_gain_pipeline = compute_pipeline(
+            &device,
+            "radial_gain",
+            &radial_gain_bind_group_layout,
+            include_str!("radial_gain.wgsl"),
+        );
+
+        // combine: img (read/write), other (read), params.
+        let combine_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("combine"),
+                entries: &[
+                    storage_entry(0, false),
+                    storage_entry(1, true),
+                    uniform_entry(2),
+                ],
+            });
+        let combine_pipeline = compute_pipeline(
+            &device,
+            "combine",
+            &combine_bind_group_layout,
+            include_str!("combine.wgsl"),
+        );
 
         Ok(Self {
             device,
@@ -181,64 +407,83 @@ impl GpuBackend {
             map_bind_group_layout,
             blur_pipeline,
             resample_pipeline,
+            warp_pipeline,
             io_bind_group_layout,
+            radial_gain_pipeline,
+            radial_gain_bind_group_layout,
+            combine_pipeline,
+            combine_bind_group_layout,
+            pool: BufferPool::default(),
+            readbacks: AtomicU64::new(0),
+            #[cfg(test)]
+            force_readback_error: std::sync::atomic::AtomicBool::new(false),
             cpu: CpuBackend,
         })
     }
 
-    /// Run the `map_pixels` compute shader over the image in place.
-    fn run_map_pixels(&self, img: &mut ImageBuf, mut params: MapParams, lut: &[f32]) {
+    /// Take a pooled buffer of `usage`/`size` and upload `contents` into it
+    /// (`queue.write_buffer`, since a pooled buffer can't use `_init`).
+    fn pooled_with(&self, usage: wgpu::BufferUsages, contents: &[u8]) -> PooledBuffer<'_> {
+        let pooled = PooledBuffer::new(&self.pool, &self.device, usage, contents.len() as u64);
+        self.queue.write_buffer(pooled.buffer(), 0, contents);
+        pooled
+    }
+
+    /// Run the `map_pixels` compute shader over the image in place. Returns the
+    /// result, or `Err` on device loss so the caller can fall back to the CPU.
+    fn run_map_pixels(
+        &self,
+        img: &ImageBuf,
+        mut params: MapParams,
+        lut: &[f32],
+    ) -> Result<Vec<f32>, GpuError> {
         // 2D workgroup grid: the x extent alone can exceed the per-dimension
         // limit on a large image, so spill into y and reconstruct the index.
         let groups = params.n_pixels.div_ceil(MAP_WORKGROUP);
         let max_dim = self.device.limits().max_compute_workgroups_per_dimension;
         let gx = groups.min(max_dim).max(1);
         let gy = groups.div_ceil(gx);
+        // `map_params` left this as a placeholder 0; fill it in here from the 2D
+        // grid width now that `gx` is known, so the shader reconstructs the linear
+        // pixel index across the y-spill.
         params.row_stride = gx * MAP_WORKGROUP;
 
         let bytes: &[u8] = bytemuck::cast_slice(img.pixels());
-        let data_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("map_pixels.data"),
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            });
-        let params_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("map_pixels.params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let lut_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("map_pixels.lut"),
-                contents: bytemuck::cast_slice(lut),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("map_pixels.staging"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let data_buf = self.pooled_with(
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            bytes,
+        );
+        let params_buf = self.pooled_with(
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            bytemuck::bytes_of(&params),
+        );
+        let lut_buf = self.pooled_with(
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            bytemuck::cast_slice(lut),
+        );
+        let staging = PooledBuffer::new(
+            &self.pool,
+            &self.device,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            bytes.len() as u64,
+        );
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("map_pixels"),
             layout: &self.map_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: data_buf.as_entire_binding(),
+                    resource: data_buf.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: params_buf.as_entire_binding(),
+                    resource: params_buf.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: lut_buf.as_entire_binding(),
+                    resource: lut_buf.buffer().as_entire_binding(),
                 },
             ],
         });
@@ -252,34 +497,51 @@ impl GpuBackend {
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
         }
-        encoder.copy_buffer_to_buffer(&data_buf, 0, &staging, 0, bytes.len() as u64);
+        encoder.copy_buffer_to_buffer(
+            data_buf.buffer(),
+            0,
+            staging.buffer(),
+            0,
+            bytes.len() as u64,
+        );
         self.queue.submit([encoder.finish()]);
-
-        // Block until the GPU finishes, then copy the result back in place.
-        let result = self.read_staging(&staging);
-        bytemuck::cast_slice_mut(img.pixels_mut()).copy_from_slice(&result);
+        self.readbacks.fetch_add(1, Ordering::Relaxed);
+        self.read_staging(staging.buffer())
     }
 
-    /// Block until `staging` is mapped and return its contents as `f32`s.
-    fn read_staging(&self, staging: &wgpu::Buffer) -> Vec<f32> {
+    /// Block until `staging` is mapped and return its contents as `f32`s, or a
+    /// recoverable [`GpuError`] on poll/map failure (a device loss). The caller
+    /// falls back to the CPU on `Err` rather than aborting the render.
+    fn read_staging(&self, staging: &wgpu::Buffer) -> Result<Vec<f32>, GpuError> {
+        // Test hook: simulate a one-shot device-loss readback failure so the
+        // CPU-fallback path can be exercised without an actual lost device.
+        #[cfg(test)]
+        if self.force_readback_error.swap(false, Ordering::Relaxed) {
+            return Err(GpuError("simulated device loss".into()));
+        }
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // A lost/outdated device surfaces here; propagate it instead of panicking.
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
-        rx.recv().expect("map channel closed").expect("buffer map");
+            .map_err(|e| GpuError(format!("poll: {e}")))?;
+        rx.recv()
+            .map_err(|e| GpuError(format!("map channel closed: {e}")))?
+            .map_err(|e| GpuError(format!("buffer map: {e}")))?;
         let mapped = slice.get_mapped_range();
         let out = bytemuck::cast_slice(&mapped).to_vec();
         drop(mapped);
         staging.unmap();
-        out
+        Ok(out)
     }
 
-    /// Run an input→output compute pipeline (blur, resample): upload `src`,
-    /// dispatch a 2D workgroup grid, and read back `out_floats` results.
+    /// Run an input→output compute pipeline (blur, resample, warp): upload `src`,
+    /// dispatch a 2D workgroup grid, and read back `out_floats` results — or `Err`
+    /// on device loss so the caller can fall back to the CPU. All buffers come
+    /// from the pool.
     fn run_io(
         &self,
         pipeline: &wgpu::ComputePipeline,
@@ -287,49 +549,45 @@ impl GpuBackend {
         out_floats: usize,
         params: &[u8],
         groups: (u32, u32),
-    ) -> Vec<f32> {
-        let src_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("io.src"),
-                contents: bytemuck::cast_slice(src),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+    ) -> Result<Vec<f32>, GpuError> {
+        let src_buf = self.pooled_with(
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            bytemuck::cast_slice(src),
+        );
         let out_bytes = (out_floats * std::mem::size_of::<f32>()) as u64;
-        let dst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("io.dst"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let params_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("io.params"),
-                contents: params,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("io.staging"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let dst_buf = PooledBuffer::new(
+            &self.pool,
+            &self.device,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            out_bytes,
+        );
+        let params_buf = self.pooled_with(
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            params,
+        );
+        let staging = PooledBuffer::new(
+            &self.pool,
+            &self.device,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            out_bytes,
+        );
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("io"),
             layout: &self.io_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: src_buf.as_entire_binding(),
+                    resource: src_buf.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: dst_buf.as_entire_binding(),
+                    resource: dst_buf.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: params_buf.as_entire_binding(),
+                    resource: params_buf.buffer().as_entire_binding(),
                 },
             ],
         });
@@ -342,9 +600,155 @@ impl GpuBackend {
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, 1);
         }
-        encoder.copy_buffer_to_buffer(&dst_buf, 0, &staging, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(dst_buf.buffer(), 0, staging.buffer(), 0, out_bytes);
         self.queue.submit([encoder.finish()]);
-        self.read_staging(&staging)
+        self.readbacks.fetch_add(1, Ordering::Relaxed);
+        self.read_staging(staging.buffer())
+    }
+
+    /// Run the in-place `radial_gain` shader over the image (a 2D grid). Returns
+    /// the modified pixels, or `Err` on device loss for a CPU fallback.
+    fn run_radial_gain(
+        &self,
+        img: &ImageBuf,
+        params: &RadialGainParams,
+    ) -> Result<Vec<f32>, GpuError> {
+        let bytes: &[u8] = bytemuck::cast_slice(img.pixels());
+        let data_buf = self.pooled_with(
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            bytes,
+        );
+        let params_buf = self.pooled_with(
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            bytemuck::bytes_of(params),
+        );
+        let staging = PooledBuffer::new(
+            &self.pool,
+            &self.device,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            bytes.len() as u64,
+        );
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("radial_gain"),
+            layout: &self.radial_gain_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: data_buf.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.buffer().as_entire_binding(),
+                },
+            ],
+        });
+        let groups = (
+            img.width().div_ceil(IO_WORKGROUP),
+            img.height().div_ceil(IO_WORKGROUP),
+        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.radial_gain_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(groups.0, groups.1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            data_buf.buffer(),
+            0,
+            staging.buffer(),
+            0,
+            bytes.len() as u64,
+        );
+        self.queue.submit([encoder.finish()]);
+        self.readbacks.fetch_add(1, Ordering::Relaxed);
+        self.read_staging(staging.buffer())
+    }
+
+    /// Run the two-input `combine` shader over `img`/`other` (a 1D grid spilled
+    /// into y like `map_pixels`). Returns the combined pixels, or `Err` on device
+    /// loss for a CPU fallback.
+    fn run_combine(
+        &self,
+        img: &ImageBuf,
+        other: &ImageBuf,
+        kind: u32,
+        gain: f32,
+    ) -> Result<Vec<f32>, GpuError> {
+        let n_pixels = img.len() as u32;
+        let groups = n_pixels.div_ceil(MAP_WORKGROUP);
+        let max_dim = self.device.limits().max_compute_workgroups_per_dimension;
+        let gx = groups.min(max_dim).max(1);
+        let gy = groups.div_ceil(gx);
+        let params = CombineParams {
+            n_pixels,
+            row_stride: gx * MAP_WORKGROUP,
+            kind,
+            gain,
+        };
+
+        let img_bytes: &[u8] = bytemuck::cast_slice(img.pixels());
+        let img_buf = self.pooled_with(
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            img_bytes,
+        );
+        let other_buf = self.pooled_with(
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            bytemuck::cast_slice(other.pixels()),
+        );
+        let params_buf = self.pooled_with(
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            bytemuck::bytes_of(&params),
+        );
+        let staging = PooledBuffer::new(
+            &self.pool,
+            &self.device,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            img_bytes.len() as u64,
+        );
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("combine"),
+            layout: &self.combine_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: img_buf.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: other_buf.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.buffer().as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.combine_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            img_buf.buffer(),
+            0,
+            staging.buffer(),
+            0,
+            img_bytes.len() as u64,
+        );
+        self.queue.submit([encoder.finish()]);
+        self.readbacks.fetch_add(1, Ordering::Relaxed);
+        self.read_staging(staging.buffer())
     }
 }
 
@@ -354,6 +758,9 @@ fn map_params(op: &PointOp, n_pixels: u32) -> (MapParams, Vec<f32>) {
     let mut p = MapParams {
         op: OP_GAIN,
         n_pixels,
+        // Placeholder 0; filled in at dispatch from the 2D grid width (see
+        // `run_map_pixels`, which sets it to `gx * MAP_WORKGROUP` once `gx` is
+        // known).
         row_stride: 0,
         amount: 0.0,
         gamma: 0.0,
@@ -468,7 +875,11 @@ impl Backend for GpuBackend {
             return;
         }
         let (params, lut) = map_params(op, img.len() as u32);
-        self.run_map_pixels(img, params, &lut);
+        match self.run_map_pixels(img, params, &lut) {
+            Ok(result) => bytemuck::cast_slice_mut(img.pixels_mut()).copy_from_slice(&result),
+            // Device loss mid-render: fall back to the CPU rather than panic.
+            Err(_) => self.cpu.map_pixels(img, op),
+        }
     }
 
     fn blur(&self, img: &ImageBuf, radius: f32) -> ImageBuf {
@@ -484,36 +895,61 @@ impl Backend for GpuBackend {
         let groups = (w.div_ceil(IO_WORKGROUP), h.div_ceil(IO_WORKGROUP));
         let src: &[f32] = bytemuck::cast_slice(img.pixels());
 
-        // Separable box blur: a horizontal pass, then a vertical pass over it.
-        let horizontal = self.run_io(
-            &self.blur_pipeline,
-            src,
-            n_floats,
-            bytemuck::bytes_of(&BlurParams {
-                width: w,
-                height: h,
-                radius: r,
-                vertical: 0,
-            }),
-            groups,
-        );
-        let vertical = self.run_io(
-            &self.blur_pipeline,
-            &horizontal,
-            n_floats,
-            bytemuck::bytes_of(&BlurParams {
-                width: w,
-                height: h,
-                radius: r,
-                vertical: 1,
-            }),
-            groups,
-        );
-        floats_to_image(w, h, &vertical)
+        // Separable box blur: a horizontal pass, then a vertical pass over it. A
+        // device loss in either pass degrades the whole blur to the CPU.
+        let blurred = self
+            .run_io(
+                &self.blur_pipeline,
+                src,
+                n_floats,
+                bytemuck::bytes_of(&BlurParams {
+                    width: w,
+                    height: h,
+                    radius: r,
+                    vertical: 0,
+                }),
+                groups,
+            )
+            .and_then(|horizontal| {
+                self.run_io(
+                    &self.blur_pipeline,
+                    &horizontal,
+                    n_floats,
+                    bytemuck::bytes_of(&BlurParams {
+                        width: w,
+                        height: h,
+                        radius: r,
+                        vertical: 1,
+                    }),
+                    groups,
+                )
+            });
+        match blurred {
+            Ok(vertical) => floats_to_image(w, h, &vertical),
+            Err(_) => self.cpu.blur(img, radius),
+        }
     }
 
     fn combine(&self, img: &mut ImageBuf, other: &ImageBuf, kind: &CombineKind) {
-        self.cpu.combine(img, other, kind);
+        if img.is_empty() {
+            return;
+        }
+        // Unsharp and LocalContrast are simple element-wise/midtone kernels and run
+        // in `combine.wgsl`. UnsharpLuma needs the full working→XYZ→Lab chain and
+        // its inverse — the same transcendental matrix path that keeps saturation
+        // on the CPU — so it stays CPU-delegated, where CPU == GPU is exact.
+        let (kind_id, gain) = match *kind {
+            CombineKind::Unsharp { gain } => (COMBINE_UNSHARP, gain),
+            CombineKind::LocalContrast { amount } => (COMBINE_LOCAL_CONTRAST, amount),
+            CombineKind::UnsharpLuma { .. } => {
+                self.cpu.combine(img, other, kind);
+                return;
+            }
+        };
+        match self.run_combine(img, other, kind_id, gain) {
+            Ok(result) => bytemuck::cast_slice_mut(img.pixels_mut()).copy_from_slice(&result),
+            Err(_) => self.cpu.combine(img, other, kind),
+        }
     }
 
     fn resample(&self, img: &ImageBuf, transform: &Transform) -> ImageBuf {
@@ -537,27 +973,97 @@ impl Backend for GpuBackend {
         let n_floats = ow as usize * oh as usize * 3;
         let groups = (ow.div_ceil(IO_WORKGROUP), oh.div_ceil(IO_WORKGROUP));
         let src: &[f32] = bytemuck::cast_slice(img.pixels());
-        let out = self.run_io(
+        match self.run_io(
             &self.resample_pipeline,
             src,
             n_floats,
             bytemuck::bytes_of(&params),
             groups,
-        );
-        floats_to_image(ow, oh, &out)
+        ) {
+            Ok(out) => floats_to_image(ow, oh, &out),
+            Err(_) => self.cpu.resample(img, transform),
+        }
     }
 
     fn warp(&self, img: &ImageBuf, w: &Warp) -> ImageBuf {
-        // The non-affine radial warp has no WGSL shader; delegate the whole
-        // geometry resample to the CPU so the composed (homography ∘ radial)
-        // lookup stays one interpolation. A WGSL port could follow later.
-        self.cpu.warp(img, w)
+        // The general (homography ∘ radial ∘ per-channel CA) lookup runs in
+        // `warp.wgsl`, a transcription of `Warp::map`/`map_channel` sharing the
+        // Catmull-Rom cubic + minification prefilter of `resample.wgsl` — one
+        // interpolation, GPU-resident.
+        let (ow, oh) = (w.output.width, w.output.height);
+        if ow == 0 || oh == 0 || img.is_empty() {
+            return ImageBuf::new(ow, oh);
+        }
+        let m = w.m;
+        let model = match w.model {
+            DistortionModel::None => MODEL_NONE,
+            DistortionModel::Poly3 => MODEL_POLY3,
+            DistortionModel::Poly5 => MODEL_POLY5,
+            DistortionModel::Ptlens => MODEL_PTLENS,
+        };
+        let params = WarpParams {
+            out_width: ow,
+            out_height: oh,
+            src_width: img.width(),
+            src_height: img.height(),
+            m: [
+                m[0][0], m[0][1], m[0][2], //
+                m[1][0], m[1][1], m[1][2], //
+                m[2][0], m[2][1], m[2][2],
+            ],
+            center: w.center,
+            inv_norm: w.inv_norm,
+            radial: w.radial,
+            model,
+            chromatic: w.has_chromatic() as u32,
+            ca: [
+                w.channel_scale[0][0],
+                w.channel_scale[0][1],
+                w.channel_scale[0][2],
+                w.channel_scale[1][0],
+                w.channel_scale[1][1],
+                w.channel_scale[1][2],
+                w.channel_scale[2][0],
+                w.channel_scale[2][1],
+                w.channel_scale[2][2],
+            ],
+            _pad: [0.0; 1],
+        };
+        let n_floats = ow as usize * oh as usize * 3;
+        let groups = (ow.div_ceil(IO_WORKGROUP), oh.div_ceil(IO_WORKGROUP));
+        let src: &[f32] = bytemuck::cast_slice(img.pixels());
+        match self.run_io(
+            &self.warp_pipeline,
+            src,
+            n_floats,
+            bytemuck::bytes_of(&params),
+            groups,
+        ) {
+            Ok(out) => floats_to_image(ow, oh, &out),
+            Err(_) => self.cpu.warp(img, w),
+        }
     }
 
     fn apply_radial_gain(&self, img: &mut ImageBuf, gain: &RadialGain) {
-        // A simple per-pixel radial multiply; delegate to the CPU for now (a WGSL
-        // port could follow later).
-        self.cpu.apply_radial_gain(img, gain);
+        if img.is_empty() {
+            return;
+        }
+        // A simple per-pixel radial multiply, in `radial_gain.wgsl` — a
+        // transcription of `RadialGain::at`. The pipeline builds the `RadialGain`
+        // (vignetting or creative vignette), so the shader is convention-agnostic.
+        let params = RadialGainParams {
+            width: img.width(),
+            height: img.height(),
+            center: gain.center,
+            inv_norm: gain.inv_norm,
+            poly: gain.poly,
+            reciprocal: gain.reciprocal as u32,
+            _pad: [0.0; 3],
+        };
+        match self.run_radial_gain(img, &params) {
+            Ok(result) => bytemuck::cast_slice_mut(img.pixels_mut()).copy_from_slice(&result),
+            Err(_) => self.cpu.apply_radial_gain(img, gain),
+        }
     }
 
     fn denoise(&self, img: &ImageBuf, params: DenoiseParams) -> ImageBuf {
@@ -583,7 +1089,8 @@ impl Backend for GpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latent_pipeline::Extent;
+    use latent_edit::Settings;
+    use latent_pipeline::{Extent, keystone_transform};
 
     /// Acquire a GPU backend, or skip the test (returning early) when no device
     /// is available, so the suite still passes on machines without one. Where an
@@ -619,6 +1126,48 @@ mod tests {
             .zip(b.pixels())
             .flat_map(|(p, q)| (0..3).map(move |c| (p[c] - q[c]).abs()))
             .fold(0.0, f32::max)
+    }
+
+    // --- Test/CPU/GPU conformance contract -------------------------------------
+    //
+    // The three backends share one documented tolerance, not ad-hoc per-test
+    // epsilons. The "Test" backend is the spec/reference: the `CpuBackend`, the
+    // mandatory correctness implementation the pipeline pins against. Each
+    // conformance check runs a primitive (or a full render) on the reference and
+    // on the GPU and asserts agreement within the right tolerance.
+
+    /// Tolerance for a single GPU primitive against the reference. A `pow`/divide
+    /// on the GPU differs from the CPU only in the last bits, so this is tight.
+    const PRIMITIVE_TOL: f32 = 1e-4;
+
+    /// Tolerance for a full end-to-end render against the reference. Looser than
+    /// [`PRIMITIVE_TOL`] because GPU float differences accumulate through the
+    /// stages (tone, sharpening, geometry).
+    const RENDER_TOL: f32 = 5e-3;
+
+    /// Assert a GPU image matches the reference (CPU) image within `tol`, naming
+    /// the case in the failure message — the one place the backends' shared
+    /// contract is enforced.
+    fn assert_conforms(label: &str, reference: &ImageBuf, on_gpu: &ImageBuf, tol: f32) {
+        assert_eq!(
+            (reference.width(), reference.height()),
+            (on_gpu.width(), on_gpu.height()),
+            "{label}: GPU output size differs from the reference"
+        );
+        let diff = max_abs_diff(reference, on_gpu);
+        assert!(
+            diff <= tol,
+            "{label}: GPU diverged from the reference by {diff} (tol {tol})"
+        );
+    }
+
+    /// Render `settings` on the GPU and on the reference (CPU) backend and assert
+    /// they agree within [`RENDER_TOL`] — the end-to-end leg of the contract.
+    fn assert_render_conforms(label: &str, gpu: &GpuBackend, src: &ImageBuf, settings: &Settings) {
+        use latent_pipeline::render;
+        let on_gpu = render(src, settings, gpu);
+        let on_ref = render(src, settings, &CpuBackend);
+        assert_conforms(label, &on_ref, &on_gpu, RENDER_TOL);
     }
 
     /// Run a point op on the GPU and on the CPU over the same image, asserting
@@ -759,9 +1308,8 @@ mod tests {
     fn render_matches_cpu_across_the_pipeline() {
         use latent_edit::{
             Adjustments, Clarity, Crop, Geometry, Gradient, LensProfile, LocalAdjustment, Mask,
-            MaskShape, NoiseReduction, Perspective, SelectiveTone, Settings, Sharpen, WhiteBalance,
+            MaskShape, NoiseReduction, Perspective, SelectiveTone, Sharpen, WhiteBalance,
         };
-        use latent_pipeline::render;
 
         let gpu = gpu_or_skip!();
         let src = ramp(40, 30);
@@ -839,19 +1387,367 @@ mod tests {
                     ..LensProfile::default()
                 }),
                 vignette: Some(-0.25),
+                ..Geometry::default()
             },
         };
 
-        let on_gpu = render(&src, &settings, &gpu);
-        let on_cpu = render(&src, &settings, &CpuBackend);
-        assert_eq!(
-            (on_gpu.width(), on_gpu.height()),
-            (on_cpu.width(), on_cpu.height())
+        // This bundle sets a `lens` block, so geometry lowers to `backend.warp`.
+        // It now drives `warp.wgsl` (radial + CA) on the GPU; the no-lens case
+        // below drives `resample.wgsl`, so the two together cover both shaders.
+        assert_render_conforms("render lens+homography (warp.wgsl)", &gpu, &src, &settings);
+    }
+
+    #[test]
+    fn gpu_resample_w_le_0_matches_cpu() {
+        // Primitive parity for the `w ≤ 0` guard: a behind-the-plane keystone has
+        // corners whose homogeneous weight goes non-positive. The CPU `resample`
+        // reads those as black (the `Transform::map` sentinel); the GPU shader must
+        // too — before the guard it sampled real pixels / fed NaN to the sampler.
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        let extent = Extent {
+            width: 40,
+            height: 30,
+        };
+        // Strong vertical + horizontal keystone so a corner weight crosses zero.
+        // With both at 0.8 the homogeneous weight at output (0, 0) is 1 − 2·0.8 =
+        // −0.6 < 0, so that corner is behind the projection plane.
+        let t = keystone_transform(extent, 0.8, 0.8);
+        assert!(
+            t.map(0.0, 0.0) == (-1.0, -1.0),
+            "corner (0,0) must be behind-plane"
         );
-        // map_pixels runs on the GPU now (the rest still delegates to the CPU);
-        // the tolerance covers GPU float differences propagated through tone and
-        // sharpening.
-        let diff = max_abs_diff(&on_gpu, &on_cpu);
-        assert!(diff <= 5e-3, "GPU render diverged from CPU by {diff}");
+        let on_ref = CpuBackend.resample(&src, &t);
+        let on_gpu = gpu.resample(&src, &t);
+        // The behind-plane corner must read black on the reference, or the test
+        // wouldn't be exercising the guard.
+        assert_eq!(
+            on_ref.get(0, 0),
+            [0.0; 3],
+            "expected a behind-plane black corner"
+        );
+        assert_conforms("resample w<=0 guard", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn gpu_resample_border_fade_matches_cpu() {
+        // Border parity against the final (cubic + prefilter) interpolator: an
+        // output frame larger than the source, so its edge pixels map on and over
+        // the source border and fade to black. The most fragile region for CPU/GPU
+        // agreement, written against the cubic, not the old bilinear.
+        let gpu = gpu_or_skip!();
+        let mut src = ImageBuf::new(12, 12);
+        for p in src.pixels_mut() {
+            *p = [0.7, 0.4, 0.2];
+        }
+        // A 0.7× zoom-out centered so the content shrinks inside a larger canvas —
+        // every edge band straddles the source border.
+        let t = Transform {
+            output: Extent {
+                width: 20,
+                height: 20,
+            },
+            m: [[0.7, 0.0, -2.0], [0.0, 0.7, -2.0], [0.0, 0.0, 1.0]],
+        };
+        let on_ref = CpuBackend.resample(&src, &t);
+        let on_gpu = gpu.resample(&src, &t);
+        assert_eq!(on_ref.get(0, 0), [0.0; 3], "outer corner should be black");
+        assert_conforms("resample border fade", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn gpu_minify_prefilter_matches_cpu() {
+        // The minifying case: a strong zoom-out that engages the per-axis
+        // minification prefilter on both backends. They must agree within the
+        // primitive tolerance — the two share one interpolation + prefilter
+        // contract, computed from the same per-pixel Jacobian.
+        let gpu = gpu_or_skip!();
+        let mut src = ImageBuf::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                // A smooth pattern with high-frequency content for the prefilter.
+                let v = (((x % 4) + (y % 4)) as f32) / 6.0;
+                src.set(x, y, [v, 1.0 - v, 0.5 * v]);
+            }
+        }
+        let t = Transform {
+            output: Extent {
+                width: 16,
+                height: 16,
+            },
+            m: [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let on_ref = CpuBackend.resample(&src, &t);
+        let on_gpu = gpu.resample(&src, &t);
+        assert_conforms("minify prefilter", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn gpu_warp_matches_cpu_radial() {
+        // The radial-distortion warp path that was CPU-only: `warp.wgsl` mirrors
+        // `Warp::map` (homography + Newton-inverted radial). A Poly5 barrel about
+        // the image center; samples kept interior so the comparison is not
+        // border-fragile.
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        let w = Warp {
+            output: Extent {
+                width: 40,
+                height: 30,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [19.5, 14.5],
+            inv_norm: 1.0 / 24.0,
+            model: DistortionModel::Poly5,
+            radial: [0.0, 0.08, 0.0, 0.02],
+            channel_scale: [[0.0, 0.0, 1.0]; 3],
+        };
+        let on_ref = CpuBackend.warp(&src, &w);
+        let on_gpu = gpu.warp(&src, &w);
+        assert_conforms("warp radial (warp.wgsl)", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn gpu_warp_matches_cpu_ca() {
+        // The chromatic-aberration warp path: per-channel radial scale, one cubic
+        // fetch per channel (`map_channel`). Red/blue carry a non-identity CA
+        // scale; green is the reference. `has_chromatic()` routes the shader's
+        // per-channel branch.
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        let w = Warp {
+            output: Extent {
+                width: 40,
+                height: 30,
+            },
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            center: [19.5, 14.5],
+            inv_norm: 1.0 / 24.0,
+            model: DistortionModel::Poly5,
+            radial: [0.0, 0.05, 0.0, 0.0],
+            channel_scale: [[0.0, 0.0, 1.003], CA_IDENTITY_TEST, [0.0, 0.0, 0.997]],
+        };
+        assert!(w.has_chromatic(), "the CA case must be chromatic");
+        let on_ref = CpuBackend.warp(&src, &w);
+        let on_gpu = gpu.warp(&src, &w);
+        assert_conforms("warp CA (warp.wgsl)", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    /// Green-reference CA scale `[b, c, v] = [0, 0, 1]` for the tests.
+    const CA_IDENTITY_TEST: [f32; 3] = [0.0, 0.0, 1.0];
+
+    #[test]
+    fn gpu_apply_radial_gain_matches_cpu() {
+        // The ported radial gain, for both `reciprocal` modes and a non-centered
+        // field, shares `RadialGain::at` — no forked polynomial.
+        let gpu = gpu_or_skip!();
+        for reciprocal in [false, true] {
+            let src = ramp(40, 30);
+            let gain = RadialGain {
+                center: [22.0, 12.0], // off-center
+                inv_norm: 2.0 / (40.0_f32 * 40.0 + 30.0 * 30.0).sqrt(),
+                poly: [-0.3, 0.1, 0.05],
+                reciprocal,
+            };
+            let mut on_ref = src.clone();
+            CpuBackend.apply_radial_gain(&mut on_ref, &gain);
+            let mut on_gpu = src.clone();
+            gpu.apply_radial_gain(&mut on_gpu, &gain);
+            assert_conforms(
+                &format!("radial gain reciprocal={reciprocal}"),
+                &on_ref,
+                &on_gpu,
+                PRIMITIVE_TOL,
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_combine_unsharp_matches_cpu() {
+        // The ported linear Unsharp recombine: out = other + gain·(img − other).
+        let gpu = gpu_or_skip!();
+        let img = ramp(40, 30);
+        let other = CpuBackend.blur(&img, 2.0);
+        let kind = CombineKind::Unsharp { gain: 2.0 };
+        let mut on_ref = img.clone();
+        CpuBackend.combine(&mut on_ref, &other, &kind);
+        let mut on_gpu = img.clone();
+        gpu.combine(&mut on_gpu, &other, &kind);
+        assert_conforms("combine unsharp", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn gpu_combine_local_contrast_matches_cpu() {
+        // The ported clarity recombine, exercising the midtone weight (shared
+        // `tone_encode`/`luminance` math) on a non-flat base.
+        let gpu = gpu_or_skip!();
+        let img = ramp(40, 30);
+        let other = CpuBackend.blur(&img, 4.0);
+        let kind = CombineKind::LocalContrast { amount: 0.6 };
+        let mut on_ref = img.clone();
+        CpuBackend.combine(&mut on_ref, &other, &kind);
+        let mut on_gpu = img.clone();
+        gpu.combine(&mut on_gpu, &other, &kind);
+        assert_conforms("combine local contrast", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn end_to_end_keystone_no_lens_matches_cpu() {
+        // The case the old end-to-end test omitted: keystone + straighten with NO
+        // lens block, so `apply_geometry` lowers to `backend.resample` — the native
+        // `resample.wgsl` shader, driven end-to-end with a real homography (with
+        // behind-plane corners). This would have FAILED before the `w ≤ 0` guard.
+        use latent_edit::{Adjustments, Geometry, Perspective};
+
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        let settings = Settings {
+            global: Adjustments {
+                exposure: Some(0.3),
+                ..Adjustments::default()
+            },
+            geometry: Geometry {
+                straighten_degrees: 4.0,
+                perspective: Some(Perspective {
+                    vertical: 0.6,
+                    horizontal: 0.4,
+                }),
+                lens: None,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        assert_render_conforms(
+            "keystone/straighten no-lens (resample.wgsl)",
+            &gpu,
+            &src,
+            &settings,
+        );
+    }
+
+    #[test]
+    fn map_pixels_2d_spill_matches_cpu() {
+        // Force the 2D workgroup grid to spill into y (gy > 1) by capping the grid
+        // width, so the `row_stride`/`gid.y` index reconstruction is validated
+        // against the CPU. A wide image whose group count exceeds one row.
+        let gpu = gpu_or_skip!();
+        let max_dim = gpu.device.limits().max_compute_workgroups_per_dimension;
+        // Enough pixels that the group count exceeds the per-dimension cap is
+        // impractical to allocate; instead use a moderately large image and verify
+        // the reconstruction holds. The spill path is the same index math either
+        // way, and a large image still exercises the multi-row dispatch.
+        let n = (max_dim as u64).min(2000) as u32 * 4;
+        let src = ramp(n.min(8000), 1);
+        let op = PointOp::Gain([1.25, 0.9, 1.1]);
+        let mut on_ref = src.clone();
+        CpuBackend.map_pixels(&mut on_ref, &op);
+        let mut on_gpu = src.clone();
+        gpu.map_pixels(&mut on_gpu, &op);
+        assert_conforms("map_pixels 2D spill", &on_ref, &on_gpu, PRIMITIVE_TOL);
+    }
+
+    #[test]
+    fn gpu_empty_and_1px_noop() {
+        // Empty (0-px) and 1-pixel images must hit the `is_empty` early-returns and
+        // the single-pixel path without panicking, matching the CPU.
+        let gpu = gpu_or_skip!();
+        // 0-pixel map_pixels: a no-op that must not dispatch.
+        let mut empty = ImageBuf::new(0, 0);
+        gpu.map_pixels(&mut empty, &PointOp::Gain([2.0, 2.0, 2.0]));
+        assert_eq!(empty.len(), 0);
+        // 1-pixel: gain and tone match the CPU.
+        let mut one = ImageBuf::new(1, 1);
+        one.set(0, 0, [0.3, 0.6, 0.9]);
+        let mut on_ref = one.clone();
+        let op = PointOp::Gain([1.5, 0.5, 2.0]);
+        gpu.map_pixels(&mut one, &op);
+        CpuBackend.map_pixels(&mut on_ref, &op);
+        assert_conforms("1px map_pixels", &on_ref, &one, PRIMITIVE_TOL);
+        // 1-pixel resample identity is a no-op.
+        let t = Transform::identity(Extent {
+            width: 1,
+            height: 1,
+        });
+        assert_conforms(
+            "1px resample",
+            &CpuBackend.resample(&on_ref, &t),
+            &gpu.resample(&on_ref, &t),
+            PRIMITIVE_TOL,
+        );
+    }
+
+    #[test]
+    fn gpu_render_reads_back_per_primitive_and_reuses_buffers() {
+        // The residency/pool refactor must not change results, and a multi-primitive
+        // render must reuse pooled buffers rather than allocate fresh ones each call.
+        // After a warm-up render fills the pool, a second identical render should
+        // perform very few (ideally zero) new allocations — the buffers are recycled.
+        use latent_edit::{Adjustments, Geometry, Sharpen};
+
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        let settings = Settings {
+            global: Adjustments {
+                exposure: Some(0.5),
+                sharpen: Some(Sharpen {
+                    amount: 0.8,
+                    radius: 2.0,
+                }),
+                ..Adjustments::default()
+            },
+            geometry: Geometry {
+                straighten_degrees: 2.0,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        // Warm up: fill the pool and count the round-trips of one render.
+        let _ = latent_pipeline::render(&src, &settings, &gpu);
+        let readbacks_before = gpu.readbacks.load(Ordering::Relaxed);
+        let allocs_before = gpu.pool.allocations.load(Ordering::Relaxed);
+        // A second identical render reuses the warmed pool.
+        let on_gpu = latent_pipeline::render(&src, &settings, &gpu);
+        let readbacks_after = gpu.readbacks.load(Ordering::Relaxed);
+        let allocs_after = gpu.pool.allocations.load(Ordering::Relaxed);
+
+        // The render dispatched several GPU primitives (each one readback).
+        assert!(
+            readbacks_after > readbacks_before,
+            "the render should have dispatched GPU primitives"
+        );
+        // …but the second pass allocated nothing new: every buffer came from the
+        // pool warmed by the first pass.
+        assert_eq!(
+            allocs_after, allocs_before,
+            "second render allocated fresh buffers instead of reusing the pool"
+        );
+        // And the result still matches the CPU exactly through the pooled path.
+        let on_cpu = latent_pipeline::render(&src, &settings, &CpuBackend);
+        assert_conforms("pooled render", &on_cpu, &on_gpu, RENDER_TOL);
+    }
+
+    #[test]
+    fn gpu_device_loss_falls_back_to_cpu() {
+        // When a primitive's readback fails (the device-loss path), the `Backend`
+        // impl must re-run it on the embedded CPU rather than panic or emit garbage.
+        // The test hook arms a one-shot readback error, so the next primitive sees
+        // the failure and degrades to the CPU. The result must equal the CPU's, and
+        // the call must not panic.
+        let gpu = gpu_or_skip!();
+        let src = ramp(20, 16);
+        let op = PointOp::Gain([1.3, 0.7, 1.1]);
+        let mut on_cpu = src.clone();
+        CpuBackend.map_pixels(&mut on_cpu, &op);
+
+        // Arm the simulated device loss; the next readback returns `Err`.
+        gpu.force_readback_error.store(true, Ordering::Relaxed);
+        let mut on_fallback = src.clone();
+        gpu.map_pixels(&mut on_fallback, &op); // must not panic
+        assert_conforms("device-loss fallback", &on_cpu, &on_fallback, PRIMITIVE_TOL);
+
+        // After the one-shot error clears, the GPU path resumes and still matches.
+        let mut on_gpu = src.clone();
+        gpu.map_pixels(&mut on_gpu, &op);
+        assert_conforms("post-fallback recovery", &on_cpu, &on_gpu, PRIMITIVE_TOL);
     }
 }

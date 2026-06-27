@@ -108,8 +108,10 @@ impl Backend for CpuBackend {
     }
 
     fn resample(&self, img: &ImageBuf, t: &Transform) -> ImageBuf {
-        // Inverse mapping: trace each output pixel back into the source and
-        // bilinearly sample. Output rows are independent → run them in parallel.
+        // Inverse mapping: trace each output pixel back into the source and sample
+        // with the higher-order cubic, sized to the texel's source footprint so a
+        // locally-minifying corner is prefiltered, not aliased. Output rows are
+        // independent → run them in parallel.
         let mut out = ImageBuf::new(t.output.width, t.output.height);
         let stride = t.output.width as usize;
         out.pixels_mut()
@@ -117,18 +119,22 @@ impl Backend for CpuBackend {
             .enumerate()
             .for_each(|(oy, row)| {
                 for ox in 0..t.output.width {
-                    let (sx, sy) = t.map(ox as f32, oy as f32);
-                    row[ox as usize] = sample_bilinear(img, sx, sy);
+                    let (ofx, ofy) = (ox as f32, oy as f32);
+                    let (sx, sy) = t.map(ofx, ofy);
+                    let fp = map_footprint(|x, y| t.map(x, y), ofx, ofy);
+                    row[ox as usize] = sample_cubic(img, sx, sy, fp);
                 }
             });
         out
     }
 
     fn warp(&self, img: &ImageBuf, w: &Warp) -> ImageBuf {
-        // Same single-pass inverse mapping and sampler as `resample`, but through
-        // the general (homography ∘ radial ∘ per-channel) coordinate map — one
-        // interpolation. With chromatic aberration each channel samples at its
-        // own radius, so it takes one bilinear fetch per channel.
+        // Same single-pass inverse mapping and cubic sampler as `resample`, but
+        // through the general (homography ∘ radial ∘ per-channel) coordinate map —
+        // one interpolation. The minification footprint is taken from the shared
+        // (CA-free) geometry, so all channels prefilter the same region. With
+        // chromatic aberration each channel samples at its own radius, so it takes
+        // one cubic fetch per channel.
         let chromatic = w.has_chromatic();
         let mut out = ImageBuf::new(w.output.width, w.output.height);
         let stride = w.output.width as usize;
@@ -137,14 +143,16 @@ impl Backend for CpuBackend {
             .enumerate()
             .for_each(|(oy, row)| {
                 for ox in 0..w.output.width {
+                    let (ofx, ofy) = (ox as f32, oy as f32);
+                    let fp = map_footprint(|x, y| w.map(x, y), ofx, ofy);
                     row[ox as usize] = if chromatic {
                         std::array::from_fn(|c| {
-                            let (sx, sy) = w.map_channel(ox as f32, oy as f32, c);
-                            sample_bilinear(img, sx, sy)[c]
+                            let (sx, sy) = w.map_channel(ofx, ofy, c);
+                            sample_cubic(img, sx, sy, fp)[c]
                         })
                     } else {
-                        let (sx, sy) = w.map(ox as f32, oy as f32);
-                        sample_bilinear(img, sx, sy)
+                        let (sx, sy) = w.map(ofx, ofy);
+                        sample_cubic(img, sx, sy, fp)
                     };
                 }
             });
@@ -304,36 +312,123 @@ fn blur_axis(src: &ImageBuf, radius: i32, vertical: bool) -> ImageBuf {
     out
 }
 
-/// Bilinear sample of `img` at the fractional coordinate `(x, y)`, where integer
-/// coordinates address pixel centers. Blends the four surrounding pixels; any
-/// neighbor outside the image contributes black, so sampling past the border
-/// fades to black.
+/// The Catmull–Rom cubic weight for a sample `t` pixels from the reconstruction
+/// point, on `[-2, 2]` (it is `0` outside). This is the Mitchell–Netravali family
+/// at `B = 0, C = 1/2`: an interpolating kernel (it passes through the samples)
+/// with linear precision — it reproduces any affine ramp exactly — so on-grid and
+/// flat regions resample without error and a magnified edge stays crisp. Sharper
+/// than the 2-tap bilinear's triangle, with bounded 4-tap support that ports
+/// directly to a shader. The coefficients are pinned here as the one interpolation
+/// contract a GPU mirror transcribes (`B = 0, C = 1/2`, piecewise on `|t|`).
+fn catmull_rom(t: f32) -> f32 {
+    let a = t.abs();
+    if a < 1.0 {
+        // 1.5·a³ − 2.5·a² + 1 (the central lobe; the C = 1/2 form of B,C cubics).
+        1.5 * a * a * a - 2.5 * a * a + 1.0
+    } else if a < 2.0 {
+        // −0.5·a³ + 2.5·a² − 4·a + 2 (the negative outer lobe that adds the
+        // overshoot bilinear lacks).
+        -0.5 * a * a * a + 2.5 * a * a - 4.0 * a + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Higher-order sample of `img` at the fractional coordinate `(x, y)`, where
+/// integer coordinates address pixel centers, with an optional per-axis
+/// minification prefilter. `footprint = (fx, fy)` is the source-space extent (in
+/// pixels) one output texel covers along each axis — the local map Jacobian's
+/// column norms (see [`map_footprint`]); `(1, 1)` is unit scale.
 ///
-/// This is a 2-tap interpolator with no prefilter, so it assumes a transform of
-/// roughly unit scale (the geometry stage uses it only for crop/rotation).
-/// Minifying through it would undersample and alias — downscaling is done
-/// separately by area-averaging (`ImageBuf::downscaled`), not here.
-fn sample_bilinear(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
+/// Interpolation is a separable [`catmull_rom`] cubic (4×4 taps at unit scale).
+/// When an axis *minifies* (`footprint > 1`, as a distortion/keystone corner or an
+/// auto-scale-to-fill that shrinks the frame does locally), point-sampling any
+/// kernel would undersample and alias; so the cubic's sampling step along that
+/// axis is stretched to the footprint, turning the reconstruction kernel into a
+/// low-pass that averages the source region the texel actually covers — a
+/// Jacobian-sized separable area prefilter, not a second resize pass. At unit
+/// scale or under magnification (`footprint ≤ 1`) the step is `1`, so the
+/// prefilter is inert and the result is pure bicubic — the non-minifying path is
+/// never softened. Any tap outside the image contributes black, so sampling past
+/// the border fades to black exactly as the old 2-tap sampler did.
+fn sample_cubic(img: &ImageBuf, x: f32, y: f32, footprint: (f32, f32)) -> [f32; 3] {
     let (w, h) = (img.width() as i32, img.height() as i32);
-    let x0 = x.floor() as i32;
-    let y0 = y.floor() as i32;
-    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    // Per-axis footprint: ≥ 1 stretches the kernel to low-pass the minified
+    // source; clamped at 1 so magnification stays pure bicubic.
+    let sx = footprint.0.max(1.0);
+    let sy = footprint.1.max(1.0);
+    // The taps span ±2 kernel units, each unit `s` source pixels wide.
+    let half_x = (2.0 * sx).ceil() as i32;
+    let half_y = (2.0 * sy).ceil() as i32;
+    let (cx, cy) = (x.round() as i32, y.round() as i32);
+    let inv_sx = 1.0 / sx;
+    let inv_sy = 1.0 / sy;
 
-    let at = |xi: i32, yi: i32| -> [f32; 3] {
-        if xi < 0 || yi < 0 || xi >= w || yi >= h {
-            [0.0; 3]
-        } else {
-            img.get(xi as u32, yi as u32)
+    // Separable weighted sum: a vertical accumulation of horizontally-resampled
+    // rows. The denominator is the *full* kernel weight (every tap, in or out of
+    // bounds), and an out-of-bounds tap contributes black to the numerator — so a
+    // sample past the border fades to black exactly as the 2-tap sampler did, while
+    // the in-bounds region still normalizes correctly (the unit-scale cubic's
+    // weights already sum to 1; the stretched prefilter renormalizes its wider
+    // support to a proper area average).
+    let mut acc = [0.0_f32; 3];
+    let mut wsum = 0.0_f32;
+    for dy in -half_y..=half_y {
+        let yi = cy + dy;
+        let wy = catmull_rom((yi as f32 - y) * inv_sy);
+        if wy == 0.0 {
+            continue;
         }
-    };
-    let (p00, p10) = (at(x0, y0), at(x0 + 1, y0));
-    let (p01, p11) = (at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+        for dx in -half_x..=half_x {
+            let xi = cx + dx;
+            let wx = catmull_rom((xi as f32 - x) * inv_sx);
+            if wx == 0.0 {
+                continue;
+            }
+            let wgt = wx * wy;
+            wsum += wgt;
+            if yi < 0 || yi >= h || xi < 0 || xi >= w {
+                continue; // out of bounds → black, but its weight still counts
+            }
+            let p = img.get(xi as u32, yi as u32);
+            acc[0] += wgt * p[0];
+            acc[1] += wgt * p[1];
+            acc[2] += wgt * p[2];
+        }
+    }
+    if wsum == 0.0 {
+        [0.0; 3]
+    } else {
+        [acc[0] / wsum, acc[1] / wsum, acc[2] / wsum]
+    }
+}
 
-    std::array::from_fn(|c| {
-        let top = p00[c] * (1.0 - fx) + p10[c] * fx;
-        let bot = p01[c] * (1.0 - fx) + p11[c] * fx;
-        top * (1.0 - fy) + bot * fy
-    })
+/// The source-space footprint of one output texel at `(ox, oy)` under `map`: the
+/// per-axis extent the texel covers in the source, from the local Jacobian of the
+/// output → source map estimated by a central difference of half a pixel.
+/// Returned as `(‖∂s/∂x‖, ‖∂s/∂y‖)` — the column norms, so each is the source
+/// distance the texel spans along that output axis. A value `> 1` means the map
+/// minifies there (the prefilter engages); `≤ 1` is unit scale or magnification.
+///
+/// A behind-the-plane sample (`map` returns the outside sentinel) yields a unit
+/// footprint: the texel reads black through the border anyway, so no prefilter is
+/// needed and a degenerate Jacobian there must not poison the size.
+fn map_footprint(map: impl Fn(f32, f32) -> (f32, f32), ox: f32, oy: f32) -> (f32, f32) {
+    let (xr, yr) = map(ox + 0.5, oy);
+    let (xl, yl) = map(ox - 0.5, oy);
+    let (xd, yd) = map(ox, oy + 0.5);
+    let (xu, yu) = map(ox, oy - 0.5);
+    if xr < 0.0 || xl < 0.0 || xd < 0.0 || xu < 0.0 {
+        return (1.0, 1.0);
+    }
+    let dxdx = xr - xl;
+    let dydx = yr - yl;
+    let dxdy = xd - xu;
+    let dydy = yd - yu;
+    (
+        (dxdx * dxdx + dydx * dydx).sqrt(),
+        (dxdy * dxdy + dydy * dydy).sqrt(),
+    )
 }
 
 #[cfg(test)]
@@ -840,6 +935,133 @@ mod tests {
         );
     }
 
+    /// A reference 2-tap bilinear sample, kept only in the tests as the baseline
+    /// the cubic must beat on magnification.
+    fn bilinear_ref(img: &ImageBuf, x: f32, y: f32) -> [f32; 3] {
+        let (w, h) = (img.width() as i32, img.height() as i32);
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |xi: i32, yi: i32| -> [f32; 3] {
+            if xi < 0 || yi < 0 || xi >= w || yi >= h {
+                [0.0; 3]
+            } else {
+                img.get(xi as u32, yi as u32)
+            }
+        };
+        let (p00, p10) = (at(x0, y0), at(x0 + 1, y0));
+        let (p01, p11) = (at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+        std::array::from_fn(|c| {
+            let top = p00[c] * (1.0 - fx) + p10[c] * fx;
+            let bot = p01[c] * (1.0 - fx) + p11[c] * fx;
+            top * (1.0 - fy) + bot * fy
+        })
+    }
+
+    #[test]
+    fn bicubic_sharper_than_bilinear_on_magnify() {
+        // Magnify a hard black→white step edge 8×. The cubic's negative outer lobe
+        // produces a steeper edge than bilinear's triangle: the gradient across the
+        // transition is larger. (At unit footprint, no prefilter engages.)
+        let mut src = ImageBuf::new(8, 1);
+        for x in 0..8 {
+            src.set(x, 0, if x < 4 { [0.0; 3] } else { [1.0; 3] });
+        }
+        // Sample a dense set of sub-pixel positions straddling the edge at x ≈ 3.5.
+        let probe = |sampler: &dyn Fn(&ImageBuf, f32, f32) -> [f32; 3]| {
+            let mut max_grad = 0.0_f32;
+            let mut prev = sampler(&src, 2.5, 0.0)[0];
+            let n = 200;
+            for i in 1..=n {
+                let x = 2.5 + (i as f32 / n as f32) * 2.0; // 2.5 → 4.5
+                let v = sampler(&src, x, 0.0)[0];
+                max_grad = max_grad.max((v - prev).abs() * n as f32 / 2.0);
+                prev = v;
+            }
+            max_grad
+        };
+        let cubic = probe(&|img, x, y| sample_cubic(img, x, y, (1.0, 1.0)));
+        let bilin = probe(&bilinear_ref);
+        assert!(
+            cubic > bilin * 1.1,
+            "cubic edge not sharper than bilinear: {cubic} vs {bilin}"
+        );
+    }
+
+    #[test]
+    fn minify_prefilter_suppresses_aliasing() {
+        // A fine 1-pixel vertical stripe pattern is the worst case for point
+        // sampling: at a strong, non-integer minification the sampled phase walks
+        // across the stripes, so point-cubic output beats into a high-variance moiré,
+        // while the footprint prefilter averages each texel's source region toward
+        // the stripe's 0.5 mean — far flatter.
+        let (sw, sh) = (96u32, 8u32);
+        let mut src = ImageBuf::new(sw, sh);
+        for y in 0..sh {
+            for x in 0..sw {
+                let v = (x % 2) as f32; // 0,1,0,1,… vertical stripes
+                src.set(x, y, [v; 3]);
+            }
+        }
+        // ~7.3× minification: a non-integer step so the sampled stripe phase
+        // precesses, which is exactly what aliases.
+        let scale = 7.3_f32;
+        let ow = 12u32;
+        let row_var = |footprint: (f32, f32)| {
+            let mut vals = Vec::new();
+            for ox in 0..ow {
+                let sx = ox as f32 * scale;
+                vals.push(sample_cubic(&src, sx, 4.0, footprint)[0]);
+            }
+            let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+            vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / vals.len() as f32
+        };
+        let aliased = row_var((1.0, 1.0)); // no prefilter (point cubic)
+        let filtered = row_var((scale, scale)); // Jacobian-sized prefilter
+        assert!(
+            filtered < aliased * 0.2,
+            "prefilter did not suppress aliasing: var {filtered} vs {aliased}"
+        );
+    }
+
+    #[test]
+    fn unit_scale_resample_not_softened() {
+        // On the non-minifying path (footprint ≤ 1) the cubic must be at least as
+        // sharp as bilinear, never blurred by an accidental prefilter. A pure
+        // half-pixel shift of a step edge: the cubic value at the edge is no closer
+        // to the midpoint mean than bilinear's (it is in fact sharper).
+        let mut src = ImageBuf::new(8, 1);
+        for x in 0..8 {
+            src.set(x, 0, if x < 4 { [0.2; 3] } else { [0.8; 3] });
+        }
+        let cubic = sample_cubic(&src, 3.5, 0.0, (1.0, 1.0))[0];
+        let bilin = bilinear_ref(&src, 3.5, 0.0)[0];
+        let mid = 0.5;
+        assert!(
+            (cubic - mid).abs() >= (bilin - mid).abs() - 1e-6,
+            "unit-scale cubic softened below bilinear: {cubic} vs {bilin}"
+        );
+        // A magnifying transform (footprint < 1) is also inert — a 0.3 footprint
+        // clamps to a unit step, identical to plain bicubic.
+        let mag = sample_cubic(&src, 3.5, 0.0, (0.3, 0.3))[0];
+        assert!((mag - cubic).abs() < 1e-6, "magnify path differed: {mag}");
+    }
+
+    #[test]
+    fn cubic_sample_past_the_border_fades_to_black() {
+        // Zero-border: a sample whose entire support lies outside the source reads
+        // black, and a sample straddling the edge fades toward black (no clamp/wrap).
+        let mut src = ImageBuf::new(4, 4);
+        for p in src.pixels_mut() {
+            *p = [1.0; 3];
+        }
+        // Fully outside → exactly black.
+        assert_eq!(sample_cubic(&src, -10.0, 1.5, (1.0, 1.0)), [0.0; 3]);
+        // Just past the right edge → strictly darker than the interior 1.0.
+        let edge = sample_cubic(&src, 3.9, 1.5, (1.0, 1.0))[0];
+        assert!(edge < 1.0, "border did not fade toward black: {edge}");
+    }
+
     #[test]
     fn warp_samples_through_a_radial_map() {
         // Linear ramp r = x + 8y → bilinear is exact, so the warped output at a
@@ -865,6 +1087,55 @@ mod tests {
         let out = CpuBackend.warp(&img, &w);
         let (sx, sy) = w.map(12.0, 7.0);
         assert!((out.get(12, 7)[0] - (sx + 8.0 * sy)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn auto_scale_goes_through_prefilter() {
+        // A barrel/pincushion correction whose auto-scale-to-fill *minifies* the
+        // frame (here ~1.25×) must route through the resampler's minification
+        // prefilter, so a fine high-frequency source does not alias. A 1-pixel
+        // checker rendered with auto-scale on comes out smoothed toward its 0.5 mean
+        // in the interior — low local variance — which only the prefilter gives; a
+        // point sample of the same minifying map would beat into moiré.
+        let (w, h) = (41u32, 41u32);
+        let mut src = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                src.set(x, y, [((x + y) % 2) as f32; 3]);
+            }
+        }
+        let settings = Settings {
+            geometry: latent_edit::Geometry {
+                lens: Some(latent_edit::LensProfile {
+                    crop: 1.0,
+                    real_focal: 9.03,
+                    model: latent_edit::DistortionModel::Poly5,
+                    distortion: [0.0, 0.15, 0.05, 0.0],
+                    ..latent_edit::LensProfile::default()
+                }),
+                auto_scale: true,
+                ..latent_edit::Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &CpuBackend);
+        // Interior local variance over a window away from the border: the prefilter
+        // averages each minified texel's source region toward the checker mean, so
+        // the spread is small. Aliased point sampling of a 1-px checker would hold
+        // the full 0/1 contrast (variance ≈ 0.25).
+        let (cx, cy) = (out.width() / 2, out.height() / 2);
+        let mut vals = Vec::new();
+        for dy in -4i32..=4 {
+            for dx in -4i32..=4 {
+                vals.push(out.get((cx as i32 + dx) as u32, (cy as i32 + dy) as u32)[0]);
+            }
+        }
+        let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+        let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / vals.len() as f32;
+        assert!(
+            var < 0.05,
+            "auto-scale minify aliased (prefilter not engaged): var {var}"
+        );
     }
 
     #[test]

@@ -546,17 +546,29 @@ pub struct Geometry {
     /// Creative vignette amount applied after crop (OUTPUT space): negative
     /// darkens the corners, positive lightens them; `None` (or `0`) is none.
     pub vignette: Option<f32>,
+    /// Scale the corrected/warped image about the frame center so it fills the
+    /// output with no black border wedges (lensfun's `GetAutoScale`). Off by
+    /// default, so a distortion/keystone/straighten correction leaves the wedges
+    /// for the user to crop; when on it may *minify* the image to fit.
+    pub auto_scale: bool,
+    /// Output sharpening applied *after* geometry (OUTPUT space, post-resample),
+    /// using the same perceptual L\* luma-sharpen as capture sharpen. `None` (or a
+    /// `0` amount) is off; distinct from [`Adjustments::sharpen`], which runs in
+    /// SOURCE space before geometry.
+    pub output_sharpen: Option<Sharpen>,
 }
 
 impl Geometry {
     /// True if this geometry changes nothing (no crop, rotation, keystone, lens,
-    /// or vignette).
+    /// vignette, auto-scale, or output sharpen).
     pub fn is_identity(&self) -> bool {
         self.crop.is_none()
             && self.straighten_degrees == 0.0
             && self.perspective.is_none()
             && self.lens.is_none()
             && self.vignette.is_none()
+            && !self.auto_scale
+            && self.output_sharpen.is_none()
     }
 }
 
@@ -872,6 +884,13 @@ impl Geometry {
         if let Some(vignette) = &mut self.vignette {
             *vignette = finite_or(*vignette, 0.0);
         }
+        if let Some(sharpen) = &mut self.output_sharpen {
+            // Same scrub as the global sharpen: amount is a signed-ish strength,
+            // radius a non-negative magnitude in pixels.
+            sharpen.amount = finite_or(sharpen.amount, 0.0);
+            sharpen.radius = finite_clamped(sharpen.radius, 0.0, 0.0, f32::MAX);
+        }
+        // `auto_scale` is a plain bool — nothing to scrub.
     }
 }
 
@@ -948,36 +967,40 @@ mod tests {
     fn default_geometry_is_identity_and_a_change_is_not() {
         assert!(Geometry::default().is_identity());
         let tilted = Geometry {
-            crop: None,
             straighten_degrees: 1.0,
-            perspective: None,
-            lens: None,
-            vignette: None,
+            ..Geometry::default()
         };
         assert!(!tilted.is_identity());
         let keystoned = Geometry {
-            crop: None,
-            straighten_degrees: 0.0,
             perspective: Some(Perspective {
                 vertical: 0.2,
                 horizontal: 0.0,
             }),
-            lens: None,
-            vignette: None,
+            ..Geometry::default()
         };
         assert!(!keystoned.is_identity());
         let corrected = Geometry {
-            crop: None,
-            straighten_degrees: 0.0,
-            perspective: None,
             lens: Some(LensProfile {
                 model: DistortionModel::Poly3,
                 distortion: [0.0, -0.1, 0.0, 0.0],
                 ..LensProfile::default()
             }),
-            vignette: None,
+            ..Geometry::default()
         };
         assert!(!corrected.is_identity());
+        let auto_scaled = Geometry {
+            auto_scale: true,
+            ..Geometry::default()
+        };
+        assert!(!auto_scaled.is_identity());
+        let sharpened = Geometry {
+            output_sharpen: Some(Sharpen {
+                amount: 1.0,
+                radius: 1.0,
+            }),
+            ..Geometry::default()
+        };
+        assert!(!sharpened.is_identity());
     }
 
     #[test]
@@ -1295,6 +1318,11 @@ mod tests {
                     vignetting: [-0.2, 0.05, 0.0],
                 }),
                 vignette: Some(0.3),
+                auto_scale: true,
+                output_sharpen: Some(Sharpen {
+                    amount: 0.6,
+                    radius: 1.5,
+                }),
             },
         };
         // Two variants: a neutral one and the edited one.

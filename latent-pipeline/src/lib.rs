@@ -454,8 +454,9 @@ pub trait Backend: Send + Sync {
 /// `source` is the linear working image in SOURCE coordinates — the full,
 /// uncropped develop (decode → white balance → demosaic → camera-to-working).
 /// The fixed pipeline then applies, in order: global adjustments, local
-/// adjustments, and geometry (the single SOURCE → OUTPUT step). The final
-/// output encoding happens separately, at export.
+/// adjustments, geometry (the single SOURCE → OUTPUT step), and an output
+/// sharpen at OUTPUT resolution. The final output encoding happens separately,
+/// at export.
 ///
 /// With default (neutral) settings every stage is a no-op, so the source image
 /// is returned unchanged.
@@ -463,7 +464,8 @@ pub fn render(source: &ImageBuf, settings: &Settings, backend: &dyn Backend) -> 
     let img = source.clone();
     let img = apply_global(img, &settings.global, backend);
     let img = apply_locals(img, &settings.locals, backend);
-    apply_geometry(img, &settings.geometry, backend)
+    let img = apply_geometry(img, &settings.geometry, backend);
+    apply_output_sharpen(img, &settings.geometry, backend)
 }
 
 /// Stage: global adjustments, applied in SOURCE space.
@@ -1259,6 +1261,84 @@ fn lens_vignetting_radial(extent: Extent, lens: &LensProfile) -> ([f32; 2], f32)
     (center, inv_norm)
 }
 
+/// Pre-multiply a homography `m` by a center-preserving scale of its *input*
+/// (output-pixel) coordinates: an output point `p` is first mapped to `center +
+/// (p − center)·k`, then through `m`. Used to fold an auto-scale-to-fill into the
+/// same matrix so the geometry stays a single resample. With `k = 1` this is `m`
+/// unchanged. `k < 1` magnifies the visible content (pushes black wedges out of
+/// frame), `k > 1` minifies it.
+fn prescale_homography(m: [[f32; 3]; 3], center: [f32; 2], k: f32) -> [[f32; 3]; 3] {
+    // The input scale is the affine S = T(center)·diag(k,k,1)·T(-center); fold it
+    // in as m·S (it acts on the output coordinate before the existing map).
+    let (cx, cy) = (center[0], center[1]);
+    let s = [
+        [k, 0.0, cx * (1.0 - k)],
+        [0.0, k, cy * (1.0 - k)],
+        [0.0, 0.0, 1.0],
+    ];
+    let mut out = [[0.0_f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[i][0] * s[0][j] + m[i][1] * s[1][j] + m[i][2] * s[2][j];
+        }
+    }
+    out
+}
+
+/// The fill scale that makes the warped frame cover the source with no black
+/// border wedges, à la lensfun's `GetAutoScale`. Traces a ring of boundary
+/// samples (the four corners and points along each edge — corners alone miss the
+/// worst case under strong distortion) of the `output`-sized frame through the
+/// output → source `map`, and finds the center scale `k` (on the output
+/// coordinate) that pulls the most-outlying mapped sample exactly onto the source
+/// boundary. `map(output_center)` is the source center (every geometry map here
+/// preserves the center), so scaling the output toward its center moves each
+/// mapped sample proportionally toward the source center — hence the per-sample
+/// scale is the ratio of source half-extent to the sample's offset from center,
+/// and the binding (smallest) one fills the frame. Returns `1.0` (a no-op) when
+/// the frame is already covered or the source is degenerate.
+fn auto_scale_factor(output: Extent, src: Extent, map: impl Fn(f32, f32) -> (f32, f32)) -> f32 {
+    let (ow, oh) = (output.width as f32, output.height as f32);
+    // Source valid region: pixel centers span [0, sw-1] × [0, sh-1].
+    let (sw, sh) = (src.width as f32 - 1.0, src.height as f32 - 1.0);
+    if sw <= 0.0 || sh <= 0.0 {
+        return 1.0;
+    }
+    let sc = [sw / 2.0, sh / 2.0];
+    // Walk the frame boundary at a fixed sampling density per edge.
+    const EDGE_SAMPLES: u32 = 16;
+    let mut k = f32::INFINITY;
+    let mut consider = |x: f32, y: f32| {
+        let (mx, my) = map(x, y);
+        if mx < 0.0 && my < 0.0 {
+            // Behind-the-plane sentinel: ignore (it reads black regardless).
+            return;
+        }
+        let (dx, dy) = (mx - sc[0], my - sc[1]);
+        // Per-sample scale that lands this point on the nearer source edge.
+        let kx = if dx.abs() > 1e-6 {
+            sc[0] / dx.abs()
+        } else {
+            f32::INFINITY
+        };
+        let ky = if dy.abs() > 1e-6 {
+            sc[1] / dy.abs()
+        } else {
+            f32::INFINITY
+        };
+        k = k.min(kx.min(ky));
+    };
+    for i in 0..EDGE_SAMPLES {
+        let f = i as f32 / EDGE_SAMPLES as f32;
+        consider(f * (ow - 1.0), 0.0); // top edge
+        consider(f * (ow - 1.0), oh - 1.0); // bottom edge
+        consider(0.0, f * (oh - 1.0)); // left edge
+        consider(ow - 1.0, f * (oh - 1.0)); // right edge
+    }
+    consider(ow - 1.0, oh - 1.0); // the far corner the loop's `f<1` skips
+    if k.is_finite() && k > 0.0 { k } else { 1.0 }
+}
+
 /// Stage: geometry — the single SOURCE → OUTPUT step.
 ///
 /// Lens distortion, keystone, and straighten all compose into one coordinate map
@@ -1266,9 +1346,12 @@ fn lens_vignetting_radial(extent: Extent, lens: &LensProfile) -> ([f32; 2], f32)
 /// result. All are reversible: they only change what the *output* contains, never
 /// the source. The default geometry leaves the image untouched.
 ///
-/// The output keeps the source frame size — there is no auto-scale-to-fill, so a
-/// strong distortion or keystone correction can leave black borders the user
-/// crops away (an auto-scale would be a later addition).
+/// The output keeps the source frame size. With `auto_scale` off (the default) a
+/// strong distortion or keystone correction can leave black borders the user crops
+/// away; with it on, a center-preserving fill scale is folded into the *same*
+/// homography before the single resample, so the frame is filled with no black
+/// wedges (at the cost of a slight crop/minify — which then goes through the
+/// resampler's minification prefilter).
 fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend) -> ImageBuf {
     let extent = Extent {
         width: img.width(),
@@ -1319,23 +1402,46 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
         (h, Some(l)) => {
             let base = h.unwrap_or_else(|| Transform::identity(extent));
             let (center, inv_norm, model, radial) = lens_radial(extent, &l);
-            img = backend.warp(
-                &img,
-                &Warp {
-                    output: base.output,
-                    m: base.m,
-                    center,
-                    inv_norm,
-                    model,
-                    radial,
-                    // Green is the reference identity; red/blue carry their POLY3
-                    // radial CA scale [b, c, v].
-                    channel_scale: [l.ca[0], CA_IDENTITY, l.ca[1]],
-                },
-            );
+            let mut warp = Warp {
+                output: base.output,
+                m: base.m,
+                center,
+                inv_norm,
+                model,
+                radial,
+                // Green is the reference identity; red/blue carry their POLY3
+                // radial CA scale [b, c, v].
+                channel_scale: [l.ca[0], CA_IDENTITY, l.ca[1]],
+            };
+            // Auto-scale-to-fill: fold a center-preserving fill scale into the same
+            // homography (one resample). The fill scale is found from the full
+            // distortion+homography map, so it covers the radial wedges too.
+            if geometry.auto_scale {
+                let frame_center = [
+                    (warp.output.width as f32 - 1.0) / 2.0,
+                    (warp.output.height as f32 - 1.0) / 2.0,
+                ];
+                let k = auto_scale_factor(warp.output, extent, |x, y| warp.map(x, y));
+                warp.m = prescale_homography(warp.m, frame_center, k);
+            }
+            img = backend.warp(&img, &warp);
         }
-        (Some(t), None) => img = backend.resample(&img, &t),
-        (None, None) => {}
+        (Some(mut t), None) => {
+            if geometry.auto_scale {
+                let frame_center = [
+                    (t.output.width as f32 - 1.0) / 2.0,
+                    (t.output.height as f32 - 1.0) / 2.0,
+                ];
+                let k = auto_scale_factor(t.output, extent, |x, y| t.map(x, y));
+                t.m = prescale_homography(t.m, frame_center, k);
+            }
+            img = backend.resample(&img, &t);
+        }
+        (None, None) => {
+            // No homography and no lens, but auto-scale can still fill a frame the
+            // user expects scaled (a no-op map fills exactly, so this only matters
+            // when composed with a future crop-aware fill — left as identity here).
+        }
     }
     if let Some(crop) = geometry.crop {
         img = crop_image(&img, crop);
@@ -1353,6 +1459,37 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
                 reciprocal: false,
             },
         );
+    }
+    img
+}
+
+/// Stage: output sharpening — the single OUTPUT-space sharpen, run *after*
+/// [`apply_geometry`] (post-crop, post-resample), distinct from the capture
+/// sharpen in [`apply_global`] which runs in SOURCE space before geometry.
+///
+/// It reuses the exact perceptual recombine of capture sharpen — unsharp on **L\***
+/// only, color rebuilt around the sharpened lightness ([`CombineKind::UnsharpLuma`])
+/// — so a sharpened edge keeps its hue and the overshoot is perceptually symmetric;
+/// there is no second sharpen math.
+///
+/// The point of running it *here* rather than in the global stage is the resample:
+/// because the higher-order interpolator and its minification prefilter already
+/// resolve the image more sharply than a 2-tap sampler, this pass is **not** there
+/// to undo interpolation softness. It restores the acutance a minifying
+/// distortion/keystone/auto-scale loses (its prefilter, by design, low-passes the
+/// detail it averages) by creating the sharpening overshoots at the *output*
+/// resolution, where no further resample can alias them away. With no geometry it
+/// is still a valid output-sharpen control — it is gated on the setting, not on
+/// whether geometry ran. An absent setting (or a `0` amount / sub-pixel radius)
+/// is a no-op, so the default render is unchanged.
+fn apply_output_sharpen(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend) -> ImageBuf {
+    if let Some(s) = geometry.output_sharpen
+        && s.amount > 0.0
+        && radius_is_active(s.radius)
+    {
+        let base = backend.blur(&img, s.radius);
+        let gain = 1.0 + s.amount;
+        backend.combine(&mut img, &base, &CombineKind::UnsharpLuma { gain });
     }
     img
 }
@@ -2763,6 +2900,7 @@ mod tests {
                 perspective: None,
                 lens: None,
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -2785,6 +2923,7 @@ mod tests {
                 perspective: None,
                 lens: None,
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -2973,6 +3112,7 @@ mod tests {
                 }),
                 lens: None,
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -2998,6 +3138,7 @@ mod tests {
                 }),
                 lens: None,
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3106,6 +3247,7 @@ mod tests {
                     ..LensProfile::default()
                 }),
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3129,6 +3271,7 @@ mod tests {
                 perspective: None,
                 lens: Some(LensProfile::default()),
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3157,6 +3300,7 @@ mod tests {
                     ..LensProfile::default()
                 }),
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3199,6 +3343,7 @@ mod tests {
                     ..LensProfile::default()
                 }),
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3223,6 +3368,7 @@ mod tests {
                 perspective: None,
                 lens: Some(LensProfile::default()),
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3242,6 +3388,7 @@ mod tests {
                 perspective: None,
                 lens: None,
                 vignette: Some(-0.5),
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3276,6 +3423,7 @@ mod tests {
                 perspective: None,
                 lens: None,
                 vignette: None,
+                ..Geometry::default()
             },
             ..Settings::default()
         };
@@ -3715,5 +3863,208 @@ mod tests {
                 out.get(x, y)
             );
         }
+    }
+
+    #[test]
+    fn output_sharpen_runs_after_geometry() {
+        // The output sharpen is a distinct, post-geometry stage: with it set, an
+        // edge in the (already framed) output gains symmetric overshoot it would not
+        // have without the pass — and it is reached through the geometry setting, not
+        // the global sharpen.
+        let mut src = ImageBuf::new(5, 1);
+        for (x, v) in [0.2, 0.2, 0.2, 0.8, 0.8].into_iter().enumerate() {
+            src.set(x as u32, 0, [v; 3]);
+        }
+        let off = render(&src, &Settings::default(), &TestBackend);
+        let settings = Settings {
+            geometry: Geometry {
+                output_sharpen: Some(Sharpen {
+                    amount: 1.0,
+                    radius: 1.0,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let on = render(&src, &settings, &TestBackend);
+        // The dark side of the edge dips below its input and the bright side rises
+        // above — the overshoot the output pass creates at output resolution.
+        assert!(
+            l_star(on.get(2, 0)[0]) < l_star(off.get(2, 0)[0]),
+            "dark side not undershot: {:?}",
+            on.get(2, 0)
+        );
+        assert!(
+            l_star(on.get(3, 0)[0]) > l_star(off.get(3, 0)[0]),
+            "bright side not overshot: {:?}",
+            on.get(3, 0)
+        );
+    }
+
+    #[test]
+    fn output_sharpen_is_luma_only_no_fringing() {
+        // A saturated single-hue edge sharpened through the output pass keeps its
+        // hue at the overshoot (the L* recombine carries a*/b* from the input), with
+        // no color fringing — the same guarantee as capture sharpen, now post-crop.
+        let dark = Lab {
+            l: 30.0,
+            a: 35.0,
+            b: -20.0,
+        }
+        .to_working();
+        let bright = Lab {
+            l: 75.0,
+            a: 35.0,
+            b: -20.0,
+        }
+        .to_working();
+        let mut src = ImageBuf::new(5, 1);
+        for (x, &px) in [dark, dark, dark, bright, bright].iter().enumerate() {
+            src.set(x as u32, 0, px);
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                output_sharpen: Some(Sharpen {
+                    amount: 1.0,
+                    radius: 1.0,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let out = render(&src, &settings, &TestBackend);
+        let edge = Lab::from_working(bright).to_lch();
+        let over = Lab::from_working(out.get(3, 0)).to_lch();
+        assert!(
+            (over.h - edge.h).abs() < 1e-3,
+            "hue fringed at the sharpened edge: {} vs {}",
+            over.h,
+            edge.h
+        );
+        assert!(over.l > edge.l, "no overshoot in lightness: {over:?}");
+    }
+
+    #[test]
+    fn default_settings_output_sharpen_is_noop() {
+        // An absent output-sharpen (the default) leaves the render byte-identical to
+        // the source — the no-op the serde default guarantees for old sidecars.
+        let mut src = ImageBuf::new(4, 2);
+        src.set(0, 0, [0.1, 0.2, 0.3]);
+        src.set(3, 1, [0.7, 0.8, 0.9]);
+        assert_eq!(render(&src, &Settings::default(), &TestBackend), src);
+        // An explicit zero-amount output sharpen is also inert.
+        let settings = Settings {
+            geometry: Geometry {
+                output_sharpen: Some(Sharpen {
+                    amount: 0.0,
+                    radius: 2.0,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(render(&src, &settings, &TestBackend), src);
+    }
+
+    #[test]
+    fn auto_scale_fills_keystone_border() {
+        // A keystone correction leaves a black wedge at a corner of the output.
+        // Auto-scale folds a center-preserving fill scale into the same homography
+        // so every output pixel maps inside the source — no black border — at the
+        // cost of a slight crop. With the toggle off the wedge is present.
+        let mut src = ImageBuf::new(21, 21);
+        for p in src.pixels_mut() {
+            *p = [0.5, 0.6, 0.7];
+        }
+        let perspective = Some(Perspective {
+            vertical: 0.25,
+            horizontal: 0.15,
+        });
+        let without = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    perspective,
+                    auto_scale: false,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        let with = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    perspective,
+                    auto_scale: true,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        // Count fully-black output pixels (a sample mapped outside the source).
+        let black = |img: &ImageBuf| {
+            img.pixels()
+                .iter()
+                .filter(|p| **p == [0.0, 0.0, 0.0])
+                .count()
+        };
+        assert!(black(&without) > 0, "keystone should leave black wedges");
+        assert_eq!(black(&with), 0, "auto-scale should fill the frame");
+    }
+
+    #[test]
+    fn auto_scale_off_is_unchanged() {
+        // With auto-scale off the render is exactly today's — the same keystone
+        // output as before the toggle existed (regression guard for the default).
+        let mut src = ImageBuf::new(15, 15);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [i as f32, 0.0, 0.0];
+        }
+        let geometry = Geometry {
+            perspective: Some(Perspective {
+                vertical: 0.2,
+                horizontal: 0.0,
+            }),
+            ..Geometry::default()
+        };
+        let baseline = render(
+            &src,
+            &Settings {
+                geometry: geometry.clone(),
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        // Re-rendering the identical (auto_scale: false) geometry is byte-identical.
+        let again = render(
+            &src,
+            &Settings {
+                geometry,
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        assert_eq!(baseline, again);
+    }
+
+    #[test]
+    fn auto_scale_no_geometry_is_a_noop() {
+        // Auto-scale on with no distortion/keystone/straighten is the identity: the
+        // map already fills the frame, so the fill scale is 1 and nothing changes.
+        let mut src = ImageBuf::new(8, 6);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [i as f32 * 0.01, 0.2, 0.3];
+        }
+        let settings = Settings {
+            geometry: Geometry {
+                auto_scale: true,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(render(&src, &settings, &TestBackend), src);
     }
 }
