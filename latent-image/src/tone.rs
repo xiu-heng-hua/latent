@@ -214,4 +214,44 @@ mod tests {
             assert!((c.apply_linear(x) - x).abs() < 1e-5, "x={x}");
         }
     }
+
+    #[test]
+    fn eval_below_zero_clamps_to_the_floor() {
+        // Inputs below 0 clamp to the first table entry rather than extrapolating
+        // downward (the lower end is the toe; there is no headroom below black).
+        let c = ToneCurve::from_fn(|t| t * t);
+        assert_eq!(c.eval(-0.5), c.lut()[0]);
+        assert_eq!(c.eval(-100.0), c.lut()[0]);
+        // The first table entry of `t*t` is 0.
+        assert_eq!(c.eval(-1.0), 0.0);
+    }
+
+    #[test]
+    fn eval_at_one_hits_the_last_entry_via_the_clamp() {
+        // Exactly 1.0 maps to `pos == n - 1`, so the `i >= n - 1` clamp returns the
+        // final table entry exactly (no out-of-range `lut[i + 1]` read).
+        let c = ToneCurve::from_fn(|t| 0.5 * t + 0.25);
+        let last = *c.lut().last().unwrap();
+        assert_eq!(c.eval(1.0), last);
+        assert!((last - 0.75).abs() < 1e-6, "last entry: {last}");
+    }
+
+    #[test]
+    fn eval_high_extrapolation_uses_the_end_slope_from_lut_n_minus_2() {
+        // Above 1.0 the curve extrapolates with the end slope
+        // `(lut[n-1] - lut[n-2]) * (n - 1)`. For a line of slope 2 the LUT samples it
+        // exactly, so the extrapolated value continues that line.
+        let c = ToneCurve::from_fn(|t| 2.0 * t);
+        // At t = 1.5 the line gives 3.0; the end-slope extrapolation must reproduce it.
+        assert!(
+            (c.eval(1.5) - 3.0).abs() < 1e-3,
+            "extrapolated: {}",
+            c.eval(1.5)
+        );
+        // The slope itself is reconstructed from the last two entries.
+        let lut = c.lut();
+        let n = lut.len();
+        let slope = (lut[n - 1] - lut[n - 2]) * (n - 1) as f32;
+        assert!((slope - 2.0).abs() < 1e-3, "end slope: {slope}");
+    }
 }

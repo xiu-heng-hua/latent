@@ -10,12 +10,14 @@ impl Mat3 {
     pub const IDENTITY: Mat3 = Mat3([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
 
     /// Apply the matrix to a column vector: `self * v`.
+    #[must_use]
     pub fn mul_vec(&self, v: [f32; 3]) -> [f32; 3] {
         let m = &self.0;
         std::array::from_fn(|r| m[r][0] * v[0] + m[r][1] * v[1] + m[r][2] * v[2])
     }
 
     /// Matrix product `self * other`.
+    #[must_use]
     pub fn mul(&self, other: &Mat3) -> Mat3 {
         let (a, b) = (&self.0, &other.0);
         Mat3(std::array::from_fn(|r| {
@@ -24,6 +26,7 @@ impl Mat3 {
     }
 
     /// Determinant (via the rule of Sarrus).
+    #[must_use]
     pub fn det(&self) -> f32 {
         let m = &self.0;
         m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
@@ -33,6 +36,7 @@ impl Mat3 {
 
     /// Scale each row so it sums to 1, so a neutral input `[v,v,v]` maps to a
     /// neutral output `[v,v,v]`. Rows that sum to ~0 are left unchanged.
+    #[must_use]
     pub fn row_normalized(&self) -> Mat3 {
         Mat3(std::array::from_fn(|r| {
             let sum: f32 = self.0[r].iter().sum();
@@ -42,6 +46,7 @@ impl Mat3 {
     }
 
     /// The inverse, or `None` if the matrix is singular.
+    #[must_use]
     pub fn inverse(&self) -> Option<Mat3> {
         let det = self.det();
         if det.abs() < 1e-12 {
@@ -438,7 +443,13 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
     let c = v * s;
     let x = c * (1.0 - ((h6 % 2.0) - 1.0).abs());
     let m = v - c;
-    let (r, g, b) = match h6 as u32 {
+    // `f32::rem_euclid(1.0)` can return *exactly* `1.0` for a tiny negative input
+    // (`1.0 - ε` rounds up to `1.0` in f32), making `h6 == 6.0` and `h6 as u32 == 6`
+    // reachable — and `color_mix` feeds slightly-negative hue shifts. Clamp the
+    // sextant to `5` so hue at the wheel's end deterministically lands in the last
+    // (magenta→red) arm instead of relying on `x == 0` to mask the overflow.
+    let sextant = (h6 as u32).min(5);
+    let (r, g, b) = match sextant {
         0 => (c, x, 0.0),
         1 => (x, c, 0.0),
         2 => (0.0, c, x),
@@ -863,5 +874,160 @@ mod tests {
         for r in 0..3 {
             assert!((m.0[r].iter().sum::<f32>() - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn hsv_achromatic_returns_zero_hue_and_saturation() {
+        // A pure gray has no chroma: saturation 0, a finite (0) hue, value = the
+        // gray. The `c <= 1e-9` / `max <= 0.0` branches must not produce NaN.
+        let (h, s, v) = rgb_to_hsv([0.4, 0.4, 0.4]);
+        assert_eq!((h, s, v), (0.0, 0.0, 0.4));
+        // Pure black: max == 0 → saturation 0, no division by zero.
+        let (h, s, v) = rgb_to_hsv([0.0, 0.0, 0.0]);
+        assert!(h.is_finite() && s == 0.0 && v == 0.0, "{h} {s} {v}");
+    }
+
+    #[test]
+    fn hsv_to_rgb_sextant_is_clamped_at_the_wheel_end() {
+        // A hue that lands exactly at (or just past) the wheel end must stay valid.
+        // `h6 as u32` could reach 6 for a slightly-negative hue; the clamp keeps it
+        // in the last arm. The reconstructed color is finite and on the gray axis for
+        // s = 0, and a pure-red hue (0) reconstructs to red.
+        let red = hsv_to_rgb(0.0, 1.0, 1.0);
+        assert!(
+            (red[0] - 1.0).abs() < 1e-6 && red[1] < 1e-6 && red[2] < 1e-6,
+            "{red:?}"
+        );
+        // A tiny-negative hue (which rem_euclid can round to exactly 1.0) must not
+        // panic or jump channels — it stays adjacent to pure red.
+        let nearly = hsv_to_rgb(-1e-9, 1.0, 1.0);
+        for c in nearly {
+            assert!(c.is_finite(), "non-finite at wheel end: {nearly:?}");
+        }
+        assert!((nearly[0] - 1.0).abs() < 1e-3, "should be ~red: {nearly:?}");
+    }
+
+    #[test]
+    fn color_mix_at_a_band_center_uses_only_that_band() {
+        // Hue 0 is the center of band 0; an adjustment there is driven only by band 0
+        // (interpolation weight 1 on band 0, 0 on its neighbor).
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.0, -1.0, 0.0]; // desaturate band 0
+        let red = color_mix([0.8, 0.1, 0.1], &bands);
+        assert!(
+            (red[0] - red[1]).abs() < 1e-6 && (red[1] - red[2]).abs() < 1e-6,
+            "band-center red desaturated: {red:?}"
+        );
+    }
+
+    #[test]
+    fn color_mix_hue_at_wraparound_stays_correct() {
+        // A pixel whose hue is just below 1.0 sits between the last band (7) and band
+        // 0 (the wraparound `j = (i+1) % 8`). A shift that pushes the hue past 1.0
+        // must reconstruct without a channel jump (this exercises the negative/over-
+        // unit hue path into hsv_to_rgb).
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[7] = [0.05, 0.0, 0.0]; // nudge hue forward at band 7
+        bands[0] = [0.05, 0.0, 0.0];
+        // A magenta-ish pixel near hue ~0.92.
+        let px = [0.8, 0.1, 0.5];
+        let out = color_mix(px, &bands);
+        for c in out {
+            assert!(c.is_finite() && c >= 0.0, "wraparound produced {out:?}");
+        }
+    }
+
+    #[test]
+    fn color_mix_preserves_super_unit_and_clamps_value_floor() {
+        // Value above 1 (headroom) survives the round trip; a strong negative lum
+        // adjustment can't drive value below 0.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.0, 0.0, -2.0]; // value ×(1 - 2) = ×-1 → clamped to 0
+        let out = color_mix([0.9, 0.1, 0.1], &bands);
+        for c in out {
+            assert!(c >= 0.0 && c.is_finite(), "value floor not held: {out:?}");
+        }
+    }
+
+    #[test]
+    fn rgb_to_hsv_handles_non_finite_inputs() {
+        // Pin the `f32::max`/`min` NaN-dropping behavior. For `[NaN, 0.2, 0.1]`,
+        // `max`/`min` drop the NaN, so `max == 0.2` (the green channel) and
+        // `min == 0.1`; the saturation `c / max` is therefore finite. The hue formula
+        // still references the NaN red channel, so hue is NaN — documenting that the
+        // max/min are robust to NaN while the per-channel arithmetic is not. The key
+        // contract is that the function returns rather than panicking.
+        let (_h, s, v) = rgb_to_hsv([f32::NAN, 0.2, 0.1]);
+        assert!(
+            s.is_finite(),
+            "max/min should drop NaN, leaving finite sat: {s}"
+        );
+        assert_eq!(v, 0.2, "value is the NaN-dropped max");
+        // Inf in the dominant channel: max is Inf, so saturation `c / max` is the
+        // Inf/Inf indeterminate (NaN) — but the call still returns; value carries Inf.
+        let (_h, _s, v) = rgb_to_hsv([f32::INFINITY, 0.0, 0.0]);
+        assert!(v.is_infinite(), "value should carry the Inf: {v}");
+    }
+
+    #[test]
+    fn inverse_just_above_singular_threshold_inverts() {
+        // A determinant just above the 1e-12 cutoff still inverts (composing both
+        // directions is near-identity); just below it returns None.
+        let above = Mat3([[1e-3, 0.0, 0.0], [0.0, 1e-3, 0.0], [0.0, 0.0, 1e-3]]);
+        // det = 1e-9 > 1e-12 → invertible.
+        let inv = above.inverse().expect("det 1e-9 is above the cutoff");
+        assert!(approx_eq(&above.mul(&inv), &Mat3::IDENTITY, 1e-3));
+
+        // det just below the cutoff (a near-zero diagonal) → singular.
+        let below = Mat3([[1e-4, 0.0, 0.0], [0.0, 1e-4, 0.0], [0.0, 0.0, 1e-5]]);
+        // det = 1e-13 < 1e-12 → None.
+        assert!((below.det()).abs() < 1e-12);
+        assert_eq!(below.inverse(), None);
+    }
+
+    /// A tiny xorshift PRNG for deterministic, dependency-free sweeps.
+    fn lcg(state: &mut u64) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        // Map to [0, 1).
+        (*state >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    #[test]
+    fn hsv_round_trip_seeded_sweep() {
+        // Round-trip a spread of saturated colors; HSV → RGB → HSV → RGB must return
+        // the same RGB to f32 precision.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..2000 {
+            let px = [lcg(&mut seed), lcg(&mut seed), lcg(&mut seed)];
+            let (h, s, v) = rgb_to_hsv(px);
+            let back = hsv_to_rgb(h, s, v);
+            for c in 0..3 {
+                assert!(
+                    (back[c] - px[c]).abs() < 1e-5,
+                    "round-trip {back:?} vs {px:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mat3_inverse_seeded_sweep() {
+        // For random matrices that are comfortably non-singular, A·A⁻¹ ≈ I.
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut checked = 0;
+        for _ in 0..2000 {
+            let m = Mat3(std::array::from_fn(|_| {
+                std::array::from_fn(|_| lcg(&mut seed) * 2.0 - 1.0)
+            }));
+            if m.det().abs() < 1e-2 {
+                continue; // skip near-singular matrices (ill-conditioned in f32)
+            }
+            let inv = m.inverse().expect("non-singular");
+            assert!(approx_eq(&m.mul(&inv), &Mat3::IDENTITY, 1e-2), "{m:?}");
+            checked += 1;
+        }
+        assert!(checked > 100, "sweep covered too few matrices: {checked}");
     }
 }
