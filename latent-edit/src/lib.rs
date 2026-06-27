@@ -143,6 +143,23 @@ fn select_luma(p: [f32; 3]) -> f32 {
     0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
 }
 
+/// Force a single value finite, then clamp it into `[lo, hi]`.
+///
+/// Order matters: `f32::clamp` returns `NaN` unchanged for a `NaN` input, so the
+/// non-finite scrub to `neutral` must come *first* — only then does the clamp
+/// see a real number. The neutral is the field's own default, so scrubbing a
+/// corrupt value restores the no-op rather than an arbitrary edge of the range.
+fn finite_clamped(x: f32, neutral: f32, lo: f32, hi: f32) -> f32 {
+    let scrubbed = if x.is_finite() { x } else { neutral };
+    scrubbed.clamp(lo, hi)
+}
+
+/// Force a single value finite (to `neutral` if not), leaving its magnitude
+/// otherwise untouched — for fields with no documented bound.
+fn finite_or(x: f32, neutral: f32) -> f32 {
+    if x.is_finite() { x } else { neutral }
+}
+
 /// A smooth band: `1` for `v` in `[lo, hi]`, ramping to `0` over `feather` on
 /// each side. `feather <= 0` gives a hard band.
 fn band(v: f32, lo: f32, hi: f32, feather: f32) -> f32 {
@@ -184,7 +201,12 @@ fn hue_distance(a: f32, b: f32) -> f32 {
 /// A luminosity-range selection: full weight where the pixel's brightness is in
 /// `[lo, hi]`, feathered on each side. Position-independent — it selects tones
 /// wherever they occur. (See [`select_luma`].)
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The default is an all-zero band (a single point at `0` with no feather),
+/// which selects a negligible sliver — a benign no-op, the right neutral when a
+/// field is missing from an older sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LuminanceRange {
     pub lo: f32,
     pub hi: f32,
@@ -200,7 +222,12 @@ impl LuminanceRange {
 /// A hue-range selection: full weight where the pixel's hue is within
 /// `hue_width` of `hue` (on the color wheel) and at least `sat_min` saturated,
 /// feathered over `feather`. Position-independent.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The default is all-zero: a zero-width band at hue `0` that, with `sat_min` 0,
+/// selects nothing — a benign no-op, the right neutral when a field is missing
+/// from an older sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ColorRange {
     /// Target hue in turns, `[0, 1)`.
     pub hue: f32,
@@ -229,7 +256,12 @@ impl ColorRange {
 
 /// A linear gradient: weight ramps `0 → 1` from the line through `(x0, y0)` to
 /// the line through `(x1, y1)`, clamped flat outside that band. Normalized.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The default is a zero-length gradient (both endpoints at the origin), which
+/// is treated as empty (`weight_at` returns `0`) — a benign no-op, the right
+/// neutral when a field is missing from an older sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Gradient {
     pub x0: f32,
     pub y0: f32,
@@ -251,7 +283,12 @@ impl Gradient {
 /// A radial mask: weight `1` within `radius` of the center `(cx, cy)`, fading to
 /// `0` over `feather`, in normalized coordinates. (Distance is measured in
 /// normalized units, so the falloff is elliptical on non-square images.)
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The default is all-zero: a zero-radius, zero-feather disc that selects
+/// nothing — a benign no-op, the right neutral when a field is missing from an
+/// older sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Radial {
     pub cx: f32,
     pub cy: f32,
@@ -282,7 +319,11 @@ pub struct Brush {
 /// One brush stamp: a soft disc at `(x, y)` of `radius`, fading to `0` over
 /// `feather` (normalized units, like [`Radial`]). `erase` subtracts coverage
 /// instead of adding it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The default is all-zero: a zero-radius paint dab that covers nothing — a
+/// benign no-op, the right neutral when a field is missing from an older sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Dab {
     pub x: f32,
     pub y: f32,
@@ -575,6 +616,202 @@ pub struct Crop {
     pub height: f32,
 }
 
+// --- Sanitize-on-load ------------------------------------------------------
+//
+// A sidecar is untrusted input: RON accepts `NaN`/`inf` as float literals, and a
+// hand-edited or corrupt file can carry an out-of-range `opacity` or feather
+// verbatim. The documented invariants ("opacity in `[0, 1]`", adjustments
+// "roughly `[-1, 1]`", a feather `>= 0`) are otherwise only advisory. The
+// `sanitize` pass below makes them real: it walks the whole settings tree and,
+// for every float, scrubs any non-finite value to its neutral and clamps every
+// documented range. Run once on load (see [`Document::from_ron`]), this lets the
+// rest of the codebase — the render math, the tone/curve evaluation — assume
+// finite, in-range values. Sanitizing an already-clean `Settings` is a no-op.
+
+impl Settings {
+    /// Scrub every non-finite float and clamp every documented range across the
+    /// whole settings tree (global + locals + geometry), in place.
+    pub fn sanitize(&mut self) {
+        self.global.sanitize();
+        for local in &mut self.locals {
+            local.adjustments.sanitize();
+            // Opacity is a blend strength in `[0, 1]`; full opacity is neutral.
+            local.opacity = finite_clamped(local.opacity, 1.0, 0.0, 1.0);
+            local.mask.sanitize();
+        }
+        self.geometry.sanitize();
+    }
+}
+
+impl Adjustments {
+    /// Scrub/clamp every adjustment. Used for both the global adjustments and
+    /// each local's, so the two cannot drift.
+    fn sanitize(&mut self) {
+        // Exposure (stops) and saturation are signed/unbounded factors; only
+        // finiteness is enforced. Neutral exposure is `0` EV, neutral saturation
+        // is `1` (unchanged); saturation has no meaning below `0`.
+        if let Some(exposure) = &mut self.exposure {
+            *exposure = finite_or(*exposure, 0.0);
+        }
+        if let Some(saturation) = &mut self.saturation {
+            *saturation = finite_clamped(*saturation, 1.0, 0.0, f32::MAX);
+        }
+        // Dehaze is a strength in `[0, 1]`; `0` (and `None`) is off.
+        if let Some(dehaze) = &mut self.dehaze {
+            *dehaze = finite_clamped(*dehaze, 0.0, 0.0, 1.0);
+        }
+        if let Some(wb) = &mut self.white_balance {
+            wb.temp = finite_or(wb.temp, 0.0);
+            wb.tint = finite_or(wb.tint, 0.0);
+        }
+        if let Some(tone) = &mut self.tone {
+            // Each range is neutral at `0`, documented as roughly `[-1, 1]`.
+            tone.contrast = finite_clamped(tone.contrast, 0.0, -1.0, 1.0);
+            tone.highlights = finite_clamped(tone.highlights, 0.0, -1.0, 1.0);
+            tone.shadows = finite_clamped(tone.shadows, 0.0, -1.0, 1.0);
+            tone.blacks = finite_clamped(tone.blacks, 0.0, -1.0, 1.0);
+        }
+        if let Some(curves) = &mut self.curves {
+            curves.sanitize();
+        }
+        if let Some(hsl) = &mut self.hsl {
+            for band in &mut hsl.bands {
+                for v in band {
+                    *v = finite_or(*v, 0.0);
+                }
+            }
+        }
+        if let Some(mixer) = &mut self.channel_mixer {
+            for row in &mut mixer.matrix {
+                for v in row {
+                    *v = finite_or(*v, 0.0);
+                }
+            }
+        }
+        if let Some(sharpen) = &mut self.sharpen {
+            // Amount is signed-ish strength; radius is a magnitude in pixels.
+            sharpen.amount = finite_or(sharpen.amount, 0.0);
+            sharpen.radius = finite_clamped(sharpen.radius, 0.0, 0.0, f32::MAX);
+        }
+        if let Some(clarity) = &mut self.clarity {
+            clarity.amount = finite_or(clarity.amount, 0.0);
+            clarity.radius = finite_clamped(clarity.radius, 0.0, 0.0, f32::MAX);
+        }
+        if let Some(nr) = &mut self.noise_reduction {
+            // Radius and both strengths are magnitudes (`>= 0`); `0` is off.
+            nr.radius = finite_clamped(nr.radius, 0.0, 0.0, f32::MAX);
+            nr.luminance = finite_clamped(nr.luminance, 0.0, 0.0, f32::MAX);
+            nr.color = finite_clamped(nr.color, 0.0, 0.0, f32::MAX);
+        }
+    }
+}
+
+impl Curves {
+    /// Drop any control point with a non-finite coordinate and clamp the
+    /// survivors into the `[0, 1]` perceptual domain. The render-side evaluator
+    /// stays total regardless, but cleaning the stored points here keeps the data
+    /// model honest and the two agree on which points are valid.
+    fn sanitize(&mut self) {
+        for channel in [
+            &mut self.master,
+            &mut self.red,
+            &mut self.green,
+            &mut self.blue,
+        ] {
+            channel.retain(|(x, y)| x.is_finite() && y.is_finite());
+            for (x, y) in channel.iter_mut() {
+                *x = x.clamp(0.0, 1.0);
+                *y = y.clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
+impl Mask {
+    /// Scrub/clamp every shape in the mask, in place.
+    fn sanitize(&mut self) {
+        for shape in &mut self.shapes {
+            shape.sanitize();
+        }
+    }
+}
+
+impl MaskShape {
+    /// Scrub/clamp the shape's parameters: positions and centers are coordinates
+    /// (finite only), radii and feathers are magnitudes (finite and `>= 0`).
+    fn sanitize(&mut self) {
+        match self {
+            MaskShape::Gradient(g) => {
+                g.x0 = finite_or(g.x0, 0.0);
+                g.y0 = finite_or(g.y0, 0.0);
+                g.x1 = finite_or(g.x1, 0.0);
+                g.y1 = finite_or(g.y1, 0.0);
+            }
+            MaskShape::Radial(r) => {
+                r.cx = finite_or(r.cx, 0.0);
+                r.cy = finite_or(r.cy, 0.0);
+                r.radius = finite_clamped(r.radius, 0.0, 0.0, f32::MAX);
+                r.feather = finite_clamped(r.feather, 0.0, 0.0, f32::MAX);
+            }
+            MaskShape::Luminosity(l) => {
+                l.lo = finite_or(l.lo, 0.0);
+                l.hi = finite_or(l.hi, 0.0);
+                l.feather = finite_clamped(l.feather, 0.0, 0.0, f32::MAX);
+            }
+            MaskShape::ColorRange(c) => {
+                c.hue = finite_or(c.hue, 0.0);
+                c.hue_width = finite_clamped(c.hue_width, 0.0, 0.0, f32::MAX);
+                c.sat_min = finite_clamped(c.sat_min, 0.0, 0.0, f32::MAX);
+                c.feather = finite_clamped(c.feather, 0.0, 0.0, f32::MAX);
+            }
+            MaskShape::Brush(b) => {
+                for dab in &mut b.dabs {
+                    dab.x = finite_or(dab.x, 0.0);
+                    dab.y = finite_or(dab.y, 0.0);
+                    dab.radius = finite_clamped(dab.radius, 0.0, 0.0, f32::MAX);
+                    dab.feather = finite_clamped(dab.feather, 0.0, 0.0, f32::MAX);
+                }
+            }
+        }
+    }
+}
+
+impl Geometry {
+    /// Scrub/clamp the geometry: the straighten angle and the keystone/lens/
+    /// vignette parameters (finite), and the crop rectangle (finite, with a
+    /// non-negative size).
+    fn sanitize(&mut self) {
+        self.straighten_degrees = finite_or(self.straighten_degrees, 0.0);
+        if let Some(crop) = &mut self.crop {
+            crop.x = finite_or(crop.x, 0.0);
+            crop.y = finite_or(crop.y, 0.0);
+            crop.width = finite_clamped(crop.width, 0.0, 0.0, f32::MAX);
+            crop.height = finite_clamped(crop.height, 0.0, 0.0, f32::MAX);
+        }
+        if let Some(p) = &mut self.perspective {
+            p.vertical = finite_or(p.vertical, 0.0);
+            p.horizontal = finite_or(p.horizontal, 0.0);
+        }
+        if let Some(lens) = &mut self.lens {
+            // A non-finite optical center falls back to the frame center.
+            lens.center[0] = finite_or(lens.center[0], 0.5);
+            lens.center[1] = finite_or(lens.center[1], 0.5);
+            for d in &mut lens.distortion {
+                *d = finite_or(*d, 0.0);
+            }
+            for c in &mut lens.ca {
+                *c = finite_or(*c, 0.0);
+            }
+            for v in &mut lens.vignetting {
+                *v = finite_or(*v, 0.0);
+            }
+        }
+        if let Some(vignette) = &mut self.vignette {
+            *vignette = finite_or(*vignette, 0.0);
+        }
+    }
+}
+
 /// A saved edit document: a schema version plus one or more variants —
 /// independent edits of the same source image. This is what a sidecar stores.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -599,14 +836,23 @@ impl Document {
     /// build understands is rejected (rather than silently misreading a future
     /// schema); an older one still loads, since `#[serde(default)]` on the
     /// settings structs fills any fields it predates.
+    ///
+    /// Every loaded variant is then [sanitized](Settings::sanitize): a sidecar is
+    /// untrusted input, so any non-finite float is scrubbed to its neutral and
+    /// every documented range is clamped before the value is handed back. The
+    /// result is always safe, in-range data — or a clean `Err` for a parse
+    /// failure — never a panic and never a propagated `NaN`/`inf`.
     pub fn from_ron(text: &str) -> Result<Self, String> {
-        let doc: Document = ron::from_str(text).map_err(|e| e.to_string())?;
+        let mut doc: Document = ron::from_str(text).map_err(|e| e.to_string())?;
         if doc.version > Self::VERSION {
             return Err(format!(
                 "sidecar schema version {} is newer than supported {}",
                 doc.version,
                 Self::VERSION
             ));
+        }
+        for variant in &mut doc.variants {
+            variant.sanitize();
         }
         Ok(doc)
     }
@@ -1015,5 +1261,228 @@ mod tests {
         let text = "(version: 999, variants: [(global: ())])";
         let err = Document::from_ron(text).expect_err("newer version should fail");
         assert!(err.contains("newer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn sanitize_replaces_non_finite_with_neutral() {
+        // NaN/inf anywhere in the tree are scrubbed to each field's neutral.
+        let mut s = Settings {
+            global: Adjustments {
+                exposure: Some(f32::NAN),
+                saturation: Some(f32::INFINITY),
+                curves: Some(Curves {
+                    master: vec![(0.0, 0.0), (f32::NAN, 0.5), (1.0, 1.0)],
+                    red: Vec::new(),
+                    green: Vec::new(),
+                    blue: Vec::new(),
+                }),
+                ..Adjustments::default()
+            },
+            locals: vec![LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![MaskShape::Radial(Radial {
+                        cx: 0.5,
+                        cy: 0.5,
+                        radius: 0.2,
+                        feather: f32::NAN,
+                    })],
+                    ops: Vec::new(),
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            }],
+            geometry: Geometry::default(),
+        };
+        s.sanitize();
+
+        assert_eq!(s.global.exposure, Some(0.0)); // NaN → neutral exposure
+        assert_eq!(s.global.saturation, Some(1.0)); // inf → neutral saturation
+        // The NaN-x curve point is dropped; the finite ones survive.
+        let master = &s.global.curves.as_ref().unwrap().master;
+        assert_eq!(master, &vec![(0.0, 0.0), (1.0, 1.0)]);
+        // The NaN feather is scrubbed to its neutral (0 → hard edge), finite.
+        let MaskShape::Radial(r) = &s.locals[0].mask.shapes[0] else {
+            panic!("expected a radial");
+        };
+        assert_eq!(r.feather, 0.0);
+        assert!(r.feather.is_finite());
+    }
+
+    #[test]
+    fn sanitize_clamps_opacity_out_of_range() {
+        let mut over = LocalAdjustment {
+            opacity: 5.0,
+            ..LocalAdjustment::default()
+        };
+        let mut under = LocalAdjustment {
+            opacity: -2.0,
+            ..LocalAdjustment::default()
+        };
+        let mut s = Settings {
+            locals: vec![over.clone(), under.clone()],
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.locals[0].opacity, 1.0); // 5.0 → 1.0
+        assert_eq!(s.locals[1].opacity, 0.0); // -2.0 → 0.0
+
+        // A non-finite opacity scrubs to the neutral (1.0) before clamping.
+        over.opacity = f32::NAN;
+        under.opacity = f32::NEG_INFINITY;
+        let mut s = Settings {
+            locals: vec![over, under],
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.locals[0].opacity, 1.0);
+        assert_eq!(s.locals[1].opacity, 1.0);
+    }
+
+    #[test]
+    fn sanitize_clamps_adjustment_ranges() {
+        let mut s = Settings {
+            global: Adjustments {
+                tone: Some(SelectiveTone {
+                    contrast: 5.0,    // past the documented [-1, 1]
+                    highlights: -3.0, // past the documented [-1, 1]
+                    shadows: 0.2,     // in range, untouched
+                    blacks: 0.0,
+                }),
+                dehaze: Some(2.5), // past the documented [0, 1]
+                ..Adjustments::default()
+            },
+            ..Settings::default()
+        };
+        s.sanitize();
+        let tone = s.global.tone.unwrap();
+        assert_eq!(tone.contrast, 1.0);
+        assert_eq!(tone.highlights, -1.0);
+        assert_eq!(tone.shadows, 0.2);
+        assert_eq!(s.global.dehaze, Some(1.0));
+    }
+
+    #[test]
+    fn sanitize_is_a_no_op_on_clean_settings() {
+        // A valid, populated document survives sanitize unchanged (idempotence).
+        let s = Settings {
+            global: Adjustments {
+                exposure: Some(0.5),
+                saturation: Some(1.2),
+                tone: Some(SelectiveTone {
+                    contrast: 0.3,
+                    highlights: -0.2,
+                    shadows: 0.1,
+                    blacks: 0.0,
+                }),
+                dehaze: Some(0.4),
+                curves: Some(Curves {
+                    master: vec![(0.0, 0.0), (0.5, 0.6), (1.0, 1.0)],
+                    ..Curves::default()
+                }),
+                ..Adjustments::default()
+            },
+            locals: vec![LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![MaskShape::Radial(Radial {
+                        cx: 0.5,
+                        cy: 0.5,
+                        radius: 0.2,
+                        feather: 0.1,
+                    })],
+                    ops: Vec::new(),
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 0.5,
+            }],
+            geometry: Geometry::default(),
+        };
+        let mut sanitized = s.clone();
+        sanitized.sanitize();
+        assert_eq!(sanitized, s);
+    }
+
+    #[test]
+    fn from_ron_sanitizes_on_load() {
+        // A hand-written sidecar with NaN/inf and an out-of-range opacity loads
+        // to finite, clamped values rather than carrying the bad data through.
+        let text = "(version: 1, variants: [(\
+            global: (exposure: Some(NaN)), \
+            locals: [(mask: (), adjustments: (), opacity: 5.0)]\
+        )])";
+        let doc = Document::from_ron(text).expect("malformed-but-parseable sidecar should load");
+        let s = &doc.variants[0];
+        assert_eq!(s.global.exposure, Some(0.0)); // NaN scrubbed to neutral
+        assert!(s.global.exposure.unwrap().is_finite());
+        assert_eq!(s.locals[0].opacity, 1.0); // 5.0 clamped to 1.0
+    }
+
+    #[test]
+    fn garbage_ron_is_a_clean_error_not_a_panic() {
+        let err = Document::from_ron("this is not ron at all {{{")
+            .expect_err("garbage input should error");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn mask_shapes_load_with_missing_fields() {
+        // Each mask-shape leaf carries `#[serde(default)]`, so a sidecar that
+        // omits a field on any shape fills it with the neutral default instead of
+        // erroring — the forward-compat guarantee that lets a shape gain fields
+        // without breaking previously-saved sidecars.
+
+        // Gradient with `x1` omitted → default 0.0.
+        let text = "(version: 1, variants: [(locals: [(\
+            mask: (shapes: [Gradient((x0: 0.1, y0: 0.2, y1: 0.4))]), opacity: 1.0)\
+        ])])";
+        let doc = Document::from_ron(text).expect("gradient with a missing field should load");
+        let MaskShape::Gradient(g) = &doc.variants[0].locals[0].mask.shapes[0] else {
+            panic!("expected a gradient");
+        };
+        assert_eq!(g.x1, 0.0);
+
+        // Radial with `feather` omitted → default 0.0.
+        let text = "(version: 1, variants: [(locals: [(\
+            mask: (shapes: [Radial((cx: 0.5, cy: 0.5, radius: 0.2))]), opacity: 1.0)\
+        ])])";
+        let doc = Document::from_ron(text).expect("radial with a missing field should load");
+        let MaskShape::Radial(r) = &doc.variants[0].locals[0].mask.shapes[0] else {
+            panic!("expected a radial");
+        };
+        assert_eq!(r.feather, 0.0);
+
+        // Dab with `erase` omitted → default false.
+        let text = "(version: 1, variants: [(locals: [(\
+            mask: (shapes: [Brush((dabs: [(x: 0.5, y: 0.5, radius: 0.2, feather: 0.0)]))]), \
+            opacity: 1.0)\
+        ])])";
+        let doc = Document::from_ron(text).expect("dab with a missing field should load");
+        let MaskShape::Brush(b) = &doc.variants[0].locals[0].mask.shapes[0] else {
+            panic!("expected a brush");
+        };
+        assert!(!b.dabs[0].erase);
+
+        // Luminosity range with `hi` omitted → default 0.0.
+        let text = "(version: 1, variants: [(locals: [(\
+            mask: (shapes: [Luminosity((lo: 0.0, feather: 0.05))]), opacity: 1.0)\
+        ])])";
+        let doc =
+            Document::from_ron(text).expect("luminance range with a missing field should load");
+        let MaskShape::Luminosity(l) = &doc.variants[0].locals[0].mask.shapes[0] else {
+            panic!("expected a luminosity range");
+        };
+        assert_eq!(l.hi, 0.0);
+
+        // Color range with `sat_min` omitted → default 0.0.
+        let text = "(version: 1, variants: [(locals: [(\
+            mask: (shapes: [ColorRange((hue: 0.0, hue_width: 0.05, feather: 0.05))]), \
+            opacity: 1.0)\
+        ])])";
+        let doc = Document::from_ron(text).expect("color range with a missing field should load");
+        let MaskShape::ColorRange(c) = &doc.variants[0].locals[0].mask.shapes[0] else {
+            panic!("expected a color range");
+        };
+        assert_eq!(c.sat_min, 0.0);
     }
 }

@@ -1,5 +1,7 @@
 //! Undo/redo history over an edit value.
 
+use std::collections::VecDeque;
+
 /// Undo/redo history over a value (e.g. a [`crate::Settings`]).
 ///
 /// An edit is a transaction: [`begin`](Self::begin) snapshots the state before a
@@ -8,21 +10,43 @@
 /// to where it started, or the same value re-entered) creates no history.
 /// Calling `begin`/`commit` once per gesture (not per frame) keeps a drag a
 /// single undo step.
+///
+/// The undo stack is **bounded**: each step deep-clones the whole value (every
+/// `Vec<LocalAdjustment>`, every brush-dab list), so an unbounded stack is a slow
+/// memory leak over a long session. Past [`capacity`](Self::with_capacity) steps
+/// the oldest is evicted, so only the most-recent `capacity` edits stay undoable.
+/// The redo stack needs no cap: it is cleared on every new committed edit, so it
+/// can never exceed the undo depth.
 #[derive(Debug, Clone)]
 pub struct History<T> {
     current: T,
-    undo: Vec<T>,
+    undo: VecDeque<T>,
     redo: Vec<T>,
+    /// The most-recent edits to retain; older steps are evicted on `commit`.
+    capacity: usize,
     /// Pre-gesture snapshot, set by `begin`, consumed by `commit`.
     pending: Option<T>,
 }
 
 impl<T: Clone + PartialEq> History<T> {
+    /// The default number of undo steps retained (see [`Self::with_capacity`]).
+    pub const DEFAULT_CAP: usize = 100;
+
+    /// A history with the [default capacity](Self::DEFAULT_CAP).
     pub fn new(initial: T) -> Self {
+        Self::with_capacity(initial, Self::DEFAULT_CAP)
+    }
+
+    /// A history that retains at least the most-recent `capacity` undo steps.
+    ///
+    /// `capacity` is floored at `1` (a zero cap would discard every step the
+    /// moment it is recorded, making undo useless).
+    pub fn with_capacity(initial: T, capacity: usize) -> Self {
         Self {
             current: initial,
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
+            capacity: capacity.max(1),
             pending: None,
         }
     }
@@ -46,18 +70,25 @@ impl<T: Clone + PartialEq> History<T> {
     /// End an edit gesture: if the state changed since `begin`, record an undo
     /// step and clear the redo branch; otherwise discard the snapshot so a no-op
     /// gesture leaves no trace.
+    ///
+    /// Eviction happens strictly after a step is recorded, so it never perturbs
+    /// the no-op path or the redo invalidation: only a real recorded edit can
+    /// push the stack over capacity, and only then is the oldest step dropped.
     pub fn commit(&mut self) {
         if let Some(prev) = self.pending.take()
             && prev != self.current
         {
-            self.undo.push(prev);
+            self.undo.push_back(prev);
             self.redo.clear();
+            while self.undo.len() > self.capacity {
+                self.undo.pop_front();
+            }
         }
     }
 
     /// Restore the previous checkpoint; returns false if there is nothing to undo.
     pub fn undo(&mut self) -> bool {
-        match self.undo.pop() {
+        match self.undo.pop_back() {
             Some(prev) => {
                 self.redo.push(std::mem::replace(&mut self.current, prev));
                 true
@@ -70,7 +101,8 @@ impl<T: Clone + PartialEq> History<T> {
     pub fn redo(&mut self) -> bool {
         match self.redo.pop() {
             Some(next) => {
-                self.undo.push(std::mem::replace(&mut self.current, next));
+                self.undo
+                    .push_back(std::mem::replace(&mut self.current, next));
                 true
             }
             None => false,
@@ -133,6 +165,63 @@ mod tests {
 
         edit(&mut h, 9); // new edit
         assert!(!h.can_redo()); // redo branch discarded
+    }
+
+    #[test]
+    fn an_empty_history_undoes_and_redoes_to_nothing() {
+        // A fresh history has nothing to undo or redo: both return false, no panic.
+        let mut h = History::new(0);
+        assert!(!h.undo());
+        assert!(!h.redo());
+        assert_eq!(*h.current(), 0);
+    }
+
+    #[test]
+    fn history_caps_undo_depth() {
+        // Commit more distinct edits than the default cap. The stack must stay
+        // bounded, and undoing all the way back lands on the value that was
+        // current `DEFAULT_CAP` steps ago — not the original, whose step was
+        // evicted as the oldest.
+        let cap = History::<i32>::DEFAULT_CAP;
+        let mut h = History::new(0);
+        let extra = 5;
+        for v in 1..=(cap + extra) as i32 {
+            edit(&mut h, v);
+        }
+        assert_eq!(*h.current(), (cap + extra) as i32);
+
+        // Undo as far as possible; count the steps to confirm the bound.
+        let mut steps = 0;
+        while h.undo() {
+            steps += 1;
+        }
+        assert_eq!(steps, cap, "exactly the most-recent `cap` steps remain");
+        // The oldest `extra` steps were evicted, so we cannot reach `0`; the
+        // earliest reachable state is the value that was current `cap` steps back.
+        assert_eq!(*h.current(), extra as i32);
+    }
+
+    #[test]
+    fn with_capacity_respects_a_custom_cap() {
+        let mut h = History::with_capacity(0, 3);
+        for v in 1..=10 {
+            edit(&mut h, v);
+        }
+        let mut steps = 0;
+        while h.undo() {
+            steps += 1;
+        }
+        assert_eq!(steps, 3, "custom cap bounds the stack");
+        // Three steps back from 10 (the last recorded `prev` values are 9, 8, 7).
+        assert_eq!(*h.current(), 7);
+
+        // A zero cap is floored to 1, so at least the last step stays undoable.
+        let mut floored = History::with_capacity(0, 0);
+        edit(&mut floored, 1);
+        edit(&mut floored, 2);
+        assert!(floored.undo());
+        assert_eq!(*floored.current(), 1);
+        assert!(!floored.undo(), "only one step retained at the floored cap");
     }
 
     #[test]

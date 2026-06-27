@@ -294,7 +294,12 @@ impl Warp {
 /// never in a backend. A backend may implement the primitives however it likes
 /// (on the CPU now, elsewhere later) as long as the results match. More
 /// primitives are added to this trait as the pipeline grows.
-pub trait Backend {
+///
+/// The trait is `Send + Sync` so a backend can be moved to or shared across a
+/// worker thread (rendering and export off the UI thread): every implementation
+/// is either stateless or holds only thread-safe device handles, so the bound is
+/// satisfied today and pinned here against a future implementation that is not.
+pub trait Backend: Send + Sync {
     /// Apply a per-pixel operation to every pixel of the image, in place.
     fn map_pixels(&self, img: &mut ImageBuf, op: &PointOp);
 
@@ -1762,5 +1767,17 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(render(&src, &settings, &TestBackend), src);
+    }
+
+    #[test]
+    fn backend_is_send_and_sync() {
+        // The `Send + Sync` supertrait is what lets a backend move to or be
+        // shared across a worker thread (off-thread render/export). Pin it at the
+        // type level: this fails to compile if a backend impl ever loses the
+        // bound. The `dyn Backend` line confirms a shared trait object carries it
+        // too — a future non-`Send` impl could not satisfy the supertrait.
+        fn assert_send_sync<T: ?Sized + Send + Sync>() {}
+        assert_send_sync::<TestBackend>();
+        assert_send_sync::<dyn Backend>();
     }
 }

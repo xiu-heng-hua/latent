@@ -300,6 +300,14 @@ mod tests {
     use latent_pipeline::{Extent, render};
 
     #[test]
+    fn backend_is_send_and_sync() {
+        // `Backend: Send + Sync` must hold for the real CPU backend so it can be
+        // moved to or shared across a worker thread. Pinned at the type level.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CpuBackend>();
+    }
+
+    #[test]
     fn map_pixels_identity_leaves_the_image_unchanged() {
         let mut img = ImageBuf::new(2, 2);
         img.set(0, 0, [0.1, 0.2, 0.3]);
