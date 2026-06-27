@@ -6,6 +6,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use gui::BackendKind;
 use latent_cpu::CpuBackend;
 use latent_image::ImageBuf;
 use latent_image::color;
@@ -64,17 +65,18 @@ enum Command {
 /// Pick a rendering backend at the application's composition root. With `--gpu`,
 /// try the GPU backend and fall back to the CPU one if no device is available;
 /// otherwise use the CPU backend (the complete, always-available reference).
-fn select_backend(use_gpu: bool) -> Box<dyn Backend> {
+/// Returns the backend and which kind it is, so the editor can show it.
+fn select_backend(use_gpu: bool) -> (Box<dyn Backend>, BackendKind) {
     if use_gpu {
         match latent_gpu::GpuBackend::new() {
             Ok(gpu) => {
                 eprintln!("using GPU backend");
-                return Box::new(gpu);
+                return (Box::new(gpu), BackendKind::Gpu);
             }
             Err(e) => eprintln!("GPU unavailable ({e}); using CPU backend"),
         }
     }
-    Box::new(CpuBackend)
+    (Box::new(CpuBackend), BackendKind::Cpu)
 }
 
 /// Decode and develop a RAW into a linear working image in SOURCE coordinates:
@@ -111,7 +113,10 @@ fn main() {
             output,
             depth,
         } => develop(&input, &output, depth).map(|()| println!("wrote {}", output.display())),
-        Command::Open { input, gpu } => gui::run(&input, select_backend(gpu)),
+        Command::Open { input, gpu } => {
+            let (backend, kind) = select_backend(gpu);
+            gui::run(&input, backend, kind)
+        }
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
