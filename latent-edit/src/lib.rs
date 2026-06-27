@@ -536,6 +536,10 @@ impl Default for NoiseReduction {
 pub struct Geometry {
     /// Crop rectangle in normalized coordinates, or `None` for the full frame.
     pub crop: Option<Crop>,
+    /// Discrete right-angle re-framing (rotate 90° / flip) the user applies on
+    /// top of the developed image, composed into the same single resample as
+    /// straighten/keystone. Default is the identity (no turn, no flip).
+    pub orientation: Orientation,
     /// Straighten angle in degrees (positive = counter-clockwise); `0` is level.
     pub straighten_degrees: f32,
     /// Keystone (perspective) correction, or `None` for none.
@@ -559,10 +563,11 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// True if this geometry changes nothing (no crop, rotation, keystone, lens,
-    /// vignette, auto-scale, or output sharpen).
+    /// True if this geometry changes nothing (no crop, orientation, rotation,
+    /// keystone, lens, vignette, auto-scale, or output sharpen).
     pub fn is_identity(&self) -> bool {
         self.crop.is_none()
+            && self.orientation.is_identity()
             && self.straighten_degrees == 0.0
             && self.perspective.is_none()
             && self.lens.is_none()
@@ -580,6 +585,81 @@ impl Geometry {
 pub struct Perspective {
     pub vertical: f32,
     pub horizontal: f32,
+}
+
+/// A discrete right-angle re-framing the user applies on top of the developed
+/// (already display-oriented) image: zero or more 90° turns plus an optional
+/// horizontal flip. The eight reachable states form the dihedral group of the
+/// square (four rotations × an optional mirror), the same space LibRaw's
+/// orientation codes live in, so any rotate/flip the user clicks composes
+/// exactly with the next.
+///
+/// It is modeled as a quarter-turn count (`0..4`, clockwise) followed by an
+/// optional left↔right flip. This pair reaches all eight states and composes
+/// without a lookup table: rotating advances the count, flipping toggles the
+/// mirror and reverses the turn direction so the count and flip stay in a
+/// canonical normal form. The default — no turns, no flip — is the identity,
+/// the right neutral when an older sidecar omits the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Orientation {
+    /// Clockwise quarter-turns, kept in `0..4`.
+    pub quarter_turns: u8,
+    /// Mirror left↔right, applied after the rotation.
+    pub flip: bool,
+}
+
+impl Orientation {
+    /// The identity re-framing (no turn, no flip).
+    pub const IDENTITY: Self = Self {
+        quarter_turns: 0,
+        flip: false,
+    };
+
+    /// Whether this is the identity (changes nothing). The default `Geometry`
+    /// stays a no-op when it carries a default `Orientation`.
+    pub fn is_identity(self) -> bool {
+        self.quarter_turns.is_multiple_of(4) && !self.flip
+    }
+
+    /// Whether the re-framing exchanges the width and height axes — true for the
+    /// two odd (90°/270°) quarter-turns.
+    pub fn swaps_axes(self) -> bool {
+        self.quarter_turns % 2 == 1
+    }
+
+    /// Add a clockwise 90° turn.
+    pub fn rotate_cw(self) -> Self {
+        Self {
+            quarter_turns: (self.quarter_turns + 1) % 4,
+            flip: self.flip,
+        }
+    }
+
+    /// Add a counter-clockwise 90° turn (three clockwise turns).
+    pub fn rotate_ccw(self) -> Self {
+        Self {
+            quarter_turns: (self.quarter_turns + 3) % 4,
+            flip: self.flip,
+        }
+    }
+
+    /// Toggle a horizontal (left↔right) mirror. Composing the new flip *after*
+    /// the existing rotation reverses the stored turn direction, which keeps the
+    /// `(quarter_turns, flip)` pair in its canonical normal form so two flips
+    /// cancel and `flip ∘ rotate` stays a single reachable state.
+    pub fn flip_h(self) -> Self {
+        Self {
+            quarter_turns: (4 - self.quarter_turns % 4) % 4,
+            flip: !self.flip,
+        }
+    }
+
+    /// Toggle a vertical (top↔bottom) mirror — a horizontal flip plus a 180°
+    /// turn, expressed through the same normal form.
+    pub fn flip_v(self) -> Self {
+        self.flip_h().rotate_cw().rotate_cw()
+    }
 }
 
 /// The forward distortion model a [`LensProfile`]'s coefficients describe.
@@ -848,6 +928,9 @@ impl Geometry {
     /// vignette parameters (finite), and the crop rectangle (finite, with a
     /// non-negative size).
     fn sanitize(&mut self) {
+        // Keep the discrete re-framing in its canonical normal form: an
+        // out-of-range turn count (a hand-edited sidecar) wraps into `0..4`.
+        self.orientation.quarter_turns %= 4;
         self.straighten_degrees = finite_or(self.straighten_degrees, 0.0);
         if let Some(crop) = &mut self.crop {
             crop.x = finite_or(crop.x, 0.0);
@@ -1303,6 +1386,10 @@ mod tests {
                     width: 0.8,
                     height: 0.8,
                 }),
+                orientation: Orientation {
+                    quarter_turns: 1,
+                    flip: false,
+                },
                 straighten_degrees: 2.5,
                 perspective: Some(Perspective {
                     vertical: -0.15,
@@ -1626,5 +1713,79 @@ mod tests {
             panic!("expected a color range");
         };
         assert_eq!(c.sat_min, 0.0);
+    }
+
+    #[test]
+    fn orientation_default_is_identity() {
+        // The default re-framing is a no-op, and a default `Geometry` carrying it
+        // still reports identity (so the default render is byte-identical).
+        let o = Orientation::default();
+        assert!(o.is_identity());
+        assert_eq!(o, Orientation::IDENTITY);
+        assert!(!o.swaps_axes());
+        assert!(Geometry::default().is_identity());
+    }
+
+    #[test]
+    fn orientation_group_composes() {
+        // Four clockwise turns return to identity; two equal a 180°.
+        let id = Orientation::IDENTITY;
+        assert_eq!(id.rotate_cw().rotate_cw().rotate_cw().rotate_cw(), id);
+        let half = id.rotate_cw().rotate_cw();
+        assert_eq!(half.quarter_turns, 2);
+        assert!(!half.flip);
+
+        // CW then CCW cancels; CCW is three CW turns.
+        assert_eq!(id.rotate_cw().rotate_ccw(), id);
+        assert_eq!(id.rotate_ccw(), id.rotate_cw().rotate_cw().rotate_cw());
+
+        // A flip is its own inverse, both before and after a rotation.
+        assert_eq!(id.flip_h().flip_h(), id);
+        let r = id.rotate_cw();
+        assert_eq!(r.flip_h().flip_h(), r);
+
+        // Vertical flip equals horizontal flip plus a 180° turn.
+        assert_eq!(id.flip_v(), id.flip_h().rotate_cw().rotate_cw());
+        // Two vertical flips cancel.
+        assert_eq!(id.flip_v().flip_v(), id);
+
+        // Odd turns swap the axes; even turns (and a pure flip) do not.
+        assert!(id.rotate_cw().swaps_axes());
+        assert!(!id.rotate_cw().rotate_cw().swaps_axes());
+        assert!(!id.flip_h().swaps_axes());
+    }
+
+    #[test]
+    fn orientation_round_trips_and_is_forward_compatible() {
+        // A populated orientation survives a RON round-trip.
+        let s = Settings {
+            geometry: Geometry {
+                orientation: Orientation {
+                    quarter_turns: 3,
+                    flip: true,
+                },
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let doc = Document {
+            version: Document::VERSION,
+            variants: vec![s.clone()],
+        };
+        let text = doc.to_ron().expect("serialize");
+        let back = Document::from_ron(&text).expect("round-trip");
+        assert_eq!(back.variants[0], s);
+
+        // An older sidecar without the `orientation` field still loads, filling
+        // the identity (forward compatibility — a defaulted field is the no-op).
+        let text = "(version: 1, variants: [(geometry: (straighten_degrees: 5.0))])";
+        let doc = Document::from_ron(text).expect("sidecar without orientation should load");
+        assert_eq!(doc.variants[0].geometry.orientation, Orientation::IDENTITY);
+        assert_eq!(doc.variants[0].geometry.straighten_degrees, 5.0);
+
+        // A hand-edited out-of-range turn count wraps into 0..4 on load.
+        let text = "(version: 1, variants: [(geometry: (orientation: (quarter_turns: 6)))])";
+        let doc = Document::from_ron(text).expect("out-of-range turns should sanitize");
+        assert_eq!(doc.variants[0].geometry.orientation.quarter_turns, 2);
     }
 }

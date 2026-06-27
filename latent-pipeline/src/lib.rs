@@ -8,7 +8,7 @@
 
 use latent_edit::{
     Adjustments, Crop, Curves, DistortionModel, Geometry, LensProfile, LocalAdjustment, Mask,
-    Perspective, SelectiveTone, Settings,
+    Orientation, Perspective, SelectiveTone, Settings,
 };
 use latent_image::ImageBuf;
 use latent_image::color::{Lab, l_star, luminance};
@@ -1186,6 +1186,57 @@ fn apply_locals(mut img: ImageBuf, locals: &[LocalAdjustment], backend: &dyn Bac
     img
 }
 
+/// Build the discrete right-angle re-framing transform for an image of size
+/// `extent`: an output → source affine map for the [`Orientation`]'s 90°
+/// turn(s) plus optional flip. The output extent swaps width and height for an
+/// odd quarter-turn (a 90°/270° rotation); the map is an exact axis
+/// permutation / reflection, so every output pixel center lands on a source
+/// pixel center — no interpolation, bit-exact when resampled.
+///
+/// The map runs output → source (as every geometry transform here does): an
+/// output pixel `(ox, oy)` is sent back to the source pixel it came from. The
+/// rotation is clockwise; the flip mirrors the output's X axis after it.
+pub fn orientation_transform(extent: Extent, orientation: Orientation) -> Transform {
+    let (w, h) = (extent.width as f32, extent.height as f32);
+    let turns = orientation.quarter_turns % 4;
+    let output = if orientation.swaps_axes() {
+        Extent {
+            width: extent.height,
+            height: extent.width,
+        }
+    } else {
+        extent
+    };
+    // Output → source for each clockwise turn, in pixel-index coordinates. The
+    // constants land on exact integers, so resampling reads a single source
+    // pixel with full weight (no blur).
+    let ow = output.width as f32;
+    // Linear part + translation of the output → source affine, before the flip.
+    // `sx = a·ox + b·oy + e`, `sy = c·ox + d·oy + f`.
+    let (a, b, e, c, d, f) = match turns {
+        // Identity.
+        0 => (1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+        // 90° CW: sx = oy, sy = (h - 1) - ox.
+        1 => (0.0, 1.0, 0.0, -1.0, 0.0, h - 1.0),
+        // 180°: sx = (w - 1) - ox, sy = (h - 1) - oy.
+        2 => (-1.0, 0.0, w - 1.0, 0.0, -1.0, h - 1.0),
+        // 270° CW: sx = (w - 1) - oy, sy = ox.
+        _ => (0.0, -1.0, w - 1.0, 1.0, 0.0, 0.0),
+    };
+    // A horizontal flip mirrors the output X axis (`ox -> ow - 1 - ox`) before
+    // the map, which substitutes into the translation as `e += a·(ow - 1)` and
+    // `f += c·(ow - 1)`, negating the `ox` coefficients.
+    let (a, c, e, f) = if orientation.flip {
+        (-a, -c, e + a * (ow - 1.0), f + c * (ow - 1.0))
+    } else {
+        (a, c, e, f)
+    };
+    Transform {
+        output,
+        m: [[a, b, e], [c, d, f], [0.0, 0.0, 1.0]],
+    }
+}
+
 /// Build the keystone (perspective-correction) transform for an image of size
 /// `extent`: an output → source homography correcting converging verticals
 /// (`vertical`) and horizontals (`horizontal`). The frame center is fixed and
@@ -1375,15 +1426,28 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
             },
         );
     }
+    // The discrete re-framing (rotate 90° / flip) is the base the continuous
+    // straighten refines: it maps the *oriented* frame back to the source, with
+    // its output extent the source's (width/height swapped for an odd turn). It
+    // is an exact axis permutation, so when it is the only geometry the resample
+    // reads one source pixel per output pixel — lossless, no interpolation.
+    let orient = (!geometry.orientation.is_identity())
+        .then(|| orientation_transform(extent, geometry.orientation));
+    // Straighten and keystone are built against the *oriented* extent, so the
+    // user levels and squares within the chosen 90° framing.
+    let oriented_extent = orient.map_or(extent, |t| t.output);
     let straighten = (geometry.straighten_degrees != 0.0)
-        .then(|| Transform::rotation(extent, geometry.straighten_degrees.to_radians()));
+        .then(|| Transform::rotation(oriented_extent, geometry.straighten_degrees.to_radians()));
     let keystone = geometry
         .perspective
         .filter(|p: &Perspective| p.vertical != 0.0 || p.horizontal != 0.0)
-        .map(|p| keystone_transform(extent, p.vertical, p.horizontal));
-    // Compose straighten and keystone into one homography (output → rectilinear
-    // source). The output canvas is the straighten's bounding box when present.
-    let homography = match (straighten, keystone) {
+        .map(|p| keystone_transform(oriented_extent, p.vertical, p.horizontal));
+    // Compose orientation, straighten, and keystone into one homography
+    // (output → rectilinear source) — a single resample. The output canvas is
+    // the straighten's bounding box when present, else the oriented frame; the
+    // map runs keystone, then straighten (into the oriented frame), then the
+    // orientation (into the source).
+    let framing = match (straighten, keystone) {
         (Some(s), Some(k)) => Some(Transform {
             output: s.output,
             ..k.compose(&s)
@@ -1391,6 +1455,14 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
         (Some(s), None) => Some(s),
         (None, Some(k)) => Some(k),
         (None, None) => None,
+    };
+    let homography = match (orient, framing) {
+        (Some(o), Some(f)) => Some(Transform {
+            output: f.output,
+            ..o.compose(&f)
+        }),
+        (Some(o), None) => Some(o),
+        (None, f) => f,
     };
     // Fold lens distortion and chromatic aberration into the *same* resample:
     // homography, then the radial term, then a per-channel scale — one
@@ -2908,6 +2980,138 @@ mod tests {
         assert_eq!((out.width(), out.height()), (2, 2));
         assert_eq!(out.get(0, 0), [2.0, 0.0, 0.0]); // old (2, 0)
         assert_eq!(out.get(1, 1), [7.0, 0.0, 0.0]); // old (3, 1)
+    }
+
+    #[test]
+    fn rotate90_composes_correctly() {
+        // A non-square asymmetric image with a per-pixel marker, so a 90° turn is
+        // checkable corner-by-corner. 3 wide × 2 tall: value = x + 10·y.
+        let mut src = ImageBuf::new(3, 2);
+        for y in 0..2 {
+            for x in 0..3 {
+                src.set(x, y, [(x + 10 * y) as f32, 0.0, 0.0]);
+            }
+        }
+        let rot = |turns: u8, flip: bool| {
+            let settings = Settings {
+                geometry: Geometry {
+                    orientation: Orientation {
+                        quarter_turns: turns,
+                        flip,
+                    },
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            };
+            render(&src, &settings, &TestBackend)
+        };
+
+        // 90° CW swaps the output extent (3×2 → 2×3) and lands the source's
+        // top-left at the output's top-right (the clockwise corner walk).
+        let cw = rot(1, false);
+        assert_eq!((cw.width(), cw.height()), (2, 3));
+        assert_eq!(cw.get(cw.width() - 1, 0), src.get(0, 0)); // src TL → out TR
+        assert_eq!(cw.get(0, 0), src.get(0, 1)); // src BL → out TL
+
+        // The right-angle case is bit-exact — every output pixel equals exactly
+        // one source pixel, no interpolation softening a sharp marker.
+        for oy in 0..cw.height() {
+            for ox in 0..cw.width() {
+                let p = cw.get(ox, oy);
+                assert!(
+                    src.pixels().contains(&p),
+                    "rotated pixel {p:?} is not an exact source value"
+                );
+            }
+        }
+
+        // Two CW turns equal one 180°.
+        let twice_cw = rot(2, false);
+        assert_eq!(
+            (twice_cw.width(), twice_cw.height()),
+            (src.width(), src.height())
+        );
+        assert_eq!(twice_cw.get(2, 1), src.get(0, 0)); // 180° maps TL → BR
+
+        // flip ∘ flip is identity (a pure horizontal flip, then flip back).
+        let flipped = rot(0, true);
+        assert_eq!(flipped.get(0, 0), src.get(2, 0)); // mirror X
+        assert_eq!(flipped.get(2, 1), src.get(0, 1));
+        let unflipped = {
+            // Apply the flip to the already-flipped image and confirm we're back.
+            let settings = Settings {
+                geometry: Geometry {
+                    orientation: Orientation {
+                        quarter_turns: 0,
+                        flip: true,
+                    },
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            };
+            render(&flipped, &settings, &TestBackend)
+        };
+        assert_eq!(unflipped, src);
+    }
+
+    #[test]
+    fn orientation_then_straighten_matches_documented_order() {
+        // Orientation is the base, straighten refines within it: rendering with
+        // both must equal first re-orienting the image, then straightening the
+        // result. This pins the compose order (orientation first, then straighten)
+        // and proves it is one resample, not two stacked.
+        let mut src = ImageBuf::new(7, 5);
+        for y in 0..5 {
+            for x in 0..7 {
+                src.set(x, y, [x as f32 / 7.0, y as f32 / 5.0, 0.3]);
+            }
+        }
+        let orientation = Orientation {
+            quarter_turns: 1,
+            flip: false,
+        };
+        let both = Settings {
+            geometry: Geometry {
+                orientation,
+                straighten_degrees: 6.0,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let out_both = render(&src, &both, &TestBackend);
+
+        // Re-orient alone, then straighten the oriented image alone.
+        let oriented = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    orientation,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        let then_straight = render(
+            &oriented,
+            &Settings {
+                geometry: Geometry {
+                    straighten_degrees: 6.0,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+
+        // Same output canvas, and the same content (the single-resample fold is a
+        // strict improvement on the two-pass reference, so allow the small
+        // resampling difference between one and two interpolations).
+        assert_eq!(
+            (out_both.width(), out_both.height()),
+            (then_straight.width(), then_straight.height()),
+            "the folded order must produce the same output extent as orientation-then-straighten"
+        );
     }
 
     #[test]

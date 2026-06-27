@@ -1626,6 +1626,35 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_orientation_matches_cpu() {
+        // A discrete 90° turn + flip composed with straighten, no lens — the
+        // re-framing folds into the same homography that drives `resample.wgsl`,
+        // so the GPU and CPU must agree end-to-end. A right-angle turn is an exact
+        // axis permutation on both backends.
+        use latent_edit::{Geometry, Orientation};
+
+        let gpu = gpu_or_skip!();
+        let src = ramp(40, 30);
+        let settings = Settings {
+            geometry: Geometry {
+                orientation: Orientation {
+                    quarter_turns: 1,
+                    flip: true,
+                },
+                straighten_degrees: 3.0,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        assert_render_conforms(
+            "orientation + straighten (resample.wgsl)",
+            &gpu,
+            &src,
+            &settings,
+        );
+    }
+
+    #[test]
     fn map_pixels_2d_spill_matches_cpu() {
         // Force the 2D workgroup grid to spill into y (gy > 1) by capping the grid
         // width, so the `row_stride`/`gid.y` index reconstruction is validated

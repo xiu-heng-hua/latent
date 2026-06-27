@@ -12,11 +12,11 @@
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Vec2};
-use latent_edit::{Dab, MaskShape};
 use latent_image::ImageBuf;
 
 use super::app::{App, BeforeAfter};
 use super::theme;
+use super::tools;
 
 /// Discrete zoom ladder (percent). `+`/`−` step along it; the wheel snaps to the
 /// nearest neighbour in the gesture direction. `Fit` is handled separately since
@@ -160,6 +160,30 @@ impl ViewTransform {
         let h = rect.height().max(f32::EPSILON);
         [(pos.x - rect.min.x) / w, (pos.y - rect.min.y) / h]
     }
+
+    /// How many screen pixels a normalized length spans along each axis. A
+    /// normalized length is a fraction of the image width (x) or height (y); the
+    /// drawn image is non-square, so the two axes scale differently. Used to draw a
+    /// radial ring or brush ring at the right on-screen size from a normalized
+    /// radius (the engine measures radii in normalized units — elliptical on a
+    /// non-square frame — so the on-screen ring is an ellipse with these two
+    /// half-axes).
+    pub(crate) fn norm_len_to_screen(&self, norm_len: f32) -> Vec2 {
+        let rect = self.image_rect();
+        Vec2::new(norm_len * rect.width(), norm_len * rect.height())
+    }
+
+    /// The inverse of [`Self::norm_len_to_screen`]: convert a screen-pixel length
+    /// to a normalized length on each axis. Used to turn a screen-pixel hit
+    /// tolerance (or a screen-pixel ring drag) back into image space without
+    /// re-measuring off a `Response::rect`.
+    pub(crate) fn screen_len_to_norm(&self, screen_len: f32) -> Vec2 {
+        let rect = self.image_rect();
+        Vec2::new(
+            screen_len / rect.width().max(f32::EPSILON),
+            screen_len / rect.height().max(f32::EPSILON),
+        )
+    }
 }
 
 /// Step `zoom` one notch in (`+1`) or out (`−1`) along the ladder, anchored at
@@ -271,6 +295,11 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 }
             }
 
+            // The mask overlay (translucent red coverage), drawn over the image
+            // but under the tool handles, so the user sees the selection. Pure
+            // paint — never baked into the texture.
+            tools::overlay::draw(app, &painter, &transform, active, local_sel);
+
             // Pixel readout: sample the rendered preview under the cursor when it
             // is over the image (not the gray surround). The shared pick-pixel
             // path the clipping read-back and the WB eyedropper reuse.
@@ -280,52 +309,22 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 sample_pixel_readout(app, &transform, pos);
             }
 
-            // Brush painting, one undo step per stroke (begin on press, commit on
-            // release). The pointer→image mapping now reads the transform — the
-            // single screen↔image map — instead of open-coded rect arithmetic.
-            let is_brush = app.variants[active]
-                .current()
-                .locals
-                .get(local_sel)
-                .is_some_and(|l| matches!(l.mask.shapes.first(), Some(MaskShape::Brush(_))));
-            // A pan gesture (middle-drag or space+left-drag) must not also paint.
-            if is_brush && !panning(&resp) {
-                let click = resp.clicked() && !resp.dragged();
-                if resp.drag_started() || click {
-                    app.variants[active].begin();
-                }
-                if (resp.dragged() || click)
-                    && let Some(pos) = resp.hover_pos()
-                {
-                    let norm = transform.screen_to_image_norm(pos);
-                    let nx = norm[0].clamp(0.0, 1.0);
-                    let ny = norm[1].clamp(0.0, 1.0);
-                    if let Some(MaskShape::Brush(b)) = app.variants[active].current_mut().locals
-                        [local_sel]
-                        .mask
-                        .shapes
-                        .first_mut()
-                    {
-                        b.dabs.push(Dab {
-                            x: nx,
-                            y: ny,
-                            radius: app.brush_radius,
-                            feather: app.brush_feather,
-                            erase: app.brush_erase,
-                        });
-                        painted = true;
-                    }
-                }
-                if resp.drag_stopped() || click {
-                    app.variants[active].commit();
-                }
-            }
+            // Route the pointer to the active tool: it draws its handles/guides
+            // and consumes the drag when it grabs one, falling through to pan
+            // otherwise. One undo step per drag (begin on grab, commit on
+            // release). `dirty` is set when the tool changed the settings.
+            let changed = tools::interact(app, &resp, &painter, &transform, active, local_sel);
+            painted |= changed;
         });
 
-    // A painted stroke changed the settings after this frame's render; refresh
-    // the preview and repaint so the dab shows up.
+    // A tool gesture changed the settings after this frame's render; refresh the
+    // preview and repaint so the edit shows up.
     if painted {
         app.render_preview(ctx);
+        ctx.request_repaint();
+    } else if app.tool != tools::CanvasTool::None {
+        // A tool is active (drawing handles/cursor) — keep repainting so the
+        // overlay tracks the pointer even when nothing changed this frame.
         ctx.request_repaint();
     }
 }

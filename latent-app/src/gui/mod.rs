@@ -9,6 +9,7 @@ mod icons;
 mod panels;
 mod state;
 mod theme;
+mod tools;
 mod widgets;
 
 pub use app::{BackendKind, run};

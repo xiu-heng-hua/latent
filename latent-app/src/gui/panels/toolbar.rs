@@ -1,12 +1,15 @@
 //! The slim icon toolbar beneath the menu bar: undo/redo (sharing the single
 //! history path with the menu and keyboard), the variant selector / new-variant
-//! button, the before/after toggle, and the zoom controls (fit / 100% / −/+).
+//! button, the on-canvas tool selector, the discrete rotate/flip buttons, the
+//! mask-overlay toggle, the before/after toggle, and the zoom controls.
 
 use eframe::egui;
 use latent_edit::History;
 
 use crate::gui::app::{App, BeforeAfter};
 use crate::gui::icons;
+use crate::gui::tools::CanvasTool;
+use crate::gui::tools::overlay::OverlayMode;
 
 /// Show the toolbar. `do_undo` / `do_redo` are OR-ed with the toolbar's
 /// undo/redo clicks; `dirty` is set when the active variant changes or a new
@@ -47,6 +50,48 @@ pub(crate) fn show(
 
             ui.separator();
 
+            // On-canvas tool selector. Selecting a tool activates its handles on
+            // the image; the same tool also activates when its panel section is
+            // open. "View" is the no-tool state (pure pan/zoom).
+            tool_selector(app, ui);
+
+            ui.separator();
+
+            // Discrete orientation: rotate 90° CW/CCW and flip H/V, each one undo
+            // step. They fold into the same single resample as straighten/crop.
+            if ui
+                .button("⟳")
+                .on_hover_text("Rotate 90° clockwise")
+                .clicked()
+            {
+                app.apply_orientation(|o| o.rotate_cw());
+                *dirty = true;
+            }
+            if ui
+                .button("⟲")
+                .on_hover_text("Rotate 90° counter-clockwise")
+                .clicked()
+            {
+                app.apply_orientation(|o| o.rotate_ccw());
+                *dirty = true;
+            }
+            if ui.button("⇋").on_hover_text("Flip horizontal").clicked() {
+                app.apply_orientation(|o| o.flip_h());
+                *dirty = true;
+            }
+            if ui.button("⇅").on_hover_text("Flip vertical").clicked() {
+                app.apply_orientation(|o| o.flip_v());
+                *dirty = true;
+            }
+
+            ui.separator();
+
+            // Mask-overlay toggle (off / red wash / mask-only). Pure visualization
+            // — no render change.
+            overlay_toggle(app, ui);
+
+            ui.separator();
+
             // Before/after: cycle Off → Toggle → Split (also bound to `).
             let before_label = match app.before {
                 BeforeAfter::Off => "After",
@@ -82,4 +127,47 @@ pub(crate) fn show(
             ui.label(format!("{}%", app.zoom_percent()));
         });
     });
+}
+
+/// The on-canvas tool selector: a row of selectable labels, one per tool. Only
+/// the active tool draws handles and consumes the canvas pointer.
+fn tool_selector(app: &mut App, ui: &mut egui::Ui) {
+    let tools = [
+        (CanvasTool::None, "View"),
+        (CanvasTool::Crop, "Crop"),
+        (CanvasTool::Straighten, "Level"),
+        (CanvasTool::Keystone, "Keystone"),
+        (CanvasTool::MaskShape, "Mask"),
+        (CanvasTool::Brush, "Brush"),
+    ];
+    for (tool, label) in tools {
+        if ui.selectable_label(app.tool == tool, label).clicked() {
+            // Toggle off to View when re-clicking the active tool.
+            app.tool = if app.tool == tool {
+                CanvasTool::None
+            } else {
+                tool
+            };
+        }
+    }
+}
+
+/// The mask-overlay toggle: cycles Off → red wash → mask-only.
+fn overlay_toggle(app: &mut App, ui: &mut egui::Ui) {
+    let label = match app.overlay_mode {
+        OverlayMode::Off => "Mask: off",
+        OverlayMode::Color => "Mask: red",
+        OverlayMode::MaskOnly => "Mask: gray",
+    };
+    if ui
+        .selectable_label(app.overlay_mode.is_on(), label)
+        .on_hover_text("Show the selected mask as an overlay")
+        .clicked()
+    {
+        app.overlay_mode = match app.overlay_mode {
+            OverlayMode::Off => OverlayMode::Color,
+            OverlayMode::Color => OverlayMode::MaskOnly,
+            OverlayMode::MaskOnly => OverlayMode::Off,
+        };
+    }
 }

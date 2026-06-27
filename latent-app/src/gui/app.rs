@@ -19,6 +19,9 @@ use super::canvas::{PixelReadout, ViewTransform, Zoom};
 use super::panels;
 use super::state::{RenderJob, RenderOutput, RenderState, auto_lens_profile};
 use super::theme;
+use super::tools::crop::AspectRatio;
+use super::tools::overlay::{OverlayCache, OverlayMode};
+use super::tools::{CanvasDrag, CanvasTool};
 
 /// Which before/after view the canvas is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,6 +139,14 @@ pub fn run(
                 brush_feather: 0.04,
                 brush_erase: false,
                 curve_channel: 0,
+                tool: CanvasTool::default(),
+                drag: None,
+                crop_aspect: AspectRatio::default(),
+                crop_aspect_locked: false,
+                crop_thirds: true,
+                overlay_mode: OverlayMode::default(),
+                overlay_cache: OverlayCache::default(),
+                preview_gen: 0,
                 backend,
                 backend_kind: kind,
             }) as Box<dyn eframe::App>)
@@ -215,6 +226,24 @@ pub struct App {
     pub(crate) brush_erase: bool,
     /// Which curve channel the editor edits (0 = master, 1/2/3 = R/G/B).
     pub(crate) curve_channel: usize,
+    /// The active on-canvas tool. `None` leaves the canvas to pan/zoom; a tool
+    /// draws handles and consumes pointer input. Selected by the toolbar and the
+    /// panel section that owns each tool.
+    pub(crate) tool: CanvasTool,
+    /// The in-progress canvas drag (the grabbed handle and its start snapshot),
+    /// held across frames so a drag keeps editing the handle it began on.
+    pub(crate) drag: Option<CanvasDrag>,
+    /// Crop tool UI state: the chosen aspect preset, whether it is locked while
+    /// dragging, and whether the rule-of-thirds grid is shown.
+    pub(crate) crop_aspect: AspectRatio,
+    pub(crate) crop_aspect_locked: bool,
+    pub(crate) crop_thirds: bool,
+    /// Mask-overlay visualization mode and its cached coverage texture.
+    pub(crate) overlay_mode: OverlayMode,
+    pub(crate) overlay_cache: OverlayCache,
+    /// Preview-base generation counter, bumped whenever the preview base is
+    /// replaced (a new file), so the mask-overlay cache invalidates with it.
+    pub(crate) preview_gen: u64,
     /// The rendering backend (CPU, or GPU when selected and available). Shared
     /// with the render worker by `Arc` — the trait is `Send + Sync`.
     pub(crate) backend: Arc<dyn Backend>,
@@ -226,6 +255,36 @@ impl App {
     /// The history of the variant currently being edited.
     fn active_history(&mut self) -> &mut History<Settings> {
         &mut self.variants[self.active]
+    }
+
+    /// The displayed image aspect (`width / height`) of the texture currently
+    /// shown, for the aspect-aware tools (crop ratio, straighten angle). Falls
+    /// back to `1.0` before a texture exists.
+    pub(crate) fn displayed_aspect(&self) -> f32 {
+        self.last_transform
+            .map(|t| {
+                let r = t.image_rect();
+                if r.height() > 0.0 {
+                    r.width() / r.height()
+                } else {
+                    1.0
+                }
+            })
+            .unwrap_or(1.0)
+    }
+
+    /// Apply a discrete orientation change (rotate 90° / flip) as one undo step,
+    /// transforming the active variant's `geometry.orientation` with `f`. Marks
+    /// the preview dirty so the rotated framing renders.
+    pub(crate) fn apply_orientation(
+        &mut self,
+        f: impl Fn(latent_edit::Orientation) -> latent_edit::Orientation,
+    ) {
+        let history = self.active_history();
+        history.begin();
+        let o = history.current().geometry.orientation;
+        history.current_mut().geometry.orientation = f(o);
+        history.commit();
     }
 
     /// Whether every variant is currently equal to what's on disk (no unsaved
@@ -440,6 +499,46 @@ impl App {
         }
     }
 
+    /// The brush keyboard shortcuts: `[` / `]` shrink/grow the brush radius, and
+    /// the same keys with Shift adjust the feather. They edit the same
+    /// `brush_radius`/`brush_feather` state the sliders show, so the cursor ring
+    /// and the sliders stay in sync. Only active under the Brush tool, and skipped
+    /// while a panel widget wants the keyboard.
+    fn handle_brush_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.tool != CanvasTool::Brush || ctx.wants_keyboard_input() {
+            return;
+        }
+        let (mut shrink, mut grow, mut shift) = (false, false, false);
+        ctx.input(|i| {
+            if i.modifiers.command {
+                return;
+            }
+            shift = i.modifiers.shift;
+            shrink = i.key_pressed(egui::Key::OpenBracket);
+            grow = i.key_pressed(egui::Key::CloseBracket);
+        });
+        // Multiplicative steps feel even across the range; clamp to the slider
+        // ranges so the keys and the numeric sliders share one domain.
+        let step = if shrink {
+            Some(1.0 / super::tools::BRUSH_KEY_STEP)
+        } else if grow {
+            Some(super::tools::BRUSH_KEY_STEP)
+        } else {
+            None
+        };
+        if let Some(k) = step {
+            if shift {
+                // Feather can sit at zero; lift off a small floor so a multiply
+                // can grow it back.
+                self.brush_feather =
+                    super::tools::scaled_clamped(self.brush_feather.max(0.005), k, 0.0, 0.5);
+            } else {
+                self.brush_radius = super::tools::scaled_clamped(self.brush_radius, k, 0.01, 0.5);
+            }
+            ctx.request_repaint();
+        }
+    }
+
     /// Build the cached "before" texture once: the develop base rendered with
     /// `Settings::default()` (the unedited develop), uploaded as a second texture
     /// the before/after view draws. Cheap — it runs over the downscaled preview
@@ -485,6 +584,8 @@ impl eframe::App for App {
         // View shortcuts (zoom +/−/0/1, before/after `). Gated so a panel that
         // wants the keyboard (a text field, a numeric slider entry) keeps it.
         self.handle_view_shortcuts(ctx);
+        // Brush size keys (`[`/`]`, Shift for feather), only under the Brush tool.
+        self.handle_brush_shortcuts(ctx);
 
         // Chrome, in panel order: menu bar, toolbar, status bar, controls — then
         // the central canvas last so it takes the remaining space.
