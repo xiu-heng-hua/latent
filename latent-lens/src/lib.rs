@@ -76,6 +76,17 @@ impl Database {
     /// `distance` (m). Returns `None` if the camera or lens is not in the
     /// database. The live query is exercised manually — the database is external,
     /// like real-RAW decode — while the model→profile mapping is unit-tested.
+    ///
+    /// Camera resolution uses lensfun's fuzzy `lf_db_find_cameras_ext`
+    /// (`lfDatabase::FindCamerasExt`, scored with `lfFuzzyStrCmp`, best match
+    /// first) rather than the exact `lf_db_find_cameras` (`FindCameras`, a byte
+    /// `_lf_strcmp` on maker and model). The exact compare fails whenever the EXIF
+    /// spelling differs from the database's — a near-universal case, since EXIF
+    /// maker/model strings carry vendor suffixes and drop the maker prefix from
+    /// the model. The fuzzy matcher absorbs that gap, as lensfun's own `lenstool`
+    /// does. When the maker-qualified search comes back empty (a maker suffix the
+    /// scorer won't bridge), we retry model-only with a NULL maker, again mirroring
+    /// `lenstool`, while keeping the model qualified to avoid a whole-database scan.
     pub fn find_profile(
         &self,
         camera_maker: &str,
@@ -92,12 +103,22 @@ impl Database {
         // outlive each call; the returned arrays are NULL-terminated and owned by
         // lensfun (freed with `lf_free`, their elements owned by the database).
         unsafe {
-            let cameras = ffi::lf_db_find_cameras(self.db, maker.as_ptr(), model.as_ptr());
+            let mut cameras =
+                ffi::lf_db_find_cameras_ext(self.db, maker.as_ptr(), model.as_ptr(), 0);
             if cameras.is_null() || (*cameras).is_null() {
+                // A maker suffix the scorer won't bridge can empty the
+                // maker-qualified search; retry model-only (NULL maker) before
+                // giving up. Free the first list first so it can't leak.
                 if !cameras.is_null() {
                     ffi::lf_free(cameras as *mut _);
                 }
-                return None;
+                cameras = ffi::lf_db_find_cameras_ext(self.db, std::ptr::null(), model.as_ptr(), 0);
+                if cameras.is_null() || (*cameras).is_null() {
+                    if !cameras.is_null() {
+                        ffi::lf_free(cameras as *mut _);
+                    }
+                    return None;
+                }
             }
             let camera = *cameras;
             let lenses =

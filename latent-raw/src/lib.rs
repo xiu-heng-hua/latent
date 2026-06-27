@@ -200,6 +200,13 @@ pub struct Metadata {
     pub make: String,
     /// Camera model, as in EXIF (e.g. `"Canon EOS 5D Mark III"`); empty if unknown.
     pub model: String,
+    /// LibRaw's standardized camera maker, mapping rebrands onto the primary
+    /// vendor (e.g. `"NIKON CORPORATION"` → `"Nikon"`); a lens-database lookup aid,
+    /// not for display. Empty if unknown.
+    pub normalized_make: String,
+    /// LibRaw's standardized camera model, a lens-database lookup aid, not for
+    /// display. Empty if unknown.
+    pub normalized_model: String,
     /// Lens model, as in EXIF (e.g. `"Canon EF 16-35mm f/2.8L II USM"`); empty if unknown.
     pub lens: String,
     /// Focal length in mm at capture, or `0` if unknown.
@@ -844,6 +851,8 @@ unsafe fn read_metadata(raw: *mut ffi::libraw_data_t) -> Metadata {
         cam_xyz,
         make: c_str_field(&idata.make),
         model: c_str_field(&idata.model),
+        normalized_make: c_str_field(&idata.normalized_make),
+        normalized_model: c_str_field(&idata.normalized_model),
         lens: c_str_field(&lens.Lens),
         focal_len: other.focal_len,
         aperture: other.aperture,
@@ -885,6 +894,8 @@ mod tests {
                 cam_xyz: [[0.0; 3]; 4],
                 make: String::new(),
                 model: String::new(),
+                normalized_make: String::new(),
+                normalized_model: String::new(),
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
@@ -1132,6 +1143,8 @@ mod tests {
                 cam_xyz: [[0.0; 3]; 4],
                 make: String::new(),
                 model: String::new(),
+                normalized_make: String::new(),
+                normalized_model: String::new(),
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
@@ -1215,6 +1228,8 @@ mod tests {
                 cam_xyz: [[0.0; 3]; 4],
                 make: String::new(),
                 model: String::new(),
+                normalized_make: String::new(),
+                normalized_model: String::new(),
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,
@@ -1263,6 +1278,8 @@ mod tests {
                 cam_xyz: [[0.0; 3]; 4],
                 make: String::new(),
                 model: String::new(),
+                normalized_make: String::new(),
+                normalized_model: String::new(),
                 lens: String::new(),
                 focal_len: 0.0,
                 aperture: 0.0,

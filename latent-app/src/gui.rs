@@ -90,10 +90,19 @@ fn auto_lens_profile(meta: &latent_raw::Metadata) -> Option<LensProfile> {
     if meta.model.is_empty() && meta.lens.is_empty() {
         return None;
     }
+    // LibRaw's normalized names are already close to the database spelling; prefer
+    // them for the lookup, falling back to the raw EXIF when one is empty.
+    fn prefer<'a>(normalized: &'a str, raw: &'a str) -> &'a str {
+        if normalized.is_empty() {
+            raw
+        } else {
+            normalized
+        }
+    }
     let db = latent_lens::Database::load().ok()?;
     db.find_profile(
-        &meta.make,
-        &meta.model,
+        prefer(&meta.normalized_make, &meta.make),
+        prefer(&meta.normalized_model, &meta.model),
         &meta.lens,
         meta.focal_len,
         meta.aperture,
