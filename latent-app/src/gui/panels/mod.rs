@@ -6,3 +6,4 @@ pub(crate) mod controls;
 pub(crate) mod menubar;
 pub(crate) mod statusbar;
 pub(crate) mod toolbar;
+pub(crate) mod welcome;

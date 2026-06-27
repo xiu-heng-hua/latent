@@ -1,13 +1,13 @@
 //! The slim icon toolbar beneath the menu bar: undo/redo (sharing the single
 //! history path with the menu and keyboard), the variant selector / new-variant
 //! button, the on-canvas tool selector, the discrete rotate/flip buttons, the
-//! mask-overlay toggle, the before/after toggle, and the zoom controls.
+//! mask-overlay toggle, the before/after toggle, and the zoom controls. Shown only
+//! with an open session (the welcome state hides it).
 
 use eframe::egui;
 use latent_edit::History;
 
-use crate::gui::app::{App, BeforeAfter};
-use crate::gui::icons;
+use crate::gui::app::App;
 use crate::gui::tools::CanvasTool;
 use crate::gui::tools::overlay::OverlayMode;
 
@@ -23,105 +23,118 @@ pub(crate) fn show(
 ) {
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            let can_undo = app.variants[app.active].can_undo();
-            let can_redo = app.variants[app.active].can_redo();
-            *do_undo |= icons::icon_button(ui, can_undo, "undo", "Undo (Cmd/Ctrl+Z)").clicked();
+            let Some(session) = app.session.as_mut() else {
+                return;
+            };
+            let can_undo = session.variants[session.active].can_undo();
+            let can_redo = session.variants[session.active].can_redo();
+            *do_undo |=
+                crate::gui::icons::icon_button(ui, can_undo, "undo", "Undo (Cmd/Ctrl+Z)").clicked();
             *do_redo |=
-                icons::icon_button(ui, can_redo, "redo", "Redo (Cmd/Ctrl+Shift+Z)").clicked();
+                crate::gui::icons::icon_button(ui, can_redo, "redo", "Redo (Cmd/Ctrl+Shift+Z)")
+                    .clicked();
 
             ui.separator();
 
             ui.label("Variant:");
-            for i in 0..app.variants.len() {
+            for i in 0..session.variants.len() {
                 if ui
-                    .selectable_label(i == app.active, format!("{}", i + 1))
+                    .selectable_label(i == session.active, format!("{}", i + 1))
                     .clicked()
                 {
-                    app.active = i;
+                    session.active = i;
                     *dirty = true;
                 }
             }
             if ui.button("+").on_hover_text("New variant (copy)").clicked() {
-                let copy = app.variants[app.active].current().clone();
-                app.variants.push(History::new(copy));
-                app.active = app.variants.len() - 1;
+                let copy = session.variants[session.active].current().clone();
+                session.variants.push(History::new(copy));
+                session.active = session.variants.len() - 1;
                 *dirty = true;
             }
 
             ui.separator();
 
-            // On-canvas tool selector. Selecting a tool activates its handles on
-            // the image; the same tool also activates when its panel section is
-            // open. "View" is the no-tool state (pure pan/zoom).
-            tool_selector(app, ui);
+            // On-canvas tool selector.
+            tool_selector(session, ui);
 
             ui.separator();
 
             // Discrete orientation: rotate 90° CW/CCW and flip H/V, each one undo
             // step. They fold into the same single resample as straighten/crop.
+            // The orientation edit goes through the app (so the begin/commit lives
+            // in one place), so it is applied after this closure via the flag set
+            // below.
+            let mut orient: Option<fn(latent_edit::Orientation) -> latent_edit::Orientation> = None;
             if ui
                 .button("⟳")
                 .on_hover_text("Rotate 90° clockwise")
                 .clicked()
             {
-                app.apply_orientation(|o| o.rotate_cw());
-                *dirty = true;
+                orient = Some(|o| o.rotate_cw());
             }
             if ui
                 .button("⟲")
                 .on_hover_text("Rotate 90° counter-clockwise")
                 .clicked()
             {
-                app.apply_orientation(|o| o.rotate_ccw());
-                *dirty = true;
+                orient = Some(|o| o.rotate_ccw());
             }
             if ui.button("⇋").on_hover_text("Flip horizontal").clicked() {
-                app.apply_orientation(|o| o.flip_h());
-                *dirty = true;
+                orient = Some(|o| o.flip_h());
             }
             if ui.button("⇅").on_hover_text("Flip vertical").clicked() {
-                app.apply_orientation(|o| o.flip_v());
+                orient = Some(|o| o.flip_v());
+            }
+            if let Some(f) = orient {
+                // Apply directly on the session's active history (one undo step).
+                let history = &mut session.variants[session.active];
+                history.begin();
+                let o = history.current().geometry.orientation;
+                history.current_mut().geometry.orientation = f(o);
+                history.commit();
                 *dirty = true;
             }
 
             ui.separator();
 
-            // Mask-overlay toggle (off / red wash / mask-only). Pure visualization
-            // — no render change.
-            overlay_toggle(app, ui);
+            // Mask-overlay toggle (off / red wash / mask-only). Pure visualization.
+            overlay_toggle(session, ui);
 
             ui.separator();
 
             // Before/after: cycle Off → Toggle → Split (also bound to `).
-            let before_label = match app.before {
-                BeforeAfter::Off => "After",
-                BeforeAfter::Toggle => "Before",
-                BeforeAfter::Split => "Split",
+            let before_label = match session.before {
+                crate::gui::app::BeforeAfter::Off => "After",
+                crate::gui::app::BeforeAfter::Toggle => "Before",
+                crate::gui::app::BeforeAfter::Split => "Split",
             };
             if ui
-                .selectable_label(app.before != BeforeAfter::Off, before_label)
+                .selectable_label(
+                    session.before != crate::gui::app::BeforeAfter::Off,
+                    before_label,
+                )
                 .on_hover_text("Before / after (`)")
                 .clicked()
             {
-                app.before = match app.before {
-                    BeforeAfter::Off => BeforeAfter::Toggle,
-                    BeforeAfter::Toggle => BeforeAfter::Split,
-                    BeforeAfter::Split => BeforeAfter::Off,
-                };
+                session.before = session.before.cycled();
             }
 
-            // Zoom controls. Fit / 100% snap the intent; −/+ step the ladder.
+            // Zoom controls. Fit / 100% snap the intent; −/+ step the ladder. They
+            // go through the app methods (session is reborrowed inside), so end the
+            // session borrow first.
+            let _ = session;
             ui.separator();
-            if icons::icon_button(ui, true, "zoom_fit", "Zoom to fit (0)").clicked() {
+            if crate::gui::icons::icon_button(ui, true, "zoom_fit", "Zoom to fit (0)").clicked() {
                 app.zoom_fit();
             }
-            if icons::icon_button(ui, true, "zoom_100", "Zoom to 100% (1)").clicked() {
+            if crate::gui::icons::icon_button(ui, true, "zoom_100", "Zoom to 100% (1)").clicked() {
                 app.zoom_actual();
             }
-            if icons::icon_button(ui, true, "zoom_out", "Zoom out (−)").clicked() {
+            if crate::gui::icons::icon_button(ui, true, "zoom_out", "Zoom out (−)").clicked() {
                 app.zoom_step(-1);
             }
-            if icons::icon_button(ui, true, "zoom_in", "Zoom in (+)").clicked() {
+            if crate::gui::icons::icon_button(ui, true, "zoom_in", "Zoom in (+)").clicked() {
                 app.zoom_step(1);
             }
             ui.label(format!("{}%", app.zoom_percent()));
@@ -131,7 +144,7 @@ pub(crate) fn show(
 
 /// The on-canvas tool selector: a row of selectable labels, one per tool. Only
 /// the active tool draws handles and consumes the canvas pointer.
-fn tool_selector(app: &mut App, ui: &mut egui::Ui) {
+fn tool_selector(session: &mut crate::gui::app::Session, ui: &mut egui::Ui) {
     let tools = [
         (CanvasTool::None, "View"),
         (CanvasTool::Crop, "Crop"),
@@ -141,9 +154,9 @@ fn tool_selector(app: &mut App, ui: &mut egui::Ui) {
         (CanvasTool::Brush, "Brush"),
     ];
     for (tool, label) in tools {
-        if ui.selectable_label(app.tool == tool, label).clicked() {
+        if ui.selectable_label(session.tool == tool, label).clicked() {
             // Toggle off to View when re-clicking the active tool.
-            app.tool = if app.tool == tool {
+            session.tool = if session.tool == tool {
                 CanvasTool::None
             } else {
                 tool
@@ -153,18 +166,18 @@ fn tool_selector(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// The mask-overlay toggle: cycles Off → red wash → mask-only.
-fn overlay_toggle(app: &mut App, ui: &mut egui::Ui) {
-    let label = match app.overlay_mode {
+fn overlay_toggle(session: &mut crate::gui::app::Session, ui: &mut egui::Ui) {
+    let label = match session.overlay_mode {
         OverlayMode::Off => "Mask: off",
         OverlayMode::Color => "Mask: red",
         OverlayMode::MaskOnly => "Mask: gray",
     };
     if ui
-        .selectable_label(app.overlay_mode.is_on(), label)
+        .selectable_label(session.overlay_mode.is_on(), label)
         .on_hover_text("Show the selected mask as an overlay")
         .clicked()
     {
-        app.overlay_mode = match app.overlay_mode {
+        session.overlay_mode = match session.overlay_mode {
             OverlayMode::Off => OverlayMode::Color,
             OverlayMode::Color => OverlayMode::MaskOnly,
             OverlayMode::MaskOnly => OverlayMode::Off,

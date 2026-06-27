@@ -21,3 +21,13 @@ latent-export = { path = "../latent-export" }
 clap = { version = "4", features = ["derive"] }
 eframe = "0.32"
 image = "0.25"
+# Native OS file/save dialogs. On Linux it speaks the XDG Desktop Portal (so it
+# works under Wayland and sandboxed), falling back to GTK — no toolkit shipped.
+rfd = "0.17"
+# The per-OS config directory; `std` has no portable config-dir API. Tiny, with
+# no transitive weight, purpose-built for the platform-correct path.
+directories = "6"
+# The persisted app config is a small serde struct stored as RON (the format the
+# edit sidecar already uses), so no new format crate is introduced.
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"

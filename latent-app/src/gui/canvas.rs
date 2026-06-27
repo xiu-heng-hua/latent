@@ -14,7 +14,7 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Vec2};
 use latent_image::ImageBuf;
 
-use super::app::{App, BeforeAfter};
+use super::app::{App, BeforeAfter, Session};
 use super::theme;
 use super::tools;
 
@@ -222,10 +222,16 @@ pub(crate) fn to_color_image(img: &ImageBuf) -> egui::ColorImage {
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     let surround = egui::Frame::central_panel(&ctx.style()).fill(theme::CANVAS_SURROUND);
 
+    // The canvas runs only with an open session (the welcome state owns the
+    // central panel otherwise).
+    let Some(session) = app.session.as_mut() else {
+        return;
+    };
+
     // The preview renders off-thread, so the texture is not ready on the first
     // frame(s). Until it arrives, show a placeholder rather than unwrapping a
     // `None` texture, and keep waiting for the worker.
-    let Some(texture) = &app.texture else {
+    let Some(texture) = &session.texture else {
         egui::CentralPanel::default()
             .frame(surround)
             .show(ctx, |ui| {
@@ -236,12 +242,12 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     };
     let tex_id = texture.id();
     let tex_size = texture.size_vec2();
-    let before_id = app.before_texture.as_ref().map(|t| t.id());
-    let active = app.active;
-    let local_sel = app.local_sel;
+    let before_id = session.before_texture.as_ref().map(|t| t.id());
+    let active = session.active;
+    let local_sel = session.local_sel;
     let mut painted = false;
     // Cleared each frame; re-set below when the cursor is over the image.
-    app.pixel_readout = None;
+    session.pixel_readout = None;
 
     egui::CentralPanel::default()
         .frame(surround)
@@ -253,11 +259,11 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
 
             // Pan and zoom run before the transform is built so this frame draws
             // at the updated view. Both only request a repaint — never a render.
-            handle_pan(app, &resp);
-            handle_zoom(app, ui, &resp, tex_size, panel);
+            handle_pan(session, &resp);
+            handle_zoom(session, ui, &resp, tex_size, panel);
 
-            let transform = ViewTransform::new(tex_size, panel, app.zoom, app.pan);
-            app.last_transform = Some(transform);
+            let transform = ViewTransform::new(tex_size, panel, session.zoom, session.pan);
+            session.last_transform = Some(transform);
 
             // Paint the surround fill (the photo's neutral border) across the
             // whole panel, then draw the image fitted into its sub-rect.
@@ -266,7 +272,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             let image_rect = transform.image_rect();
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
-            match (app.before, before_id) {
+            match (session.before, before_id) {
                 // Split: clip the image rect down the middle and draw before on
                 // the left half, after on the right. Both go through the one
                 // transform, so a feature lines up across the seam.
@@ -298,31 +304,35 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             // The mask overlay (translucent red coverage), drawn over the image
             // but under the tool handles, so the user sees the selection. Pure
             // paint — never baked into the texture.
-            tools::overlay::draw(app, &painter, &transform, active, local_sel);
+            tools::overlay::draw(session, &painter, &transform, active, local_sel);
 
             // Pixel readout: sample the rendered preview under the cursor when it
             // is over the image (not the gray surround). The shared pick-pixel
             // path the clipping read-back and the WB eyedropper reuse.
-            if app.before == BeforeAfter::Off
+            if session.before == BeforeAfter::Off
                 && let Some(pos) = resp.hover_pos()
             {
-                sample_pixel_readout(app, &transform, pos);
+                sample_pixel_readout(session, &transform, pos);
             }
 
             // Route the pointer to the active tool: it draws its handles/guides
             // and consumes the drag when it grabs one, falling through to pan
             // otherwise. One undo step per drag (begin on grab, commit on
             // release). `dirty` is set when the tool changed the settings.
-            let changed = tools::interact(app, &resp, &painter, &transform, active, local_sel);
+            let changed = tools::interact(session, &resp, &painter, &transform, active, local_sel);
             painted |= changed;
         });
+
+    // Whether a tool is active, captured before the session borrow is released so
+    // the render request below can reborrow the app.
+    let tool_active = session.tool != tools::CanvasTool::None;
 
     // A tool gesture changed the settings after this frame's render; refresh the
     // preview and repaint so the edit shows up.
     if painted {
         app.render_preview(ctx);
         ctx.request_repaint();
-    } else if app.tool != tools::CanvasTool::None {
+    } else if tool_active {
         // A tool is active (drawing handles/cursor) — keep repainting so the
         // overlay tracks the pointer even when nothing changed this frame.
         ctx.request_repaint();
@@ -338,15 +348,15 @@ fn panning(resp: &egui::Response) -> bool {
 
 /// Apply a pan gesture (middle-drag or space+left-drag) to the view pan. Pan is a
 /// pure view change: it requests a repaint, never a render.
-fn handle_pan(app: &mut App, resp: &egui::Response) {
+fn handle_pan(session: &mut Session, resp: &egui::Response) {
     // Pan is inert when the whole image fits — there's nothing off-screen to
     // bring into view.
-    if matches!(app.zoom, Zoom::Fit) {
-        app.pan = Vec2::ZERO;
+    if matches!(session.zoom, Zoom::Fit) {
+        session.pan = Vec2::ZERO;
         return;
     }
     if panning(resp) {
-        app.pan += resp.drag_delta();
+        session.pan += resp.drag_delta();
         resp.ctx.request_repaint();
     }
 }
@@ -355,7 +365,13 @@ fn handle_pan(app: &mut App, resp: &egui::Response) {
 /// adjusts the pan so the image point under the cursor stays under the cursor.
 /// Like pan, this only requests a repaint — the texture is unchanged, so no
 /// render is spawned.
-fn handle_zoom(app: &mut App, ui: &egui::Ui, resp: &egui::Response, tex_size: Vec2, panel: Rect) {
+fn handle_zoom(
+    session: &mut Session,
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    tex_size: Vec2,
+    panel: Rect,
+) {
     if !resp.hovered() {
         return;
     }
@@ -367,29 +383,29 @@ fn handle_zoom(app: &mut App, ui: &egui::Ui, resp: &egui::Response, tex_size: Ve
         return;
     };
     // Capture the normalized image point under the cursor before the zoom change.
-    let before = ViewTransform::new(tex_size, panel, app.zoom, app.pan);
+    let before = ViewTransform::new(tex_size, panel, session.zoom, session.pan);
     let anchor = before.screen_to_image_norm(cursor);
     let fit_scale = ViewTransform::compute_fit_scale(tex_size, panel.size());
 
     let dir = if scroll_y > 0.0 { 1 } else { -1 };
-    app.zoom = app.zoom.stepped(dir, fit_scale);
+    session.zoom = step_zoom(session.zoom, dir, fit_scale);
     // Re-anchor: set the pan so the same normalized point maps back to the cursor.
-    let after = ViewTransform::new(tex_size, panel, app.zoom, app.pan);
+    let after = ViewTransform::new(tex_size, panel, session.zoom, session.pan);
     let landed = after.image_norm_to_screen(anchor);
-    app.pan += cursor - landed;
+    session.pan += cursor - landed;
     ui.ctx().request_repaint();
 }
 
 /// Sample the rendered-preview pixel under `pos` (when over the image) into the
 /// app's pixel readout, reading through the one transform and from the stashed
 /// preview `ImageBuf` — the shared pick-pixel substrate.
-fn sample_pixel_readout(app: &mut App, transform: &ViewTransform, pos: Pos2) {
+fn sample_pixel_readout(session: &mut Session, transform: &ViewTransform, pos: Pos2) {
     let norm = transform.screen_to_image_norm(pos);
     // Off-image (over the gray surround): leave the readout cleared.
     if norm[0] < 0.0 || norm[0] > 1.0 || norm[1] < 0.0 || norm[1] > 1.0 {
         return;
     }
-    let Some(img) = &app.preview_rendered else {
+    let Some(img) = &session.preview_rendered else {
         return;
     };
     let (px, py) = norm_to_pixel(norm, img.width(), img.height());
@@ -401,7 +417,7 @@ fn sample_pixel_readout(app: &mut App, transform: &ViewTransform, pos: Pos2) {
     let mut one = ImageBuf::new(1, 1);
     one.set(0, 0, linear);
     let rgb = latent_export::to_srgb8(&one);
-    app.pixel_readout = Some(PixelReadout {
+    session.pixel_readout = Some(PixelReadout {
         x: px,
         y: py,
         rgb: [rgb[0], rgb[1], rgb[2]],

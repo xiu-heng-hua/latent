@@ -155,6 +155,17 @@ fn invalid_dimensions(message: &str) -> image::ImageError {
 /// error for a zero dimension or an unsupported extension — never a degenerate
 /// or untagged file.
 pub fn save(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
+    save_with_quality(img, path, None)
+}
+
+/// Like [`save`] (8-bit sRGB), but with an optional JPEG `quality` (1–100). The
+/// quality is honored only for JPEG output; PNG/TIFF ignore it (they are
+/// lossless). `None` keeps the encoder default.
+pub fn save_with_quality(
+    img: &ImageBuf,
+    path: &Path,
+    quality: Option<u8>,
+) -> image::ImageResult<()> {
     if img.width() == 0 || img.height() == 0 {
         return Err(invalid_dimensions(
             "cannot encode an image with a zero dimension",
@@ -162,7 +173,7 @@ pub fn save(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
     }
     let out = image::RgbImage::from_raw(img.width(), img.height(), to_srgb8(img))
         .ok_or_else(|| invalid_dimensions("image dimensions overflow the pixel buffer"))?;
-    save_buffer_with_icc(&out, path)
+    save_buffer_with_icc(&out, path, quality)
 }
 
 /// Encode the image to **16-bit** sRGB (same output transform as [`save`]) and
@@ -184,7 +195,9 @@ pub fn save_16(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
             out.put_pixel(x, y, image::Rgb(rgb));
         }
     }
-    save_buffer_with_icc(&out, path)
+    // 16-bit output is PNG/TIFF only (JPEG has no 16-bit path), so there is no
+    // JPEG quality to apply here.
+    save_buffer_with_icc(&out, path, None)
 }
 
 /// Encode `img` to `path` at the given depth, or — when `depth` is `None` — at
@@ -194,11 +207,25 @@ pub fn save_16(img: &ImageBuf, path: &Path) -> image::ImageResult<()> {
 /// underlying [`save`]/[`save_16`] (it reaches [`save_buffer_with_icc`] either
 /// way), so it surfaces the same typed error regardless of the chosen depth.
 pub fn save_auto(img: &ImageBuf, path: &Path, depth: Option<Depth>) -> image::ImageResult<()> {
+    save_auto_with_quality(img, path, depth, None)
+}
+
+/// Like [`save_auto`], but with an optional JPEG `quality` (1–100). The quality
+/// applies only to the JPEG encoder; for PNG/TIFF it is ignored (those are
+/// lossless). `None` keeps the encoder's built-in default. Splitting this out
+/// from [`save_auto`] keeps the simple, depth-only entry point the CLI uses while
+/// letting the editor's export dialog pass a chosen quality.
+pub fn save_auto_with_quality(
+    img: &ImageBuf,
+    path: &Path,
+    depth: Option<Depth>,
+    quality: Option<u8>,
+) -> image::ImageResult<()> {
     // Default by format; for an unsupported extension fall through to `save`,
     // which routes to `save_buffer_with_icc` and raises the extension error.
     match depth.or_else(|| recommended_depth(path)) {
         Some(Depth::Sixteen) => save_16(img, path),
-        _ => save(img, path),
+        _ => save_with_quality(img, path, quality),
     }
 }
 
@@ -219,6 +246,7 @@ fn srgb_icc() -> Vec<u8> {
 fn save_buffer_with_icc<P>(
     buf: &image::ImageBuffer<P, Vec<P::Subpixel>>,
     path: &Path,
+    quality: Option<u8>,
 ) -> image::ImageResult<()>
 where
     P: image::PixelWithColorType,
@@ -253,7 +281,14 @@ where
         }
         // The supported set guarantees this is `jpg`/`jpeg`.
         _ => {
-            let mut enc = image::codecs::jpeg::JpegEncoder::new(std::fs::File::create(path)?);
+            let file = std::fs::File::create(path)?;
+            // Honor an explicit quality (1–100); `None` keeps the encoder default.
+            let mut enc = match quality {
+                Some(q) => {
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(file, q.clamp(1, 100))
+                }
+                None => image::codecs::jpeg::JpegEncoder::new(file),
+            };
             enc.set_icc_profile(icc)
                 .map_err(image::ImageError::Unsupported)?;
             buf.write_with_encoder(enc)
@@ -419,6 +454,48 @@ mod tests {
             "jpeg output should carry an embedded ICC profile"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn jpeg_quality_affects_file_size() {
+        // A lower JPEG quality must produce a smaller file than a high quality for
+        // the same image, confirming the quality reaches the encoder. A gradient
+        // gives the encoder something to compress at different rates.
+        let mut img = ImageBuf::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = (x as f32) / 63.0;
+                img.set(x, y, [v, 1.0 - v, (y as f32) / 63.0]);
+            }
+        }
+        let low = std::env::temp_dir().join("latent_export_quality_low.jpg");
+        let high = std::env::temp_dir().join("latent_export_quality_high.jpg");
+        save_with_quality(&img, &low, Some(10)).expect("low-quality jpeg");
+        save_with_quality(&img, &high, Some(95)).expect("high-quality jpeg");
+        let low_size = std::fs::metadata(&low).unwrap().len();
+        let high_size = std::fs::metadata(&high).unwrap().len();
+        assert!(
+            low_size < high_size,
+            "lower quality should be smaller: {low_size} vs {high_size}"
+        );
+        std::fs::remove_file(&low).ok();
+        std::fs::remove_file(&high).ok();
+    }
+
+    #[test]
+    fn save_auto_with_quality_ignores_quality_for_lossless() {
+        // Quality is meaningful only for JPEG; passing it for PNG must still write
+        // a valid file (the encoder ignores it) rather than erroring.
+        let mut img = ImageBuf::new(2, 1);
+        img.set(0, 0, [0.0, 0.0, 0.0]);
+        img.set(1, 0, [0.5, 0.5, 0.5]);
+        let png = std::env::temp_dir().join("latent_export_quality_png.png");
+        save_auto_with_quality(&img, &png, None, Some(50)).expect("png ignores quality");
+        assert!(matches!(
+            image::open(&png).unwrap().color(),
+            image::ColorType::Rgb16
+        ));
+        std::fs::remove_file(&png).ok();
     }
 
     #[test]

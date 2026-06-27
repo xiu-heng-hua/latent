@@ -147,7 +147,7 @@ fn pan_gesture(resp: &egui::Response) -> bool {
 /// All pointer mapping goes through the [`ViewTransform`]; nothing here
 /// recomputes screen↔image math.
 pub(crate) fn interact(
-    app: &mut super::app::App,
+    session: &mut super::app::Session,
     resp: &egui::Response,
     painter: &Painter,
     transform: &ViewTransform,
@@ -155,15 +155,17 @@ pub(crate) fn interact(
     local_sel: usize,
 ) -> bool {
     // A pan gesture always wins, and `None` is pure view.
-    if app.tool == CanvasTool::None || pan_gesture(resp) {
+    if session.tool == CanvasTool::None || pan_gesture(resp) {
         return false;
     }
-    match app.tool {
-        CanvasTool::Crop => crop_interact(app, resp, painter, transform, active),
-        CanvasTool::Keystone => keystone_interact(app, resp, painter, transform, active),
-        CanvasTool::MaskShape => mask_interact(app, resp, painter, transform, active, local_sel),
-        CanvasTool::Straighten => straighten_interact(app, resp, painter, transform, active),
-        CanvasTool::Brush => brush_interact(app, resp, painter, transform, active, local_sel),
+    match session.tool {
+        CanvasTool::Crop => crop_interact(session, resp, painter, transform, active),
+        CanvasTool::Keystone => keystone_interact(session, resp, painter, transform, active),
+        CanvasTool::MaskShape => {
+            mask_interact(session, resp, painter, transform, active, local_sel)
+        }
+        CanvasTool::Straighten => straighten_interact(session, resp, painter, transform, active),
+        CanvasTool::Brush => brush_interact(session, resp, painter, transform, active, local_sel),
         CanvasTool::None | CanvasTool::WbPick => false,
     }
 }
@@ -177,46 +179,46 @@ fn pointer_norm(resp: &egui::Response, transform: &ViewTransform) -> Option<[f32
 
 /// The crop tool gesture + overlay.
 fn crop_interact(
-    app: &mut super::app::App,
+    session: &mut super::app::Session,
     resp: &egui::Response,
     painter: &Painter,
     transform: &ViewTransform,
     active: usize,
 ) -> bool {
-    let current = crop::current_crop(app.variants[active].current());
+    let current = crop::current_crop(session.variants[active].current());
     let mut changed = false;
 
     if resp.drag_started()
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(grab) = crop::hit_test(current, pos, transform)
     {
-        app.variants[active].begin();
-        app.drag = Some(CanvasDrag::Crop(grab, current));
+        session.variants[active].begin();
+        session.drag = Some(CanvasDrag::Crop(grab, current));
     }
     if resp.dragged()
-        && let Some(CanvasDrag::Crop(grab, start)) = app.drag
+        && let Some(CanvasDrag::Crop(grab, start)) = session.drag
         && let Some(p) = pointer_norm(resp, transform)
     {
-        let ratio = app
+        let ratio = session
             .crop_aspect_locked
-            .then(|| app.crop_aspect.visual_ratio(app.displayed_aspect()))
+            .then(|| session.crop_aspect.visual_ratio(session.displayed_aspect()))
             .flatten();
-        let c = crop::apply_drag(start, grab, p, ratio, app.displayed_aspect());
-        crop::write_crop(&mut app.variants[active], c);
+        let c = crop::apply_drag(start, grab, p, ratio, session.displayed_aspect());
+        crop::write_crop(&mut session.variants[active], c);
         changed = true;
     }
-    if resp.drag_stopped() && matches!(app.drag, Some(CanvasDrag::Crop(..))) {
-        app.variants[active].commit();
-        app.drag = None;
+    if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::Crop(..))) {
+        session.variants[active].commit();
+        session.drag = None;
     }
 
-    crop::draw_overlay(painter, transform, current, app.crop_thirds);
+    crop::draw_overlay(painter, transform, current, session.crop_thirds);
     changed
 }
 
 /// The keystone tool gesture + overlay.
 fn keystone_interact(
-    app: &mut super::app::App,
+    session: &mut super::app::Session,
     resp: &egui::Response,
     painter: &Painter,
     transform: &ViewTransform,
@@ -227,21 +229,21 @@ fn keystone_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(corner) = keystone::hit_test(pos, transform)
     {
-        app.variants[active].begin();
-        let start = keystone::current(app.variants[active].current());
-        app.drag = Some(CanvasDrag::Keystone(corner, start));
+        session.variants[active].begin();
+        let start = keystone::current(session.variants[active].current());
+        session.drag = Some(CanvasDrag::Keystone(corner, start));
     }
     if resp.dragged()
-        && let Some(CanvasDrag::Keystone(corner, start)) = app.drag
+        && let Some(CanvasDrag::Keystone(corner, start)) = session.drag
         && let Some(p) = pointer_norm(resp, transform)
     {
         let params = keystone::corner_to_params(corner, p, start);
-        keystone::write(&mut app.variants[active], params);
+        keystone::write(&mut session.variants[active], params);
         changed = true;
     }
-    if resp.drag_stopped() && matches!(app.drag, Some(CanvasDrag::Keystone(..))) {
-        app.variants[active].commit();
-        app.drag = None;
+    if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::Keystone(..))) {
+        session.variants[active].commit();
+        session.drag = None;
     }
     keystone::draw_overlay(painter, transform);
     changed
@@ -249,14 +251,15 @@ fn keystone_interact(
 
 /// The mask-shape (gradient/radial) tool gesture + overlay.
 fn mask_interact(
-    app: &mut super::app::App,
+    session: &mut super::app::Session,
     resp: &egui::Response,
     painter: &Painter,
     transform: &ViewTransform,
     active: usize,
     local_sel: usize,
 ) -> bool {
-    let Some(shape) = mask_shape::selected_shape(app.variants[active].current(), local_sel) else {
+    let Some(shape) = mask_shape::selected_shape(session.variants[active].current(), local_sel)
+    else {
         return false;
     };
     let mut changed = false;
@@ -264,20 +267,20 @@ fn mask_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(grab) = mask_shape::hit_test(&shape, pos, transform)
     {
-        app.variants[active].begin();
-        app.drag = Some(CanvasDrag::MaskShape(grab, shape.clone()));
+        session.variants[active].begin();
+        session.drag = Some(CanvasDrag::MaskShape(grab, shape.clone()));
     }
     if resp.dragged()
-        && let Some(CanvasDrag::MaskShape(grab, start)) = app.drag.clone()
+        && let Some(CanvasDrag::MaskShape(grab, start)) = session.drag.clone()
         && let Some(p) = pointer_norm(resp, transform)
     {
         let updated = mask_shape::apply_drag(&start, grab, p);
-        mask_shape::write(&mut app.variants[active], local_sel, updated);
+        mask_shape::write(&mut session.variants[active], local_sel, updated);
         changed = true;
     }
-    if resp.drag_stopped() && matches!(app.drag, Some(CanvasDrag::MaskShape(..))) {
-        app.variants[active].commit();
-        app.drag = None;
+    if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::MaskShape(..))) {
+        session.variants[active].commit();
+        session.drag = None;
     }
     mask_shape::draw_overlay(painter, transform, &shape);
     changed
@@ -285,7 +288,7 @@ fn mask_interact(
 
 /// The straighten-by-horizon tool gesture + overlay.
 fn straighten_interact(
-    app: &mut super::app::App,
+    session: &mut super::app::Session,
     resp: &egui::Response,
     painter: &Painter,
     transform: &ViewTransform,
@@ -295,15 +298,15 @@ fn straighten_interact(
     if resp.drag_started()
         && let Some(p) = pointer_norm(resp, transform)
     {
-        app.variants[active].begin();
-        app.drag = Some(CanvasDrag::Straighten(p));
+        session.variants[active].begin();
+        session.drag = Some(CanvasDrag::Straighten(p));
     }
-    if let Some(CanvasDrag::Straighten(from)) = app.drag {
+    if let Some(CanvasDrag::Straighten(from)) = session.drag {
         if let Some(to) = pointer_norm(resp, transform) {
             straighten::draw_line(painter, transform, from, to);
             if resp.dragged() {
-                let angle = straighten::level_angle(from, to, app.displayed_aspect());
-                app.variants[active]
+                let angle = straighten::level_angle(from, to, session.displayed_aspect());
+                session.variants[active]
                     .current_mut()
                     .geometry
                     .straighten_degrees = angle;
@@ -311,8 +314,8 @@ fn straighten_interact(
             }
         }
         if resp.drag_stopped() {
-            app.variants[active].commit();
-            app.drag = None;
+            session.variants[active].commit();
+            session.drag = None;
         }
     } else {
         straighten::draw_prompt(painter, transform);
@@ -324,7 +327,7 @@ fn straighten_interact(
 /// and the live coverage overlay, routed through the transform — no ad-hoc rect
 /// math. A two-ring cursor at the pointer shows the radius and feather.
 fn brush_interact(
-    app: &mut super::app::App,
+    session: &mut super::app::Session,
     resp: &egui::Response,
     painter: &Painter,
     transform: &ViewTransform,
@@ -333,7 +336,7 @@ fn brush_interact(
 ) -> bool {
     use latent_edit::{Dab, MaskShape};
     // Only paint when the selected local is a brush mask.
-    let is_brush = app.variants[active]
+    let is_brush = session.variants[active]
         .current()
         .locals
         .get(local_sel)
@@ -345,15 +348,15 @@ fn brush_interact(
     let mut painted = false;
     let click = resp.clicked() && !resp.dragged();
     if resp.drag_started() || click {
-        app.variants[active].begin();
-        app.drag = Some(CanvasDrag::Brush);
+        session.variants[active].begin();
+        session.drag = Some(CanvasDrag::Brush);
     }
     if (resp.dragged() || click)
         && let Some(p) = pointer_norm(resp, transform)
     {
         let nx = p[0].clamp(0.0, 1.0);
         let ny = p[1].clamp(0.0, 1.0);
-        if let Some(MaskShape::Brush(b)) = app.variants[active].current_mut().locals[local_sel]
+        if let Some(MaskShape::Brush(b)) = session.variants[active].current_mut().locals[local_sel]
             .mask
             .shapes
             .first_mut()
@@ -361,24 +364,24 @@ fn brush_interact(
             b.dabs.push(Dab {
                 x: nx,
                 y: ny,
-                radius: app.brush_radius,
-                feather: app.brush_feather,
-                erase: app.brush_erase,
+                radius: session.brush_radius,
+                feather: session.brush_feather,
+                erase: session.brush_erase,
             });
             painted = true;
         }
     }
     if resp.drag_stopped() || click {
-        app.variants[active].commit();
-        app.drag = None;
+        session.variants[active].commit();
+        session.drag = None;
     }
 
     // The two-ring brush cursor (radius + feather) at the pointer, in screen
     // space via the transform so it tracks the painted size at any zoom.
     if let Some(pos) = resp.hover_pos() {
-        let inner = transform.norm_len_to_screen(app.brush_radius);
-        let outer = transform.norm_len_to_screen(app.brush_radius + app.brush_feather);
-        let color = if app.brush_erase {
+        let inner = transform.norm_len_to_screen(session.brush_radius);
+        let outer = transform.norm_len_to_screen(session.brush_radius + session.brush_feather);
+        let color = if session.brush_erase {
             egui::Color32::from_rgb(230, 120, 120)
         } else {
             egui::Color32::WHITE

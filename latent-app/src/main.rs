@@ -13,11 +13,20 @@ use latent_image::{Orientation, color};
 use latent_pipeline::Backend;
 
 /// A small, readable RAW developer.
+///
+/// A bare path (`latent photo.nef`) is shorthand for `latent open photo.nef`; with
+/// no arguments at all the editor opens on its welcome screen. The `open` and
+/// `develop` subcommands are unchanged.
 #[derive(Parser)]
 #[command(name = "latent", version, about)]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
+    /// A RAW file to open in the editor (shorthand for `open <input>`). Ignored
+    /// when a subcommand is given; absent with no subcommand launches the welcome
+    /// state.
+    input: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// The output bit depth, chosen on the `develop` command line.
@@ -119,20 +128,32 @@ fn develop(input: &Path, output: &Path, depth: Option<Depth>) -> Result<(), Box<
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Develop {
+        Some(Command::Develop {
             input,
             output,
             depth,
-        } => develop(&input, &output, depth).map(|()| println!("wrote {}", output.display())),
-        Command::Open { input, gpu } => {
-            let (backend, kind) = select_backend(gpu);
-            gui::run(&input, backend, kind)
-        }
+        }) => develop(&input, &output, depth).map(|()| println!("wrote {}", output.display())),
+        // The `open` subcommand's explicit `--gpu` wins over the persisted pref.
+        Some(Command::Open { input, gpu }) => open_editor(Some(input.as_path()), Some(gpu)),
+        // No subcommand: a bare path opens that file, nothing at all opens the
+        // welcome state. With no `--gpu` flag, both honor the persisted pref.
+        None => open_editor(cli.input.as_deref(), None),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Open the editor window on `input` (or the welcome state for `None`), loading
+/// the persisted app config. `gpu` forces the backend when `Some`; `None` honors
+/// the config's persisted GPU preference. The single entry point the `open`
+/// subcommand and the bare-path/no-args paths share.
+fn open_editor(input: Option<&Path>, gpu: Option<bool>) -> Result<(), Box<dyn Error>> {
+    let config = gui::config_load();
+    let use_gpu = gpu.unwrap_or(config.gpu);
+    let (backend, kind) = select_backend(use_gpu);
+    gui::run(input, backend, kind, config)
 }
 
 #[cfg(test)]
@@ -144,11 +165,11 @@ mod tests {
         let cli = Cli::try_parse_from(["latent", "develop", "in.raw", "out.tiff"])
             .expect("develop should parse");
         match cli.command {
-            Command::Develop {
+            Some(Command::Develop {
                 input,
                 output,
                 depth,
-            } => {
+            }) => {
                 assert_eq!(input, PathBuf::from("in.raw"));
                 assert_eq!(output, PathBuf::from("out.tiff"));
                 assert_eq!(depth, None);
@@ -162,13 +183,13 @@ mod tests {
         let cli = Cli::try_parse_from(["latent", "develop", "in.raw", "out.tiff", "--depth", "8"])
             .expect("--depth 8 should parse");
         match cli.command {
-            Command::Develop { depth, .. } => assert_eq!(depth, Some(Depth::Eight)),
+            Some(Command::Develop { depth, .. }) => assert_eq!(depth, Some(Depth::Eight)),
             _ => panic!("expected the develop subcommand"),
         }
         let cli = Cli::try_parse_from(["latent", "develop", "in.raw", "out.png", "--depth", "16"])
             .expect("--depth 16 should parse");
         match cli.command {
-            Command::Develop { depth, .. } => assert_eq!(depth, Some(Depth::Sixteen)),
+            Some(Command::Develop { depth, .. }) => assert_eq!(depth, Some(Depth::Sixteen)),
             _ => panic!("expected the develop subcommand"),
         }
         // A depth outside the accepted set is rejected by the parser.
@@ -183,7 +204,7 @@ mod tests {
         let with = Cli::try_parse_from(["latent", "open", "in.raw", "--gpu"])
             .expect("open --gpu should parse");
         match with.command {
-            Command::Open { input, gpu } => {
+            Some(Command::Open { input, gpu }) => {
                 assert_eq!(input, PathBuf::from("in.raw"));
                 assert!(gpu);
             }
@@ -191,9 +212,35 @@ mod tests {
         }
         let without = Cli::try_parse_from(["latent", "open", "in.raw"]).expect("open should parse");
         match without.command {
-            Command::Open { gpu, .. } => assert!(!gpu),
+            Some(Command::Open { gpu, .. }) => assert!(!gpu),
             _ => panic!("expected the open subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_bare_path_as_open() {
+        // A lone path (no subcommand) is shorthand for `open <input>`: it parses to
+        // the top-level `input` with no subcommand.
+        let cli = Cli::try_parse_from(["latent", "photo.nef"]).expect("bare path should parse");
+        assert!(cli.command.is_none(), "a bare path is not a subcommand");
+        assert_eq!(cli.input, Some(PathBuf::from("photo.nef")));
+    }
+
+    #[test]
+    fn cli_no_args_is_welcome() {
+        // No arguments at all: no subcommand and no input — the welcome state.
+        let cli = Cli::try_parse_from(["latent"]).expect("no args should parse");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.input, None);
+    }
+
+    #[test]
+    fn cli_subcommand_wins_over_bare_path() {
+        // `open`/`develop` still parse exactly as before; the bare positional does
+        // not swallow a real subcommand (args conflict with subcommands).
+        let cli = Cli::try_parse_from(["latent", "open", "in.raw"]).expect("open parses");
+        assert!(matches!(cli.command, Some(Command::Open { .. })));
+        assert_eq!(cli.input, None);
     }
 
     #[test]

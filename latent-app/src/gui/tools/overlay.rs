@@ -13,7 +13,7 @@ use egui::{Color32, ColorImage};
 use latent_edit::Mask;
 use latent_image::ImageBuf;
 
-use super::super::app::App;
+use super::super::app::Session;
 use super::super::canvas::ViewTransform;
 
 /// The longest side of the coverage grid. Coarser than the preview itself —
@@ -164,27 +164,28 @@ impl OverlayCache {
 /// image rect via the transform. Pure paint — the rendered preview and the export
 /// are untouched.
 pub(crate) fn draw(
-    app: &mut App,
+    session: &mut Session,
     painter: &egui::Painter,
     transform: &ViewTransform,
     active: usize,
     local_sel: usize,
 ) {
-    if !app.overlay_mode.is_on() {
-        app.overlay_cache.clear();
+    if !session.overlay_mode.is_on() {
+        session.overlay_cache.clear();
         return;
     }
-    let Some(local) = app.variants[active].current().locals.get(local_sel) else {
+    let Some(local) = session.variants[active].current().locals.get(local_sel) else {
         return;
     };
     let mask = local.mask.clone();
-    let mode = app.overlay_mode;
-    let generation = app.preview_gen;
+    let mode = session.overlay_mode;
+    let generation = session.preview_gen;
     // The coverage samples the working (linear) preview base — never the display
     // sRGB — so value-driven masks preview the selection the engine evaluates.
-    let base = std::sync::Arc::clone(&app.preview);
+    let base = std::sync::Arc::clone(&session.preview);
     let Some(tex) =
-        app.overlay_cache
+        session
+            .overlay_cache
             .texture(painter.ctx(), &mask, local_sel, &base, generation, mode)
     else {
         return;
