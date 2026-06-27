@@ -415,66 +415,37 @@ fn d50_white_xyz() -> [f32; 3] {
     chromaticity_to_xyz(D50_WHITE)
 }
 
-/// Hue (turns, `[0, 1)`), saturation (`[0, 1]`), and value of a linear-RGB
-/// pixel. Value is the channel maximum, so it carries highlight headroom (`> 1`)
-/// through unchanged — unlike HSL lightness, this keeps the unbounded working
-/// range intact across a round trip.
-fn rgb_to_hsv(p: [f32; 3]) -> (f32, f32, f32) {
-    let max = p[0].max(p[1]).max(p[2]);
-    let min = p[0].min(p[1]).min(p[2]);
-    let c = max - min;
-    let s = if max <= 0.0 { 0.0 } else { c / max };
-    let h = if c <= 1e-9 {
-        0.0
-    } else if max == p[0] {
-        ((p[1] - p[2]) / c).rem_euclid(6.0)
-    } else if max == p[1] {
-        (p[2] - p[0]) / c + 2.0
-    } else {
-        (p[0] - p[1]) / c + 4.0
-    };
-    ((h / 6.0).rem_euclid(1.0), s, max)
-}
+/// A full turn in radians — the period of the LCh hue angle, used to map it to
+/// `[0, 1)` turns for banding.
+const TAU: f32 = std::f32::consts::TAU;
 
-/// Inverse of [`rgb_to_hsv`]. Output channels lie in `[0, v]`, so a value above
-/// `1` reconstructs to RGB above `1` (headroom preserved).
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let h6 = h.rem_euclid(1.0) * 6.0;
-    let c = v * s;
-    let x = c * (1.0 - ((h6 % 2.0) - 1.0).abs());
-    let m = v - c;
-    // `f32::rem_euclid(1.0)` can return *exactly* `1.0` for a tiny negative input
-    // (`1.0 - ε` rounds up to `1.0` in f32), making `h6 == 6.0` and `h6 as u32 == 6`
-    // reachable — and `color_mix` feeds slightly-negative hue shifts. Clamp the
-    // sextant to `5` so hue at the wheel's end deterministically lands in the last
-    // (magenta→red) arm instead of relying on `x == 0` to mask the overflow.
-    let sextant = (h6 as u32).min(5);
-    let (r, g, b) = match sextant {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    [r + m, g + m, b + m]
-}
-
-/// Apply a per-hue-band color mix to a linear-RGB pixel. `bands` holds eight
-/// `[hue, sat, lum]` adjustments for hue centers evenly spaced around the wheel
-/// (red … magenta). The pixel's hue picks its two neighbouring bands by linear
-/// interpolation, so a color at a band center is driven only by that band; when
-/// both neighbouring bands are neutral the pixel is returned unchanged. An
-/// achromatic pixel (no saturation) has no hue to grade and is left alone. `hue`
-/// shifts the hue (turns); `sat`/`lum` scale saturation/value by `1 + value`.
+/// Apply a per-hue-band color mix to a linear-RGB pixel, in perceptually-uniform
+/// CIE **LCh**. `bands` holds eight `[hue, sat, lum]` adjustments for hue centers
+/// evenly spaced around the LCh hue wheel (red, at angle 0, … magenta). The
+/// pixel's hue (the LCh angle, banded into eight slices) picks its two
+/// neighbouring bands by linear interpolation, so a color at a band center is
+/// driven only by that band; when both neighbouring bands are neutral the pixel
+/// is returned unchanged. An achromatic pixel (near-zero chroma) has no stable
+/// hue to grade and is left exactly alone.
+///
+/// The adjustments act in LCh, where each move is perceptually meaningful:
+/// `hue` rotates the hue angle by that many turns; `sat` scales **chroma** `C` by
+/// `1 + value`; `lum` scales **lightness** `L*` by `1 + value`. (The tool is
+/// labeled HSL, but grading in LCh gives hue-uniform shifts and true lightness —
+/// HSV's hue is non-uniform, worst in blue, and its "value" is the channel max,
+/// not lightness.) Chroma is clamped to `≥ 0`; the reconstructed RGB is clamped
+/// to `≥ 0` so an out-of-gamut LCh point never emits negative light.
 pub fn color_mix(rgb: [f32; 3], bands: &[[f32; 3]; 8]) -> [f32; 3] {
-    let (h, s, v) = rgb_to_hsv(rgb);
-    // An achromatic pixel has no hue to grade; leave neutrals exactly alone
-    // instead of letting them fall into the red band (where hue 0 lands).
-    if s <= 1e-6 {
+    let lch = Lab::from_working(rgb).to_lch();
+    // An achromatic pixel has no stable hue (atan2 of ~0 is ill-defined); leave
+    // neutrals exactly alone instead of letting them fall into the red band.
+    if lch.c <= 1e-4 {
         return rgb;
     }
-    let pos = h * 8.0;
+    // The LCh hue angle (radians, `(-π, π]`) mapped to `[0, 1)` turns, then to a
+    // position on the eight-band wheel. Red sits at angle 0 → band 0.
+    let turn = lch.h.rem_euclid(TAU) / TAU;
+    let pos = turn * 8.0;
     let i = (pos.floor() as usize) % 8;
     let j = (i + 1) % 8;
     let f = pos - pos.floor();
@@ -482,10 +453,34 @@ pub fn color_mix(rgb: [f32; 3], bands: &[[f32; 3]; 8]) -> [f32; 3] {
     if adj.iter().all(|&x| x == 0.0) {
         return rgb; // this hue's bands are untouched — leave it exactly alone
     }
-    let h2 = h + adj[0];
-    let s2 = (s * (1.0 + adj[1])).clamp(0.0, 1.0);
-    let v2 = (v * (1.0 + adj[2])).max(0.0);
-    hsv_to_rgb(h2, s2, v2)
+    let graded = LCh {
+        l: lch.l * (1.0 + adj[2]),
+        c: (lch.c * (1.0 + adj[1])).max(0.0),
+        h: lch.h + adj[0] * TAU,
+    };
+    let out = graded.to_lab().to_working();
+    std::array::from_fn(|c| out[c].max(0.0))
+}
+
+/// Scale a linear-RGB pixel's **chroma** by `amount` at constant perceptual
+/// lightness and hue — the saturation primitive.
+///
+/// The pixel is taken to [`LCh`], its chroma `C` is multiplied by `amount`
+/// (`0` → fully neutral, `1` → unchanged, `> 1` → more saturated), and it is
+/// returned to working RGB. Holding `L*` (and hue) fixed is the whole point:
+/// desaturating sends a color to the **mid-gray of its own lightness**, not
+/// toward black. A luma blend would instead lerp toward the working luma, whose
+/// blue weight is near-zero in these wide primaries — so a desaturated pure blue
+/// would collapse to near-black. Chroma scaling avoids that entirely.
+///
+/// Over-saturation can push the reconstructed RGB slightly negative at the gamut
+/// edge; the result is clamped to `≥ 0` so no channel emits negative light,
+/// matching the headroom guard the previous saturation used.
+pub fn saturate_chroma(rgb: [f32; 3], amount: f32) -> [f32; 3] {
+    let mut lch = Lab::from_working(rgb).to_lch();
+    lch.c *= amount;
+    let out = lch.to_lab().to_working();
+    std::array::from_fn(|c| out[c].max(0.0))
 }
 
 /// Apply a 3x3 color matrix to every pixel of an image, returning a new image.
@@ -833,39 +828,77 @@ mod tests {
         }
     }
 
+    /// Build a linear-working pixel sitting at the center of band `b` (0..8) with
+    /// the given lightness and chroma, so a test can drive exactly one band.
+    fn pixel_at_band(b: usize, l: f32, c: f32) -> [f32; 3] {
+        let h = (b as f32 / 8.0) * std::f32::consts::TAU;
+        LCh { l, c, h }.to_lab().to_working()
+    }
+
     #[test]
     fn color_mix_one_band_leaves_the_others_alone() {
-        // Desaturate only the red band (band 0). A pure-red pixel (hue 0) goes
-        // gray; a pure-cyan pixel (hue 0.5, band 4) is untouched.
+        // Desaturate only the red band (band 0). A pixel at band 0's hue center
+        // collapses to a neutral gray; a pixel at band 4 (the opposite hue) is
+        // left exactly alone — the selectivity that defines the tool.
         let mut bands = [[0.0_f32; 3]; 8];
-        bands[0] = [0.0, -1.0, 0.0]; // red band: saturation ×0
-        let red = color_mix([0.8, 0.1, 0.1], &bands);
+        bands[0] = [0.0, -1.0, 0.0]; // red band: chroma ×0
+        let red = color_mix(pixel_at_band(0, 55.0, 40.0), &bands);
+        let red_lch = Lab::from_working(red).to_lch();
         assert!(
-            (red[0] - red[1]).abs() < 1e-6 && (red[1] - red[2]).abs() < 1e-6,
-            "red desaturated: {red:?}"
+            red_lch.c < 1e-2,
+            "band-0 pixel not desaturated: {red_lch:?}"
         );
-        let cyan = [0.1, 0.8, 0.8];
-        assert_eq!(color_mix(cyan, &bands), cyan, "cyan untouched");
-    }
 
-    #[test]
-    fn color_mix_value_preserves_highlight_headroom() {
-        // Boosting the red band's luminance scales value (max channel) above 1,
-        // proving the HSV round trip carries the unbounded range through.
-        let mut bands = [[0.0_f32; 3]; 8];
-        bands[0] = [0.0, 0.0, 1.0]; // red band: value ×2
-        let out = color_mix([0.8, 0.1, 0.1], &bands);
-        assert!((out[0] - 1.6).abs() < 1e-5, "value doubled: {out:?}");
-    }
-
-    #[test]
-    fn hsv_round_trips_a_saturated_color() {
-        let px = [0.8, 0.3, 0.1];
-        let (h, s, v) = rgb_to_hsv(px);
-        let back = hsv_to_rgb(h, s, v);
+        let other = pixel_at_band(4, 55.0, 40.0);
+        let graded = color_mix(other, &bands);
         for c in 0..3 {
-            assert!((back[c] - px[c]).abs() < 1e-6, "{back:?} vs {px:?}");
+            assert!(
+                (graded[c] - other[c]).abs() < 1e-4,
+                "far-hue band touched: {graded:?} vs {other:?}"
+            );
         }
+    }
+
+    #[test]
+    fn color_mix_shifts_hue_in_lch() {
+        // A dialed hue band rotates the LCh hue of a matching pixel by the expected
+        // angle (an eighth-turn shift), while a pixel of an unrelated hue keeps its
+        // lightness and chroma untouched.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[2] = [0.125, 0.0, 0.0]; // band 2: rotate hue by 1/8 turn
+        let px = pixel_at_band(2, 60.0, 35.0);
+        let before = Lab::from_working(px).to_lch();
+        let after = Lab::from_working(color_mix(px, &bands)).to_lch();
+        let dh = (after.h - before.h).rem_euclid(std::f32::consts::TAU);
+        let expected = 0.125 * std::f32::consts::TAU;
+        assert!((dh - expected).abs() < 1e-2, "hue shift {dh} vs {expected}");
+        // Far-hue pixel (band 6) is untouched in L and C.
+        let far = pixel_at_band(6, 60.0, 35.0);
+        let far_after = Lab::from_working(color_mix(far, &bands)).to_lch();
+        let far_before = Lab::from_working(far).to_lch();
+        assert!(
+            (far_after.l - far_before.l).abs() < 1e-2,
+            "lightness drifted"
+        );
+        assert!((far_after.c - far_before.c).abs() < 1e-2, "chroma drifted");
+    }
+
+    #[test]
+    fn color_mix_lum_changes_lstar_not_max_channel() {
+        // The lum adjustment moves perceptual lightness L*, not the HSV "value"
+        // (max channel) the old implementation scaled. Boosting band 0's lum lifts
+        // the pixel's L* proportionally.
+        let mut bands = [[0.0_f32; 3]; 8];
+        bands[0] = [0.0, 0.0, 0.2]; // red band: L* ×1.2
+        let px = pixel_at_band(0, 50.0, 30.0);
+        let before = Lab::from_working(px).to_lch();
+        let after = Lab::from_working(color_mix(px, &bands)).to_lch();
+        assert!(
+            (after.l - before.l * 1.2).abs() < 0.2,
+            "L* not scaled by lum: {} vs {}",
+            after.l,
+            before.l * 1.2
+        );
     }
 
     #[test]
@@ -877,60 +910,26 @@ mod tests {
     }
 
     #[test]
-    fn hsv_achromatic_returns_zero_hue_and_saturation() {
-        // A pure gray has no chroma: saturation 0, a finite (0) hue, value = the
-        // gray. The `c <= 1e-9` / `max <= 0.0` branches must not produce NaN.
-        let (h, s, v) = rgb_to_hsv([0.4, 0.4, 0.4]);
-        assert_eq!((h, s, v), (0.0, 0.0, 0.4));
-        // Pure black: max == 0 → saturation 0, no division by zero.
-        let (h, s, v) = rgb_to_hsv([0.0, 0.0, 0.0]);
-        assert!(h.is_finite() && s == 0.0 && v == 0.0, "{h} {s} {v}");
-    }
-
-    #[test]
-    fn hsv_to_rgb_sextant_is_clamped_at_the_wheel_end() {
-        // A hue that lands exactly at (or just past) the wheel end must stay valid.
-        // `h6 as u32` could reach 6 for a slightly-negative hue; the clamp keeps it
-        // in the last arm. The reconstructed color is finite and on the gray axis for
-        // s = 0, and a pure-red hue (0) reconstructs to red.
-        let red = hsv_to_rgb(0.0, 1.0, 1.0);
-        assert!(
-            (red[0] - 1.0).abs() < 1e-6 && red[1] < 1e-6 && red[2] < 1e-6,
-            "{red:?}"
-        );
-        // A tiny-negative hue (which rem_euclid can round to exactly 1.0) must not
-        // panic or jump channels — it stays adjacent to pure red.
-        let nearly = hsv_to_rgb(-1e-9, 1.0, 1.0);
-        for c in nearly {
-            assert!(c.is_finite(), "non-finite at wheel end: {nearly:?}");
-        }
-        assert!((nearly[0] - 1.0).abs() < 1e-3, "should be ~red: {nearly:?}");
-    }
-
-    #[test]
     fn color_mix_at_a_band_center_uses_only_that_band() {
-        // Hue 0 is the center of band 0; an adjustment there is driven only by band 0
-        // (interpolation weight 1 on band 0, 0 on its neighbor).
+        // A pixel at band 0's hue center is driven only by band 0 (interpolation
+        // weight 1 on band 0, 0 on its neighbor), so desaturating band 0 neutralizes
+        // it while its neighbors stay zero.
         let mut bands = [[0.0_f32; 3]; 8];
         bands[0] = [0.0, -1.0, 0.0]; // desaturate band 0
-        let red = color_mix([0.8, 0.1, 0.1], &bands);
-        assert!(
-            (red[0] - red[1]).abs() < 1e-6 && (red[1] - red[2]).abs() < 1e-6,
-            "band-center red desaturated: {red:?}"
-        );
+        let red = color_mix(pixel_at_band(0, 55.0, 40.0), &bands);
+        let lch = Lab::from_working(red).to_lch();
+        assert!(lch.c < 1e-2, "band-center pixel not desaturated: {lch:?}");
     }
 
     #[test]
     fn color_mix_hue_at_wraparound_stays_correct() {
-        // A pixel whose hue is just below 1.0 sits between the last band (7) and band
-        // 0 (the wraparound `j = (i+1) % 8`). A shift that pushes the hue past 1.0
-        // must reconstruct without a channel jump (this exercises the negative/over-
-        // unit hue path into hsv_to_rgb).
+        // A pixel whose hue sits between the last band (7) and band 0 exercises the
+        // wraparound `j = (i+1) % 8`. A shift there must reconstruct without a
+        // channel jump (finite, non-negative).
         let mut bands = [[0.0_f32; 3]; 8];
         bands[7] = [0.05, 0.0, 0.0]; // nudge hue forward at band 7
         bands[0] = [0.05, 0.0, 0.0];
-        // A magenta-ish pixel near hue ~0.92.
-        let px = [0.8, 0.1, 0.5];
+        let px = pixel_at_band(7, 50.0, 35.0); // sits at the 7→0 boundary region
         let out = color_mix(px, &bands);
         for c in out {
             assert!(c.is_finite() && c >= 0.0, "wraparound produced {out:?}");
@@ -938,35 +937,18 @@ mod tests {
     }
 
     #[test]
-    fn color_mix_preserves_super_unit_and_clamps_value_floor() {
-        // Value above 1 (headroom) survives the round trip; a strong negative lum
-        // adjustment can't drive value below 0.
+    fn color_mix_clamps_chroma_and_output_floors() {
+        // A strong negative sat adjustment can't drive chroma below 0, and the
+        // reconstructed RGB is clamped to ≥0 so no channel emits negative light.
         let mut bands = [[0.0_f32; 3]; 8];
-        bands[0] = [0.0, 0.0, -2.0]; // value ×(1 - 2) = ×-1 → clamped to 0
-        let out = color_mix([0.9, 0.1, 0.1], &bands);
+        bands[0] = [0.0, -2.0, 0.0]; // chroma ×(1 - 2) = ×-1 → clamped to 0
+        let out = color_mix(pixel_at_band(0, 50.0, 30.0), &bands);
         for c in out {
-            assert!(c >= 0.0 && c.is_finite(), "value floor not held: {out:?}");
+            assert!(c >= 0.0 && c.is_finite(), "output floor not held: {out:?}");
         }
-    }
-
-    #[test]
-    fn rgb_to_hsv_handles_non_finite_inputs() {
-        // Pin the `f32::max`/`min` NaN-dropping behavior. For `[NaN, 0.2, 0.1]`,
-        // `max`/`min` drop the NaN, so `max == 0.2` (the green channel) and
-        // `min == 0.1`; the saturation `c / max` is therefore finite. The hue formula
-        // still references the NaN red channel, so hue is NaN — documenting that the
-        // max/min are robust to NaN while the per-channel arithmetic is not. The key
-        // contract is that the function returns rather than panicking.
-        let (_h, s, v) = rgb_to_hsv([f32::NAN, 0.2, 0.1]);
-        assert!(
-            s.is_finite(),
-            "max/min should drop NaN, leaving finite sat: {s}"
-        );
-        assert_eq!(v, 0.2, "value is the NaN-dropped max");
-        // Inf in the dominant channel: max is Inf, so saturation `c / max` is the
-        // Inf/Inf indeterminate (NaN) — but the call still returns; value carries Inf.
-        let (_h, _s, v) = rgb_to_hsv([f32::INFINITY, 0.0, 0.0]);
-        assert!(v.is_infinite(), "value should carry the Inf: {v}");
+        // Chroma clamped to zero means a neutral gray.
+        let lch = Lab::from_working(out).to_lch();
+        assert!(lch.c < 1e-2, "chroma not clamped to zero: {lch:?}");
     }
 
     #[test]
@@ -995,19 +977,17 @@ mod tests {
     }
 
     #[test]
-    fn hsv_round_trip_seeded_sweep() {
-        // Round-trip a spread of saturated colors; HSV → RGB → HSV → RGB must return
-        // the same RGB to f32 precision.
+    fn color_mix_round_trips_a_spread_of_colors_with_neutral_bands() {
+        // With all-zero bands, color_mix is the exact identity over a spread of
+        // saturated colors — the working→LCh→working path must not drift a pixel
+        // it isn't grading (catches any round-trip error in the new LCh path).
+        let bands = [[0.0_f32; 3]; 8];
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         for _ in 0..2000 {
             let px = [lcg(&mut seed), lcg(&mut seed), lcg(&mut seed)];
-            let (h, s, v) = rgb_to_hsv(px);
-            let back = hsv_to_rgb(h, s, v);
+            let back = color_mix(px, &bands);
             for c in 0..3 {
-                assert!(
-                    (back[c] - px[c]).abs() < 1e-5,
-                    "round-trip {back:?} vs {px:?}"
-                );
+                assert_eq!(back[c], px[c], "neutral bands changed {px:?}");
             }
         }
     }

@@ -2,7 +2,7 @@
 
 use latent_edit::Mask;
 use latent_image::ImageBuf;
-use latent_image::color::{Mat3, color_mix, luminance};
+use latent_image::color::{Mat3, color_mix, luminance, saturate_chroma};
 use latent_pipeline::{
     Backend, CombineKind, DEHAZE_GUIDE_EPS, DenoiseParams, PointOp, RadialGain, Transform, Warp,
     bilateral_pixel, dehaze_airlight, dehaze_dark_channel, dehaze_guide_radius,
@@ -34,14 +34,12 @@ impl Backend for CpuBackend {
             }
             PointOp::Saturation(amount) => {
                 let amount = *amount;
-                img.pixels_mut().par_iter_mut().for_each(|px| {
-                    let y = luminance(*px);
-                    // Clamp the result to ≥0: an over-saturation (amount > 1) can
-                    // push the weakest channel negative, which would otherwise twist
-                    // hue when later stages clamp it asymmetrically. Headroom (the
-                    // brightened channel) is left unbounded.
-                    *px = std::array::from_fn(|c| (y + amount * (px[c] - y)).max(0.0));
-                });
+                img.pixels_mut()
+                    .par_iter_mut()
+                    // Chroma-preserving saturation in LCh: scale chroma at constant
+                    // L* and hue, so desaturation goes to a mid-gray of the pixel's
+                    // own lightness rather than toward near-black. Clamps to ≥0.
+                    .for_each(|px| *px = saturate_chroma(*px, amount));
             }
             PointOp::Curves(curves) => {
                 img.pixels_mut()
@@ -808,7 +806,10 @@ mod tests {
         src.set(0, 0, px);
         let settings = Settings {
             global: Adjustments {
-                channel_mixer: Some(ChannelMixer { matrix }),
+                channel_mixer: Some(ChannelMixer {
+                    matrix,
+                    ..ChannelMixer::default()
+                }),
                 ..Adjustments::default()
             },
             ..Settings::default()

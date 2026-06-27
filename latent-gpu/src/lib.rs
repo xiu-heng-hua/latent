@@ -38,7 +38,6 @@ struct MapParams {
 
 const OP_GAIN: u32 = 0;
 const OP_TONE: u32 = 1;
-const OP_SATURATION: u32 = 2;
 
 /// Threads per workgroup for `map_pixels` (matches `@workgroup_size` in WGSL).
 const MAP_WORKGROUP: u32 = 64;
@@ -368,16 +367,14 @@ fn map_params(op: &PointOp, n_pixels: u32) -> (MapParams, Vec<f32>) {
         }
         PointOp::Tone(curve) => {
             p.op = OP_TONE;
-            p.gamma = tone::GAMMA;
+            // Tone is evaluated in the perceptual L* domain in WGSL; the old
+            // `gamma` field is unused (the shader derives the L* transfer itself).
             (p, curve.lut().to_vec())
         }
-        PointOp::Saturation(amount) => {
-            p.op = OP_SATURATION;
-            p.amount = *amount;
-            (p, vec![0.0; tone::LUT_SIZE])
-        }
-        // Per-channel curves aren't ported to WGSL; `map_pixels` runs them on the
-        // CPU before reaching here.
+        // Saturation (chroma-preserving in LCh), per-channel curves, the color mix,
+        // and the channel mixer aren't ported to WGSL; `map_pixels` runs them on
+        // the CPU before reaching here.
+        PointOp::Saturation(_) => unreachable!("saturation is handled on the CPU"),
         PointOp::Curves(_) => unreachable!("curves are handled on the CPU"),
         PointOp::ColorMix(_) => unreachable!("the color mix is handled on the CPU"),
         PointOp::Matrix(_) => unreachable!("the channel mixer is handled on the CPU"),
@@ -452,10 +449,19 @@ impl Backend for GpuBackend {
         }
         if matches!(
             op,
-            PointOp::Curves(_) | PointOp::ColorMix(_) | PointOp::Matrix(_)
+            PointOp::Saturation(_) | PointOp::Curves(_) | PointOp::ColorMix(_) | PointOp::Matrix(_)
         ) {
             // Per-channel curves, the color mix, and the channel mixer aren't
             // ported to WGSL; fall back to the CPU so this stays a complete backend.
+            //
+            // Saturation is *deliberately* a CPU fallback too: it is now a
+            // chroma-preserving op in CIE LCh (scale chroma at constant L*),
+            // which means a working→XYZ→Lab→LCh round trip per pixel. Reproducing
+            // that transcendental cube-root/matrix chain in WGSL bit-closely
+            // enough to hold the tight saturation-equivalence tolerance is far
+            // more error-prone than it is worth, so the CPU path runs it and
+            // CPU == GPU holds exactly. Correctness/equivalence outranks running
+            // it natively on the GPU.
             self.cpu.map_pixels(img, op);
             return;
         }
@@ -648,11 +654,11 @@ mod tests {
     #[test]
     fn map_pixels_tone_above_one_matches_cpu() {
         let gpu = gpu_or_skip!();
-        // Headroom regression guard. The tone path extrapolates past 1.0 using the
-        // LUT's end slope; a [0,1) ramp never exercises that branch, so feed
-        // explicit >1.0 values. A CPU/GPU divergence in highlight handling (the
-        // kind that has slipped through before) surfaces here at a tight tolerance,
-        // not just diluted through the looser end-to-end render test.
+        // Headroom regression guard. The tone path passes values past 1.0 through
+        // with unit slope (eval(1) + (t - 1)); a [0,1) ramp never exercises that
+        // branch, so feed explicit >1.0 values. A CPU/GPU divergence in highlight
+        // handling (the kind that has slipped through before) surfaces here at a
+        // tight tolerance, not just diluted through the looser end-to-end render test.
         let mut src = ImageBuf::new(8, 1);
         for (i, px) in src.pixels_mut().iter_mut().enumerate() {
             let v = 1.0 + i as f32 * 0.5; // 1.0, 1.5, …, 4.5 — all above white

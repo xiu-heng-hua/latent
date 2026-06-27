@@ -2,27 +2,49 @@
 //!
 //! A tone curve maps an input tone to an output tone. It is stored as a lookup
 //! table (LUT) so per-pixel evaluation is a cheap interpolated lookup rather
-//! than recomputing a function. Curves are applied in a gamma (perceptual)
+//! than recomputing a function. Curves are applied in the perceptual **L\***
 //! domain, not raw linear light: equal steps in linear energy are not equal
 //! *perceived* steps, so shaping contrast directly in linear gives harsh
 //! results. `apply_linear` handles the encode → curve → decode round-trip.
+//!
+//! The perceptual domain is CIE **L\*** (a cube-root-shaped lightness that is
+//! roughly uniform per perceived step), applied to each channel independently:
+//! a channel's value is encoded as `L*(value)/100` so the reference white is
+//! `1.0` and perceptual mid-gray (linear 0.18) lands near `0.5`. This is a
+//! perceptual *encoding* — the L\* transfer per channel — not a move to grading
+//! the pixel's colorimetric lightness (saturation and the hue mixer do that in
+//! true LCh). L\* is a genuinely uniform space (γ2.2 only approximates its
+//! cube-root toe), so the contrast/highlight/shadow/black pivots sit where they
+//! should perceptually.
+
+use crate::color::{l_star, l_star_inv};
 
 /// Number of samples in a curve's lookup table.
 pub const LUT_SIZE: usize = 256;
 
-/// Approximate perceptual domain: a plain gamma. A 2.2 gamma is a simple,
-/// reasonable perceptual space for tone shaping. Public so a backend that
-/// evaluates the curve itself (e.g. on the GPU) uses the same encode/decode.
-pub const GAMMA: f32 = 2.2;
+/// Perceptual mid-gray in the L\* tone domain: the encoded position of linear
+/// mid-gray (`0.18`). L\* of 0.18·white is ≈49.5, so this is ≈0.495 — the pivot
+/// the contrast S-curve and the shape polynomials key off, rather than a bare
+/// `0.5` that would only be right by coincidence. Shared so every shape pivots
+/// on the same perceptual middle.
+pub const MID_GRAY: f32 = 0.494_961_1; // l_star(0.18) / 100
 
-fn tone_encode(linear: f32) -> f32 {
-    // No upper clamp: values above 1.0 (highlight headroom) stay above 1.0 in the
-    // perceptual domain so the curve can shape them instead of crushing to white.
-    linear.max(0.0).powf(1.0 / GAMMA)
+/// Encode a linear-light channel value into the perceptual L\* tone domain
+/// (`[0, 1]` over `[black, reference white]`). Above `1.0` the encode keeps
+/// climbing (headroom is not clipped here); the `eval` headroom branch then
+/// passes those values through with unit slope.
+///
+/// Public so a backend that evaluates the curve itself (e.g. on the GPU) and the
+/// clarity midtone window use the *same* encode, keeping the perceptual middle
+/// consistent across the pipeline.
+pub fn encode(linear: f32) -> f32 {
+    l_star(linear.max(0.0)) / 100.0
 }
 
-fn tone_decode(encoded: f32) -> f32 {
-    encoded.max(0.0).powf(GAMMA)
+/// Inverse of [`encode`]: decode a perceptual L\* tone position back to
+/// linear-light proportional value.
+pub fn decode(encoded: f32) -> f32 {
+    l_star_inv(encoded.max(0.0) * 100.0)
 }
 
 /// A 1-D tone curve backed by a uniformly-sampled lookup table over `[0, 1]`.
@@ -46,16 +68,19 @@ impl ToneCurve {
         Self::from_fn(|t| t)
     }
 
-    /// Evaluate the curve at `t` (clamped to `[0, 1]`), linearly interpolating
+    /// Evaluate the curve at `t` (clamped below at `0`), linearly interpolating
     /// between the two nearest table entries.
+    ///
+    /// The bend is applied only on `[0, 1]`. Above `1.0` — highlight headroom in
+    /// the perceptual domain — the curve passes the value through with **unit
+    /// slope** (`eval(1) + (t - 1)`): headroom is preserved (shape, don't crush),
+    /// not flattened to the curve's end slope. For the identity curve this is a
+    /// straight pass-through; for a shaped (e.g. contrast) curve the bend simply
+    /// stops at white instead of soft-clipping the highlights.
     pub fn eval(&self, t: f32) -> f32 {
         let n = self.lut.len();
         if t > 1.0 {
-            // Past the top, extrapolate with the curve's end slope rather than
-            // clamping — so highlight headroom (>1.0) is shaped, not flattened.
-            // For the identity curve the slope is 1, so values pass through.
-            let slope = (self.lut[n - 1] - self.lut[n - 2]) * (n - 1) as f32;
-            return self.lut[n - 1] + (t - 1.0) * slope;
+            return self.lut[n - 1] + (t - 1.0);
         }
         let pos = t.clamp(0.0, 1.0) * (n - 1) as f32;
         let i = pos.floor() as usize;
@@ -66,33 +91,56 @@ impl ToneCurve {
         self.lut[i] * (1.0 - frac) + self.lut[i + 1] * frac
     }
 
-    /// Apply the curve to a linear-light value: move into the perceptual domain,
-    /// apply the curve, then return to linear. This is where "curves act on
-    /// perceived tone, not raw linear energy" actually happens.
+    /// Apply the curve to a linear-light value: move into the perceptual L\*
+    /// domain, apply the curve, then return to linear. This is where "curves act
+    /// on perceived tone, not raw linear energy" actually happens.
     pub fn apply_linear(&self, linear: f32) -> f32 {
-        tone_decode(self.eval(tone_encode(linear)))
+        decode(self.eval(encode(linear)))
     }
 
     /// The lookup table: `LUT_SIZE` output samples at inputs `i / (LUT_SIZE - 1)`
-    /// in the perceptual domain. A backend that evaluates the curve itself (e.g.
-    /// on the GPU) uploads this and reproduces [`Self::eval`]'s interpolation.
+    /// in the perceptual L\* domain. A backend that evaluates the curve itself
+    /// (e.g. on the GPU) uploads this and reproduces [`Self::eval`]'s
+    /// interpolation.
     pub fn lut(&self) -> &[f32] {
         &self.lut
     }
 }
 
-/// A smooth S-shaped ramp through (0,0), (0.5,0.5), (1,1) with flat ends.
-fn smoothstep(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
+/// How fast `contrast`'s steepness grows with the amount, per unit. The S-curve
+/// raises each side of the pivot to the power `exp(±CONTRAST_RATE·amount)`; this
+/// sets that exponent's growth so the slider's useful range gives a strong but
+/// natural contrast push without needing to be clamped.
+const CONTRAST_RATE: f32 = 1.2;
 
 // The following four controls are all shapes of the same tone curve. Each takes
-// an `amount` (roughly [-1, 1], 0 = no change) and returns a monotonic curve.
+// an `amount` (0 = no change) and returns a strictly increasing (monotone) curve.
 
-/// Contrast: an S-curve pivoting around mid-gray. Positive pushes tones away
-/// from the middle (more contrast), negative pulls them toward it.
+/// Contrast: an S-curve pivoting around perceptual mid-gray ([`MID_GRAY`]).
+/// Positive pushes tones away from the middle (more contrast), negative pulls
+/// them toward it.
+///
+/// Built as a **power-pivot** curve, monotone for *every* amount by
+/// construction — so it never inverts and needs no range clamp (unlike a
+/// smoothstep blend, whose slope goes negative past `amount = 1`). Each side of
+/// the pivot `p` is remapped through `x^k` with `k = exp(CONTRAST_RATE·amount)`
+/// and rescaled to fix the endpoints and the pivot: `k > 1` steepens the middle
+/// (more contrast), `k < 1` flattens it. Since `x^k` is strictly increasing for
+/// any `k > 0` and `exp(·) > 0` always, `f' > 0` everywhere and the full slider
+/// range stays usable.
 pub fn contrast(amount: f32) -> ToneCurve {
-    ToneCurve::from_fn(|t| (t + amount * (smoothstep(t) - t)).clamp(0.0, 1.0))
+    let p = MID_GRAY;
+    let k = (CONTRAST_RATE * amount).exp();
+    ToneCurve::from_fn(move |t| {
+        if t <= p {
+            // Lower half: map [0, p] through x^k, keeping 0→0 and p→p.
+            p * (t / p).powf(k)
+        } else {
+            // Upper half: mirror it so the curve is point-symmetric about (p, p),
+            // keeping p→p and 1→1.
+            1.0 - (1.0 - p) * ((1.0 - t) / (1.0 - p)).powf(k)
+        }
+    })
 }
 
 /// Highlights: lift or recover the bright tones (upper mids), leaving the
@@ -134,15 +182,27 @@ mod tests {
     }
 
     #[test]
-    fn eval_clamps_lows_but_extrapolates_highlights() {
-        let c = ToneCurve::from_fn(|t| t);
-        assert_eq!(c.eval(-1.0), 0.0); // below 0 still clamps to the floor
-        // Above 1.0 the identity curve passes through (end slope 1), so headroom
-        // is preserved rather than crushed to the top entry.
+    fn eval_passes_headroom_with_unit_slope() {
+        // Below 0 clamps to the floor; above 1.0 every curve passes through with
+        // unit slope (eval(1) + (t - 1)) — headroom is preserved, never crushed.
+        let id = ToneCurve::from_fn(|t| t);
+        assert_eq!(id.eval(-1.0), 0.0);
         assert!(
-            (c.eval(2.0) - 2.0).abs() < 1e-3,
+            (id.eval(2.0) - 2.0).abs() < 1e-3,
             "headroom: {}",
-            c.eval(2.0)
+            id.eval(2.0)
+        );
+
+        // A shaped (contrast) curve must NOT soft-clip past 1.0: with unit slope,
+        // eval(2.0) ≈ eval(1.0) + 1.0, not the flattened end-slope value the old
+        // extrapolation produced (which crushed a highlight toward ~1.04).
+        let c = contrast(0.6);
+        let at_one = c.eval(1.0);
+        assert!(
+            (c.eval(2.0) - (at_one + 1.0)).abs() < 1e-4,
+            "contrast headroom not unit-slope: eval(2)={}, eval(1)+1={}",
+            c.eval(2.0),
+            at_one + 1.0
         );
     }
 
@@ -156,7 +216,9 @@ mod tests {
             id.apply_linear(1.5)
         );
         // A real curve still maps a rising highlight ramp to a rising output
-        // (gradient kept, no flat-white plateau).
+        // (gradient kept, no flat-white plateau) and, because the bend stops at
+        // white and headroom passes with unit slope, a strong highlight stays a
+        // strong highlight rather than soft-clipping toward white.
         let c = contrast(0.6);
         let ramp: Vec<f32> = [1.0, 1.3, 1.7, 2.5]
             .iter()
@@ -165,6 +227,13 @@ mod tests {
         for w in ramp.windows(2) {
             assert!(w[1] > w[0], "highlight ramp not increasing: {ramp:?}");
         }
+        // A bright highlight (linear 4.0) survives — far above 1, not clipped near
+        // white. The L* round-trip is exact for the unit-slope headroom region.
+        assert!(
+            c.apply_linear(4.0) > 3.0,
+            "headroom crushed: {}",
+            c.apply_linear(4.0)
+        );
     }
 
     #[test]
@@ -181,7 +250,88 @@ mod tests {
         let c = contrast(0.6);
         assert!(c.eval(0.8) > 0.8); // a highlight gets brighter
         assert!(c.eval(0.2) < 0.2); // a shadow gets darker
-        assert!((c.eval(0.5) - 0.5).abs() < 1e-6); // mid-gray is the pivot
+        // The pivot is perceptual mid-gray (L*≈0.5), not a bare 0.5: it maps to
+        // itself, the fixed point the S-curve rotates the tones around.
+        assert!(
+            (c.eval(MID_GRAY) - MID_GRAY).abs() < 1e-4,
+            "pivot moved: {}",
+            c.eval(MID_GRAY)
+        );
+    }
+
+    #[test]
+    fn tone_domain_is_lstar() {
+        // The tone domain is L*: linear mid-gray (0.18) encodes to ≈0.5 (the pivot),
+        // black and white pin the ends, and the round-trip is the identity.
+        assert!((encode(0.18) - MID_GRAY).abs() < 1e-5, "{}", encode(0.18));
+        assert!(
+            (MID_GRAY - 0.5).abs() < 0.01,
+            "mid-gray near 0.5: {MID_GRAY}"
+        );
+        assert!(encode(0.0).abs() < 1e-6);
+        assert!((encode(1.0) - 1.0).abs() < 1e-6);
+        for &x in &[0.0, 0.05, 0.18, 0.5, 0.9, 1.0, 2.5] {
+            assert!((decode(encode(x)) - x).abs() < 1e-4, "round-trip x={x}");
+        }
+    }
+
+    #[test]
+    fn contrast_is_monotone_for_all_amounts() {
+        // The power-pivot S-curve is monotone by construction for every amount —
+        // it never inverts, even far past the old [-1, 1] clamp. Sweep a wide range
+        // and assert the densely-sampled curve never decreases. (At extreme
+        // positive amounts the toe values round to equal in f32, so the guarantee
+        // is non-decreasing; the slope is strictly positive in exact arithmetic.)
+        for a in [-3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0] {
+            let c = contrast(a);
+            let lut = c.lut();
+            for w in lut.windows(2) {
+                assert!(w[1] >= w[0], "contrast({a}) inverted: {} -> {}", w[0], w[1]);
+            }
+            // Endpoints and pivot stay pinned for every amount.
+            assert!(lut[0].abs() < 1e-6, "contrast({a}) floor: {}", lut[0]);
+            assert!(
+                (lut[lut.len() - 1] - 1.0).abs() < 1e-5,
+                "contrast({a}) ceil: {}",
+                lut[lut.len() - 1]
+            );
+            // The pivot is exact in the function; eval samples the LUT, so at
+            // steep amounts the pivot (which falls between grid points) carries a
+            // small interpolation error — a few×1e-3, not an inversion.
+            assert!(
+                (c.eval(MID_GRAY) - MID_GRAY).abs() < 3e-3,
+                "contrast({a}) pivot: {}",
+                c.eval(MID_GRAY)
+            );
+        }
+    }
+
+    #[test]
+    fn contrast_is_strictly_increasing_in_the_useful_range() {
+        // Over the slider's useful range the curve is strictly increasing (no
+        // plateau): every successive LUT sample is greater than the last.
+        for a in [-1.0, -0.5, 0.5, 1.0] {
+            let c = contrast(a);
+            for w in c.lut().windows(2) {
+                assert!(w[1] > w[0], "contrast({a}) not strictly rising");
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_extends_past_unit_amount() {
+        // An amount beyond the old [-1, 1] clamp still yields a valid monotone
+        // curve that pushes contrast harder than amount = 1 — the range is no
+        // longer capped. A highlight at amount 2 is brighter than at amount 1.
+        let strong = contrast(2.0);
+        let unit = contrast(1.0);
+        assert!(
+            strong.eval(0.8) > unit.eval(0.8),
+            "amount 2 should out-contrast amount 1"
+        );
+        for w in strong.lut().windows(2) {
+            assert!(w[1] >= w[0], "contrast(2.0) inverted");
+        }
     }
 
     #[test]
@@ -237,21 +387,55 @@ mod tests {
     }
 
     #[test]
-    fn eval_high_extrapolation_uses_the_end_slope_from_lut_n_minus_2() {
-        // Above 1.0 the curve extrapolates with the end slope
-        // `(lut[n-1] - lut[n-2]) * (n - 1)`. For a line of slope 2 the LUT samples it
-        // exactly, so the extrapolated value continues that line.
-        let c = ToneCurve::from_fn(|t| 2.0 * t);
-        // At t = 1.5 the line gives 3.0; the end-slope extrapolation must reproduce it.
+    fn eval_high_extrapolation_uses_unit_slope_not_the_end_slope() {
+        // Above 1.0 the curve passes through with unit slope: `eval(1) + (t - 1)`,
+        // independent of the curve's shape near white. A steep curve whose end
+        // slope is 2 must NOT extrapolate at slope 2 — headroom passes at slope 1.
+        let c = ToneCurve::from_fn(|t| 2.0 * t.min(0.5)); // saturates to 1.0 at t≥0.5
+        // eval(1.0) is the last entry (1.0); eval(1.5) is 1.0 + 0.5 = 1.5.
         assert!(
-            (c.eval(1.5) - 3.0).abs() < 1e-3,
-            "extrapolated: {}",
+            (c.eval(1.5) - (c.eval(1.0) + 0.5)).abs() < 1e-4,
+            "headroom not unit-slope: {}",
             c.eval(1.5)
         );
-        // The slope itself is reconstructed from the last two entries.
-        let lut = c.lut();
-        let n = lut.len();
-        let slope = (lut[n - 1] - lut[n - 2]) * (n - 1) as f32;
-        assert!((slope - 2.0).abs() < 1e-3, "end slope: {slope}");
+        // The identity curve passes >1 straight through.
+        let id = ToneCurve::identity();
+        assert!(
+            (id.eval(3.0) - 3.0).abs() < 1e-4,
+            "identity headroom: {}",
+            id.eval(3.0)
+        );
+    }
+
+    #[test]
+    fn lut_error_bounded_in_lstar() {
+        // The 256-entry LUT interpolates a smooth curve; re-measure its
+        // interpolation error in the L* domain (the cube-root toe is steeper than
+        // γ2.2 near black, so this is the worst case). For a representative shaped
+        // curve, the linear interpolation between table entries stays well under
+        // an LSB at 16-bit depth (1/65535 ≈ 1.5e-5) of the reference function —
+        // i.e. the LUT is indistinguishable from evaluating the function directly.
+        let amount = 0.6_f32;
+        let p = MID_GRAY;
+        let k = (CONTRAST_RATE * amount).exp();
+        let reference = |t: f32| {
+            if t <= p {
+                p * (t / p).powf(k)
+            } else {
+                1.0 - (1.0 - p) * ((1.0 - t) / (1.0 - p)).powf(k)
+            }
+        };
+        let c = contrast(amount);
+        let mut max_err = 0.0_f32;
+        // Sample densely, including points between table entries where the linear
+        // interpolation deviates most from the true (curved) function.
+        for i in 0..=100_000 {
+            let t = i as f32 / 100_000.0;
+            max_err = max_err.max((c.eval(t) - reference(t)).abs());
+        }
+        assert!(
+            max_err < 1.0 / 65535.0,
+            "LUT interpolation error {max_err} exceeds a 16-bit LSB in L*"
+        );
     }
 }

@@ -415,16 +415,25 @@ pub struct Hsl {
 /// channels — a 3x3 matrix whose rows are the output R/G/B and columns the input
 /// R/G/B. The default is the identity (no change). Also the natural home for
 /// fixed color matrices such as a monochrome conversion or a channel swap.
+///
+/// `preserve_luminosity` is Photoshop's "preserve luminosity" checkbox (default
+/// off): when on, each row is normalized to sum to 1 before applying, so a
+/// neutral gray `[v,v,v]` maps to `[v,v,v]` and the mix can't shift overall
+/// brightness. Note this preserves a *neutral's value* (rows summing to 1), not
+/// true colorimetric luminance across all colors — the standard Photoshop
+/// semantic, despite the name.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelMixer {
     pub matrix: [[f32; 3]; 3],
+    pub preserve_luminosity: bool,
 }
 
 impl Default for ChannelMixer {
     fn default() -> Self {
         Self {
             matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            preserve_luminosity: false,
         }
     }
 }
@@ -1333,6 +1342,31 @@ mod tests {
         assert_eq!(lens.real_focal, 1.0);
         assert_eq!(lens.model, DistortionModel::None);
         assert_eq!(lens.ca, [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]);
+    }
+
+    #[test]
+    fn channel_mixer_default_is_off() {
+        // The preserve-luminosity toggle defaults off, leaving the raw creative
+        // matrix to be applied as authored.
+        assert!(!ChannelMixer::default().preserve_luminosity);
+    }
+
+    #[test]
+    fn channel_mixer_serde_old_sidecar_defaults_off() {
+        // A sidecar written before the toggle existed (no `preserve_luminosity`)
+        // must load with it off (`#[serde(default)]` + the struct's own Default).
+        let text = "(version: 1, variants: [(global: (channel_mixer: Some((\
+            matrix: ((0.5, 0.3, 0.2), (0.2, 0.6, 0.2), (0.1, 0.1, 0.8))))))])";
+        let doc = Document::from_ron(text).expect("old channel-mixer sidecar should load");
+        let cm = doc.variants[0]
+            .global
+            .channel_mixer
+            .expect("channel mixer should be present");
+        assert_eq!(
+            cm.matrix,
+            [[0.5, 0.3, 0.2], [0.2, 0.6, 0.2], [0.1, 0.1, 0.8]]
+        );
+        assert!(!cm.preserve_luminosity, "omitted toggle must default off");
     }
 
     #[test]

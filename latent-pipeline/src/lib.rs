@@ -466,7 +466,14 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
         backend.map_pixels(&mut img, &PointOp::ColorMix(hsl.bands));
     }
     if let Some(cm) = &global.channel_mixer {
-        backend.map_pixels(&mut img, &PointOp::Matrix(cm.matrix));
+        // "Preserve luminosity" row-normalizes the matrix so a neutral gray keeps
+        // its value; off (the default) applies the raw creative matrix as authored.
+        let matrix = if cm.preserve_luminosity {
+            latent_image::color::Mat3(cm.matrix).row_normalized().0
+        } else {
+            cm.matrix
+        };
+        backend.map_pixels(&mut img, &PointOp::Matrix(matrix));
     }
     if let Some(nr) = global.noise_reduction
         && nr.radius > 0.0
@@ -520,14 +527,14 @@ fn apply_global(mut img: ImageBuf, global: &Adjustments, backend: &dyn Backend) 
 
 /// A midtone window for clarity: `1` at mid-gray, falling smoothly to `0` at
 /// black and white (a parabola). The window is evaluated in the **perceptual**
-/// (gamma) domain the tone system uses, so its peak lands on perceptual mid-gray
+/// (L\*) domain the tone system uses, so its peak lands on perceptual mid-gray
 /// (≈0.18 in linear light) rather than linear 0.5 (≈0.73 perceptually) — i.e. it
 /// genuinely weights the midtones instead of skewing into the highlights.
 /// Weighting the added local contrast by this protects the highlights and
 /// shadows from halos. Public so a backend computing the
 /// [`CombineKind::LocalContrast`] recombine reuses the identical window.
 pub fn midtone_weight(base_luma: f32) -> f32 {
-    let b = base_luma.clamp(0.0, 1.0).powf(1.0 / tone::GAMMA);
+    let b = tone::encode(base_luma.clamp(0.0, 1.0));
     1.0 - (2.0 * b - 1.0) * (2.0 * b - 1.0)
 }
 
@@ -939,16 +946,51 @@ fn channel_curves(c: &Curves) -> [ToneCurve; 3] {
     [compose(&c.red), compose(&c.green), compose(&c.blue)]
 }
 
-/// A tone curve interpolated (piecewise-linear) through `(input, output)` control
-/// points in the perceptual `[0, 1]` domain, clamped flat past the ends. No
-/// points gives the identity.
+/// A tone curve interpolated through `(input, output)` control points in the
+/// perceptual `[0, 1]` domain with a **monotone cubic** (Fritsch–Carlson / PCHIP)
+/// spline, clamped flat past the ends. No points gives the identity.
+///
+/// The spline is C1-smooth (no slope kinks at control points) and
+/// shape-preserving: wherever the control points are monotone the curve is
+/// monotone too, with no overshoot or oscillation between points (unlike plain
+/// Catmull–Rom). This is achieved by limiting each point's tangent to the
+/// Fritsch–Carlson bound before evaluating the Hermite cubic on the bracketing
+/// segment.
+///
+/// The function is **total**: non-finite control points are dropped and the
+/// remaining x/y are clamped to `[0, 1]` before sorting, so no `NaN`/`inf` or
+/// out-of-range point can reach the evaluator (or panic `render`). If every
+/// point is dropped, the identity is returned.
 fn point_curve(points: &[(f32, f32)]) -> ToneCurve {
-    if points.is_empty() {
+    // Drop non-finite points and clamp the survivors into the unit square, so the
+    // sort and the segment search only ever see finite, in-range coordinates.
+    let mut pts: Vec<(f32, f32)> = points
+        .iter()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
+        .collect();
+    if pts.is_empty() {
         return ToneCurve::identity();
     }
-    let mut pts = points.to_vec();
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
     let last = pts.len() - 1;
+
+    // Secant slopes of each segment and the Fritsch–Carlson-limited tangent at
+    // each control point. A zero-width segment (duplicate x after clamping) has an
+    // undefined slope; treat it as flat so the search never divides by zero.
+    let n = pts.len();
+    let secant: Vec<f32> = (0..n.saturating_sub(1))
+        .map(|i| {
+            let dx = pts[i + 1].0 - pts[i].0;
+            if dx > 0.0 {
+                (pts[i + 1].1 - pts[i].1) / dx
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let tangents = pchip_tangents(&pts, &secant);
+
     ToneCurve::from_fn(move |t| {
         if t <= pts[0].0 {
             return pts[0].1;
@@ -956,11 +998,61 @@ fn point_curve(points: &[(f32, f32)]) -> ToneCurve {
         if t >= pts[last].0 {
             return pts[last].1;
         }
-        let i = pts.windows(2).position(|w| t <= w[1].0).unwrap();
+        // Saturating segment search: the first window whose right edge is ≥ t.
+        // All x are finite, so this always finds a window; the `unwrap_or` is a
+        // belt-and-braces floor that can never trigger but keeps the function total.
+        let i = pts
+            .windows(2)
+            .position(|w| t <= w[1].0)
+            .unwrap_or(last.saturating_sub(1));
         let (x0, y0) = pts[i];
         let (x1, y1) = pts[i + 1];
-        y0 + (t - x0) / (x1 - x0) * (y1 - y0)
+        let h = x1 - x0;
+        if h <= 0.0 {
+            // Collapsed segment (duplicate x): no interval to interpolate over.
+            return y0;
+        }
+        // Cubic Hermite on [x0, x1] with the limited endpoint tangents.
+        let s = (t - x0) / h;
+        let s2 = s * s;
+        let s3 = s2 * s;
+        let h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
+        let h10 = s3 - 2.0 * s2 + s;
+        let h01 = -2.0 * s3 + 3.0 * s2;
+        let h11 = s3 - s2;
+        h00 * y0 + h10 * h * tangents[i] + h01 * y1 + h11 * h * tangents[i + 1]
     })
+}
+
+/// Fritsch–Carlson tangents for a PCHIP spline: per-control-point slopes that
+/// keep the cubic monotone wherever the data is monotone. Interior tangents are a
+/// weighted harmonic mean of the adjacent secants (zeroed at a local extremum so
+/// the curve doesn't overshoot); endpoint tangents take the adjacent secant. A
+/// single point yields a flat (zero) tangent.
+fn pchip_tangents(pts: &[(f32, f32)], secant: &[f32]) -> Vec<f32> {
+    let n = pts.len();
+    if n == 1 {
+        return vec![0.0];
+    }
+    let mut m = vec![0.0_f32; n];
+    m[0] = secant[0];
+    m[n - 1] = secant[n - 2];
+    for i in 1..n - 1 {
+        let (d0, d1) = (secant[i - 1], secant[i]);
+        if d0 * d1 <= 0.0 {
+            // Sign change or a flat: a local extremum — zero the tangent so the
+            // segment can't overshoot past the control point.
+            m[i] = 0.0;
+        } else {
+            // Weighted harmonic mean of the two secants (Fritsch–Carlson), which
+            // bounds the tangent and preserves monotonicity.
+            let (h0, h1) = (pts[i].0 - pts[i - 1].0, pts[i + 1].0 - pts[i].0);
+            let w0 = 2.0 * h1 + h0;
+            let w1 = h1 + 2.0 * h0;
+            m[i] = (w0 + w1) / (w0 / d0 + w1 / d1);
+        }
+    }
+    m
 }
 
 /// Stage: local adjustments, applied in SOURCE space.
@@ -1168,9 +1260,10 @@ fn crop_image(img: &ImageBuf, c: Crop) -> ImageBuf {
 mod tests {
     use super::*;
     use latent_edit::{
-        Clarity, Gradient, Hsl, LuminanceRange, MaskShape, NoiseReduction, Sharpen, WhiteBalance,
+        ChannelMixer, Clarity, Gradient, Hsl, LuminanceRange, MaskShape, NoiseReduction, Sharpen,
+        WhiteBalance,
     };
-    use latent_image::color::{Mat3, color_mix, luminance};
+    use latent_image::color::{Lab, Mat3, color_mix, luminance, saturate_chroma};
 
     /// A minimal backend so the pipeline can be tested here; the real CPU
     /// backend lives in a crate that depends on this one. It gives each
@@ -1195,10 +1288,7 @@ mod tests {
                 PointOp::Saturation(amount) => {
                     let amount = *amount;
                     for px in img.pixels_mut() {
-                        let y = luminance(*px);
-                        // Clamp to ≥0 so over-saturation never emits negative light
-                        // (mirrors the CPU backend).
-                        *px = std::array::from_fn(|c| (y + amount * (px[c] - y)).max(0.0));
+                        *px = saturate_chroma(*px, amount);
                     }
                 }
                 PointOp::Curves(curves) => {
@@ -1426,37 +1516,267 @@ mod tests {
 
     #[test]
     fn saturation_zero_is_grayscale_and_one_is_unchanged() {
+        // amount = 0 fully desaturates: the result is neutral (R≈G≈B) AND its L*
+        // matches the input's — the constant-lightness guarantee the old luma blend
+        // could not give (it lerped toward a hue-skewed luma, darkening blue).
+        let px = [0.6, 0.3, 0.1];
         let gray = developed(
             Adjustments {
                 saturation: Some(0.0),
                 ..Adjustments::default()
             },
-            [0.6, 0.3, 0.1],
+            px,
         );
         assert!(
-            (gray[0] - gray[1]).abs() < 1e-6 && (gray[1] - gray[2]).abs() < 1e-6,
-            "{gray:?}"
+            (gray[0] - gray[1]).abs() < 1e-4 && (gray[1] - gray[2]).abs() < 1e-4,
+            "not neutral: {gray:?}"
         );
+        let l_in = Lab::from_working(px).l;
+        let l_out = Lab::from_working(gray).l;
+        assert!((l_in - l_out).abs() < 1e-2, "L* drifted: {l_in} vs {l_out}");
 
         let same = developed(
             Adjustments {
                 saturation: Some(1.0),
                 ..Adjustments::default()
             },
-            [0.6, 0.3, 0.1],
+            px,
         );
         for c in 0..3 {
-            assert!((same[c] - [0.6, 0.3, 0.1][c]).abs() < 1e-6);
+            assert!((same[c] - px[c]).abs() < 1e-4, "amount=1 changed {same:?}");
+        }
+    }
+
+    #[test]
+    fn saturation_desaturates_blue_to_gray_not_black() {
+        // The headline regression: a saturated blue at amount = 0 keeps its
+        // lightness (goes to a mid-gray) instead of collapsing toward black, which
+        // the luma blend did because the working blue luma weight is ~0.0001.
+        let blue = [0.1, 0.2, 0.9];
+        let gray = developed(
+            Adjustments {
+                saturation: Some(0.0),
+                ..Adjustments::default()
+            },
+            blue,
+        );
+        // Neutral, and not crushed: a real mid-gray, well above black.
+        assert!(
+            (gray[0] - gray[1]).abs() < 1e-4 && (gray[1] - gray[2]).abs() < 1e-4,
+            "blue not neutralized: {gray:?}"
+        );
+        assert!(
+            gray.iter().all(|&c| c > 0.05),
+            "blue collapsed toward black: {gray:?}"
+        );
+        // Same lightness as the input blue.
+        let l_in = Lab::from_working(blue).l;
+        let l_out = Lab::from_working(gray).l;
+        assert!((l_in - l_out).abs() < 1e-2, "L* drifted: {l_in} vs {l_out}");
+    }
+
+    #[test]
+    fn saturation_constant_lstar() {
+        // Saturation and desaturation across a range of amounts all hold L*
+        // constant — chroma moves, lightness does not.
+        let px = [0.5, 0.25, 0.7];
+        let l_in = Lab::from_working(px).l;
+        for amount in [0.0, 0.5, 1.0, 1.5, 2.0] {
+            let out = developed(
+                Adjustments {
+                    saturation: Some(amount),
+                    ..Adjustments::default()
+                },
+                px,
+            );
+            let l_out = Lab::from_working(out).l;
+            assert!(
+                (l_in - l_out).abs() < 1e-2,
+                "amount {amount}: L* {l_out} != {l_in}"
+            );
+        }
+    }
+
+    #[test]
+    fn point_curve_empty_is_identity() {
+        let c = point_curve(&[]);
+        for &t in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!((c.eval(t) - t).abs() < 1e-6, "empty not identity at {t}");
+        }
+    }
+
+    #[test]
+    fn point_curve_single_point() {
+        // One control point clamps flat past both ends — the whole curve is its y.
+        let c = point_curve(&[(0.5, 0.3)]);
+        for &t in &[0.0, 0.2, 0.5, 0.8, 1.0] {
+            assert!(
+                (c.eval(t) - 0.3).abs() < 1e-6,
+                "single point not flat at {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn point_curve_matches_endpoints() {
+        let c = point_curve(&[(0.2, 0.1), (0.5, 0.6), (0.9, 0.8)]);
+        // The endpoints are matched exactly in the function; eval samples the LUT,
+        // so a point between grid samples carries a small interpolation residual.
+        assert!((c.eval(0.2) - 0.1).abs() < 1e-3, "first endpoint");
+        assert!((c.eval(0.9) - 0.8).abs() < 1e-3, "last endpoint");
+        // Flat past the ends (exact: these land on the clamp branches).
+        assert!((c.eval(0.0) - 0.1).abs() < 1e-6);
+        assert!((c.eval(1.0) - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn point_curve_unsorted_input() {
+        // Points given out of order are sorted internally; the curve is the same.
+        let a = point_curve(&[(0.9, 0.8), (0.2, 0.1), (0.5, 0.6)]);
+        let b = point_curve(&[(0.2, 0.1), (0.5, 0.6), (0.9, 0.8)]);
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            assert!(
+                (a.eval(t) - b.eval(t)).abs() < 1e-6,
+                "unsorted differs at {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn point_curve_monotone_inputs_stay_monotone() {
+        // Rising control points → a densely-sampled spline that is non-decreasing
+        // everywhere, with no overshoot below the first or above the last value.
+        let pts = [
+            (0.0, 0.0),
+            (0.25, 0.1),
+            (0.5, 0.7),
+            (0.75, 0.75),
+            (1.0, 1.0),
+        ];
+        let c = point_curve(&pts);
+        let mut prev = c.eval(0.0);
+        for i in 0..=1000 {
+            let t = i as f32 / 1000.0;
+            let v = c.eval(t);
+            assert!(v >= prev - 1e-6, "spline decreased at {t}: {prev} -> {v}");
+            assert!((-1e-4..=1.0001).contains(&v), "overshoot at {t}: {v}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn point_curve_duplicate_x_stays_finite() {
+        // A duplicate x (a vertical step in the control points) must not divide by
+        // zero or produce a non-finite output — the earlier window is chosen and a
+        // collapsed segment is treated as flat.
+        let c = point_curve(&[(0.3, 0.2), (0.3, 0.8), (0.7, 0.9)]);
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            assert!(c.eval(t).is_finite(), "non-finite at duplicate x, t={t}");
+        }
+    }
+
+    #[test]
+    fn point_curve_nan_inf_points_no_panic() {
+        // Non-finite control points (a corrupt sidecar) are dropped; out-of-range
+        // coordinates are clamped. The curve is built and sampled with no panic and
+        // finite output. This is the render-time-DoS regression.
+        let pts = [
+            (f32::NAN, 0.5),
+            (0.5, f32::INFINITY),
+            (f32::NEG_INFINITY, 0.2),
+            (-2.0, 5.0), // out of range → clamped to (0, 1)
+            (0.8, 0.9),
+            (2.0, -3.0), // out of range → clamped to (1, 0)
+        ];
+        let c = point_curve(&pts);
+        for i in 0..=255 {
+            let t = i as f32 / 255.0;
+            assert!(c.eval(t).is_finite(), "non-finite output at t={t}");
+        }
+        // All-non-finite input collapses to the identity, not a panic.
+        let id = point_curve(&[(f32::NAN, 0.0), (1.0, f32::NAN)]);
+        for &t in &[0.0, 0.5, 1.0] {
+            assert!((id.eval(t) - t).abs() < 1e-6, "all-NaN not identity at {t}");
+        }
+    }
+
+    #[test]
+    fn point_curve_is_smoother_than_piecewise_linear() {
+        // PCHIP is C1 (smooth slope) where linear has kinks: at an interior control
+        // point the left and right slopes of the spline agree, unlike a linear
+        // interpolant whose slope jumps. Sample slopes just either side of a point.
+        let c = point_curve(&[(0.0, 0.0), (0.5, 0.2), (1.0, 1.0)]);
+        let eps = 1e-3;
+        let left = (c.eval(0.5) - c.eval(0.5 - eps)) / eps;
+        let right = (c.eval(0.5 + eps) - c.eval(0.5)) / eps;
+        assert!(
+            (left - right).abs() < 0.05,
+            "slope kink at the control point: {left} vs {right}"
+        );
+    }
+
+    #[test]
+    fn channel_mixer_default_is_off_and_raw() {
+        // With the toggle off (the default), a neutral gray runs through the raw
+        // matrix unchanged in *direction* but can shift brightness: a row summing
+        // to more than 1 brightens a gray, proving the matrix is applied verbatim.
+        let raw = [[1.2, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cm = ChannelMixer {
+            matrix: raw,
+            preserve_luminosity: false,
+        };
+        assert!(!ChannelMixer::default().preserve_luminosity);
+        let out = developed(
+            Adjustments {
+                channel_mixer: Some(cm),
+                ..Adjustments::default()
+            },
+            [0.5, 0.5, 0.5],
+        );
+        // Raw matrix: R row sums to 1.2, so the gray's red is lifted to 0.6.
+        assert!(
+            (out[0] - 0.6).abs() < 1e-5,
+            "raw matrix not applied: {out:?}"
+        );
+    }
+
+    #[test]
+    fn channel_mixer_preserve_normalizes_rows() {
+        // With preserve-luminosity on, the rows are normalized to sum to 1, so a
+        // neutral gray maps to itself (value preserved) even though the raw rows
+        // would have shifted brightness.
+        let raw = [[1.2, 0.1, 0.0], [0.2, 1.0, 0.3], [0.0, 0.0, 0.8]];
+        let cm = ChannelMixer {
+            matrix: raw,
+            preserve_luminosity: true,
+        };
+        let g = 0.4;
+        let out = developed(
+            Adjustments {
+                channel_mixer: Some(cm),
+                ..Adjustments::default()
+            },
+            [g, g, g],
+        );
+        for c in 0..3 {
+            assert!(
+                (out[c] - g).abs() < 1e-5,
+                "neutral value not preserved: {out:?}"
+            );
         }
     }
 
     #[test]
     fn hsl_mixer_grades_one_band_and_spares_the_others() {
-        // Desaturate only the red band via the color mixer. A red pixel goes
-        // gray; a cyan pixel (a different band) is left exactly alone — the
+        // Desaturate the warm (red/orange) bands via the LCh color mixer. A warm
+        // red pixel — whose LCh hue sits across bands 0 and 1 — goes neutral; a
+        // cool cyan pixel (the opposite hue, bands 4/5) is left exactly alone — the
         // selectivity that defines the tool, reached through apply_global.
         let mut bands = [[0.0_f32; 3]; 8];
-        bands[0] = [0.0, -1.0, 0.0]; // red band: saturation ×0
+        bands[0] = [0.0, -1.0, 0.0]; // red band: chroma ×0
+        bands[1] = [0.0, -1.0, 0.0]; // orange band: chroma ×0
         let red = developed(
             Adjustments {
                 hsl: Some(Hsl { bands }),
@@ -1465,8 +1785,8 @@ mod tests {
             [0.8, 0.1, 0.1],
         );
         assert!(
-            (red[0] - red[1]).abs() < 1e-6 && (red[1] - red[2]).abs() < 1e-6,
-            "red desaturated: {red:?}"
+            (red[0] - red[1]).abs() < 1e-4 && (red[1] - red[2]).abs() < 1e-4,
+            "red not desaturated: {red:?}"
         );
         let cyan = developed(
             Adjustments {
