@@ -16,10 +16,20 @@ use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
 /// competes with the photo. Replaces the stray `LIGHT_BLUE` the editor had.
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(0x4F, 0x9D, 0xC9);
 
+/// The success accent — a muted, desaturated green for a completed export or
+/// save. Low-chroma to stay in the neutral chrome; only ever a toast stripe or a
+/// status mark, never on the photo.
+pub(crate) const SUCCESS: Color32 = Color32::from_rgb(0x5C, 0xA8, 0x6E);
+
+/// The error accent — a muted red for a failed export/save or an unreadable
+/// file. Used for the error toast stripe and the error-modal headline; like the
+/// other tokens it is desaturated so it warns without shouting.
+pub(crate) const ERROR: Color32 = Color32::from_rgb(0xCC, 0x5F, 0x5F);
+
 /// Window background — the darkest neutral.
 const WINDOW_FILL: Color32 = Color32::from_gray(24);
 /// Panel background (menu bar, toolbar, side panel, status bar).
-const PANEL_FILL: Color32 = Color32::from_gray(32);
+pub(crate) const PANEL_FILL: Color32 = Color32::from_gray(32);
 /// Faint zebra fill for alternating rows etc.
 const FAINT_BG: Color32 = Color32::from_gray(38);
 /// The darkest sunken background (text edits, slider rails).

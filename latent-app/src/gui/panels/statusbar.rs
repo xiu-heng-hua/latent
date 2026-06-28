@@ -58,11 +58,19 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 .on_hover_text("Active rendering backend");
             ui.separator();
 
-            // Render / autosave state.
-            if app.render.is_busy() {
+            // Render / export / autosave state (steady state — transient outcomes
+            // are toasts, not this line).
+            if app.exporting {
+                // A long full-res export gets the prominent indeterminate spinner so
+                // the user sees why Export is disabled. `progress` is always `None`
+                // today — determinate when the pipeline reports progress.
+                let progress: Option<f32> = None;
+                show_progress(ui, "Exporting…", progress);
+                ui.ctx().request_repaint();
+            } else if app.render.is_busy() {
+                // A routine preview re-render: a subtle steady-state indicator, not
+                // the prominent export spinner.
                 ui.label("Rendering…");
-            } else if !app.status.is_empty() {
-                ui.label(&app.status);
             } else if session.is_saved() {
                 ui.label("Saved");
             } else {
@@ -70,4 +78,22 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             }
         });
     });
+}
+
+/// Show an in-progress affordance for a long task: an indeterminate spinner plus
+/// `label` when `progress` is `None`, or a determinate bar when it is `Some`. The
+/// pipeline reports no fractional progress today, so the export path always passes
+/// `None`; the determinate branch is the future hook (a one-line change at the
+/// call site) — determinate when the pipeline reports progress.
+fn show_progress(ui: &mut egui::Ui, label: &str, progress: Option<f32>) {
+    match progress {
+        None => {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.label(label);
+        }
+        Some(fraction) => {
+            ui.add(egui::ProgressBar::new(fraction).desired_width(120.0));
+            ui.label(label);
+        }
+    }
 }

@@ -3,6 +3,12 @@
 //! recent-files list, and a drag-drop hint — and shows the app version. Opening
 //! any of these kicks off the off-thread develop, which installs a session and
 //! flips the next frame into the editor.
+//!
+//! While a develop is in flight (the loading state) the central panel shows a
+//! spinner and the file name instead, so a slow decode reads as "working", not
+//! "frozen".
+
+use std::path::Path;
 
 use eframe::egui;
 
@@ -73,6 +79,63 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 }
 
                 ui.label(egui::RichText::new("…or drop a RAW anywhere on this window").weak());
+
+                // The one-time first-run hint, shown until dismissed (remembered in
+                // the config). A subtle inline callout, not a focus-trapping modal.
+                if app.should_show_hint() {
+                    ui.add_space(28.0);
+                    first_run_hint(app, ui);
+                }
             });
         });
+}
+
+/// The subtle, dismissable first-run hint pointing new users at Open / drag-drop.
+/// Non-blocking: it sits inline on the welcome screen and a "Got it" button (or
+/// the first successful open) retires it for good.
+fn first_run_hint(app: &mut App, ui: &mut egui::Ui) {
+    egui::Frame::default()
+        .fill(theme::PANEL_FILL)
+        .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+        .corner_radius(theme::CORNER_RADIUS)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_max_width(360.0);
+            ui.label(
+                egui::RichText::new("New here? Open a RAW with the button above, File ▸ Open, or just drag one onto the window.")
+                    .size(13.0),
+            );
+            ui.add_space(6.0);
+            if ui.button("Got it").clicked() {
+                app.dismiss_hint();
+            }
+        });
+}
+
+/// The loading view: a spinner and the developing file's name, centered on the
+/// neutral canvas surround. Shown while a develop is in flight so the wait reads
+/// as progress rather than a freeze. The window stays fully interactive — this is
+/// just the central panel's content for that state.
+pub(crate) fn show_loading(ctx: &egui::Context, path: &Path) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let surround = egui::Frame::central_panel(&ctx.style()).fill(theme::CANVAS_SURROUND);
+    egui::CentralPanel::default()
+        .frame(surround)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.4);
+                ui.add(egui::Spinner::new().size(28.0));
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(format!("Developing {name}…"))
+                        .size(16.0)
+                        .color(egui::Color32::from_gray(40)),
+                );
+            });
+        });
+    // Keep animating the spinner while the develop runs.
+    ctx.request_repaint();
 }

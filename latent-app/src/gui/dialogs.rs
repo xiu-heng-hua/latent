@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use latent_export::Depth;
 
+use crate::gui::app::App;
 use crate::gui::shortcuts;
+use crate::gui::theme;
 
 /// Show the shortcuts cheat-sheet modal when `open` is set, rendering every row of
 /// the single [`shortcuts::SHORTCUTS`] table (so the help is generated from the
@@ -50,6 +52,145 @@ pub(crate) fn show_shortcuts(ctx: &egui::Context, open: &mut bool) {
     if modal.should_close() {
         *open = false;
     }
+}
+
+/// Show the error modal when the app is in the error load state: a friendly,
+/// centered, dismissable dialog carrying the develop error, with Retry / Open
+/// another… / Dismiss. Every button leads somewhere live (a fresh load, a picker,
+/// or the welcome state) — the app never sits in a dead error state with no way
+/// out, and it never exits the process for a bad RAW.
+pub(crate) fn show_error_modal(app: &mut App, ctx: &egui::Context) {
+    use crate::gui::app::LoadState;
+    // Snapshot the error text/name so the modal closure doesn't hold an `app`
+    // borrow while it calls back into `app` methods.
+    let (name, message) = match app.load_state() {
+        LoadState::Error { path, message } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "the file".to_owned());
+            (name, message.clone())
+        }
+        _ => return,
+    };
+
+    let mut retry = false;
+    let mut open_another = false;
+    let mut dismiss = false;
+    egui::Modal::new(egui::Id::new("load_error_modal")).show(ctx, |ui| {
+        ui.set_width(420.0);
+        ui.heading(egui::RichText::new(format!("Couldn't open {name}")).color(theme::ERROR));
+        ui.add_space(6.0);
+        // The underlying develop error in a smaller mono style.
+        ui.label(egui::RichText::new(&message).monospace().weak());
+        ui.add_space(12.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Retry").clicked() {
+                retry = true;
+            }
+            if ui.button("Open another…").clicked() {
+                open_another = true;
+            }
+            if ui.button("Dismiss").clicked() {
+                dismiss = true;
+            }
+        });
+    });
+
+    // Apply the chosen action after the closure releases the borrow. Retry takes
+    // precedence, then Open-another, then Dismiss.
+    if retry {
+        app.retry_load(ctx);
+    } else if open_another {
+        // Leave the error state first so the picker's develop isn't refused, then
+        // pick a different RAW (the in-app open path).
+        app.dismiss_error();
+        app.open_via_dialog(ctx);
+    } else if dismiss {
+        app.dismiss_error();
+    }
+}
+
+/// Show the About dialog when `app.about_open` is set: a small modal with the app
+/// version, the linked lensfun version, the active backend, and the name /
+/// description / license. Reuses the same modal machinery as the error dialog.
+pub(crate) fn show_about(app: &mut App, ctx: &egui::Context) {
+    if !app.about_open {
+        return;
+    }
+    let info = about_text(app.backend_kind.label());
+    let modal = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
+        ui.set_width(340.0);
+        ui.vertical_centered(|ui| {
+            ui.heading(egui::RichText::new(&info.name).strong());
+            ui.label(egui::RichText::new(&info.description).weak());
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        egui::Grid::new("about_grid")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Version");
+                ui.monospace(&info.app_version);
+                ui.end_row();
+                ui.label("lensfun");
+                ui.monospace(&info.lensfun_version);
+                ui.end_row();
+                ui.label("Backend");
+                ui.monospace(&info.backend);
+                ui.end_row();
+                ui.label("License");
+                ui.monospace(&info.license);
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.vertical_centered(|ui| {
+            if ui.button("Close").clicked() {
+                app.about_open = false;
+            }
+        });
+    });
+    if modal.should_close() {
+        app.about_open = false;
+    }
+}
+
+/// The assembled About content: the version/provenance strings the dialog shows.
+/// Pure (built off compile-time constants and the passed backend label) so the
+/// formatting is unit-testable without a `Context`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AboutInfo {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) app_version: String,
+    pub(crate) lensfun_version: String,
+    pub(crate) backend: String,
+    pub(crate) license: String,
+}
+
+/// Assemble the About content for the active `backend` label (e.g. "CPU"/"GPU").
+/// The app version comes from `CARGO_PKG_VERSION` (the same source as `--version`),
+/// the lensfun version from [`latent_lens::version`] formatted `major.minor.micro`
+/// (a trailing bugfix is dropped). Pure, so [`about_reports_versions`] pins it.
+pub(crate) fn about_text(backend: &str) -> AboutInfo {
+    AboutInfo {
+        name: "latent".to_owned(),
+        description: "A small, readable RAW developer.".to_owned(),
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        lensfun_version: lensfun_version_string(),
+        backend: backend.to_owned(),
+        license: "MIT".to_owned(),
+    }
+}
+
+/// Format the linked lensfun version as `major.minor.micro`, from the compile-time
+/// [`latent_lens::version`] tuple (the trailing bugfix component is dropped).
+fn lensfun_version_string() -> String {
+    let (major, minor, micro, _bugfix) = latent_lens::version();
+    format!("{major}.{minor}.{micro}")
 }
 
 /// The RAW extensions the Open dialog filters to. The real gate is
@@ -233,6 +374,36 @@ impl ExportSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_reports_versions() {
+        // The About model assembles a non-empty app version (from
+        // `CARGO_PKG_VERSION`), the linked lensfun version formatted `M.m.µ` whose
+        // components match `latent_lens::version`, and the passed backend label.
+        let info = about_text("GPU");
+        assert_eq!(info.app_version, env!("CARGO_PKG_VERSION"));
+        assert!(!info.app_version.is_empty(), "the app version is present");
+
+        let (major, minor, micro, _bugfix) = latent_lens::version();
+        assert_eq!(
+            info.lensfun_version,
+            format!("{major}.{minor}.{micro}"),
+            "the lensfun version drops the bugfix and matches the tuple"
+        );
+
+        assert_eq!(info.backend, "GPU", "the active backend label is carried");
+        assert_eq!(info.name, "latent");
+        assert!(!info.description.is_empty());
+        assert_eq!(info.license, "MIT");
+    }
+
+    #[test]
+    fn lensfun_version_drops_the_bugfix() {
+        // The formatter keeps only major.minor.micro (two dots), dropping a trailing
+        // bugfix component — e.g. a `(0, 3, 95, 0)` tuple formats as "0.3.95".
+        let s = lensfun_version_string();
+        assert_eq!(s.matches('.').count(), 2, "exactly major.minor.micro: {s}");
+    }
 
     #[test]
     fn format_from_path_routes_by_extension() {

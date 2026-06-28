@@ -119,6 +119,14 @@ fn main() {
         // welcome state. With no `--gpu` flag, both honor the persisted pref.
         None => open_editor(cli.input.as_deref(), None),
     };
+    // The error contract splits by command:
+    //   - `develop` is a CLI tool, so a failure must exit non-zero with an
+    //     `error:` line (scripts and `tests/cli.rs` rely on it).
+    //   - the GUI (`open`/bare-path) shows a *decode* error in-app as a dismissable
+    //     modal — `open_editor`/`gui::run` returns `Ok` for a recoverable bad RAW
+    //     and only an `Err` for an unrecoverable window/platform failure (where
+    //     there is no UI left to show a modal in). So this shared exit path stays
+    //     correct precisely because the GUI no longer returns decode errors here.
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);

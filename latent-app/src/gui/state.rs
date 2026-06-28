@@ -49,8 +49,10 @@ pub(crate) struct SessionData {
 pub(crate) enum RenderOutput {
     /// A rendered preview base, to be uploaded into the preview texture.
     Preview(ImageBuf),
-    /// The result of a finished export, already formatted for the status line.
-    Export(String),
+    /// The result of a finished export: `Ok(path)` names the written file,
+    /// `Err(message)` carries the failure. The main thread turns this into a
+    /// success or error toast, so the kind is known without sniffing a string.
+    Export(Result<String, String>),
     /// A developed file (boxed — it's much larger than the other variants), or the
     /// error string from a failed develop. On `Err` the current session is kept.
     Loaded(Box<Result<SessionData, String>>),
@@ -127,7 +129,7 @@ impl RenderJob {
             } => {
                 let result =
                     latent_export::save_auto_with_quality(&rendered, &output, depth, quality);
-                RenderOutput::Export(export_status(&output.to_string_lossy(), result))
+                RenderOutput::Export(export_result(&output.to_string_lossy(), result))
             }
             // Handled above; unreachable here.
             JobKind::Load { .. } => unreachable!("load handled before render"),
@@ -191,12 +193,14 @@ pub(crate) fn load_session(input: &Path) -> Result<SessionData, String> {
     })
 }
 
-/// The status line for a finished export: success names the path, failure names
-/// the error. Factored out of the worker so it can be tested as a pure mapping.
-pub(crate) fn export_status(path: &str, result: image::ImageResult<()>) -> String {
+/// The outcome of a finished export as a toast-ready result: `Ok(path)` on a
+/// written file, `Err(message)` on a failure. Factored out of the worker so the
+/// success/failure split is a pure, testable mapping the main thread routes into
+/// a success or error toast by kind (no string-sniffing).
+pub(crate) fn export_result(path: &str, result: image::ImageResult<()>) -> Result<String, String> {
     match result {
-        Ok(()) => format!("Exported to {path}"),
-        Err(e) => format!("Export failed: {e}"),
+        Ok(()) => Ok(path.to_owned()),
+        Err(e) => Err(format!("Export failed: {e}")),
     }
 }
 
@@ -267,16 +271,16 @@ mod tests {
     use std::sync::mpsc::channel;
 
     #[test]
-    fn export_status_maps_ok_and_err() {
-        // The status line names the path on success and the error on failure.
-        assert_eq!(
-            export_status("out.tiff", Ok(())),
-            "Exported to out.tiff".to_owned()
-        );
+    fn export_result_maps_ok_and_err() {
+        // The result names the path on success (an `Ok` → a success toast) and the
+        // error on failure (an `Err` → an error toast); the kind is carried by the
+        // `Result`, never sniffed from a string.
+        assert_eq!(export_result("out.tiff", Ok(())), Ok("out.tiff".to_owned()));
         let err = latent_export::save(&ImageBuf::new(0, 0), Path::new("out.png"))
             .expect_err("zero dimension errors");
-        let msg = export_status("out.png", Err(err));
-        assert!(msg.starts_with("Export failed:"), "{msg}");
+        let mapped = export_result("out.png", Err(err));
+        assert!(mapped.is_err(), "a failed export maps to Err");
+        assert!(mapped.unwrap_err().starts_with("Export failed:"));
     }
 
     #[test]
@@ -454,8 +458,8 @@ mod tests {
             },
         };
         match job.run() {
-            RenderOutput::Export(status) => assert!(status.starts_with("Exported to"), "{status}"),
-            _ => panic!("an export job must report an export status"),
+            RenderOutput::Export(result) => assert!(result.is_ok(), "{result:?}"),
+            _ => panic!("an export job must report an export result"),
         }
         assert!(matches!(
             image::open(&tiff).unwrap().color(),
@@ -477,8 +481,8 @@ mod tests {
             },
         };
         match job.run() {
-            RenderOutput::Export(status) => assert!(status.starts_with("Exported to"), "{status}"),
-            _ => panic!("an export job must report an export status"),
+            RenderOutput::Export(result) => assert!(result.is_ok(), "{result:?}"),
+            _ => panic!("an export job must report an export result"),
         }
         assert!(matches!(
             image::open(&jpg).unwrap().color(),
@@ -488,18 +492,23 @@ mod tests {
     }
 
     #[test]
-    fn export_status_maps_failed_export() {
-        // An unsupported extension reaches the encoder as a typed error; the status
-        // mapper turns it into a "Export failed:" line (the toast/status message),
-        // never a panic.
+    fn export_failure_is_an_error_toast() {
+        // An unsupported extension reaches the encoder as a typed error; the
+        // mapper turns it into an `Err` (which the main thread routes to an error
+        // toast — the kind comes from the `Result`, not a sniffed string), never a
+        // panic.
         let mut img = ImageBuf::new(1, 1);
         img.set(0, 0, [0.5, 0.5, 0.5]);
         let bad = std::env::temp_dir().join("latent_export_status_bad.bmp");
         std::fs::remove_file(&bad).ok();
         let result = latent_export::save_auto_with_quality(&img, &bad, None, None);
         assert!(result.is_err(), "unsupported extension should error");
-        let msg = export_status(&bad.to_string_lossy(), result);
-        assert!(msg.starts_with("Export failed:"), "{msg}");
+        let mapped = export_result(&bad.to_string_lossy(), result);
+        assert!(
+            mapped.is_err(),
+            "a failed export is an error result (error toast)"
+        );
+        assert!(mapped.unwrap_err().starts_with("Export failed:"));
     }
 
     #[test]

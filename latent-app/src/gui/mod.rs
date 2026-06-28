@@ -13,6 +13,7 @@ mod scopes;
 mod shortcuts;
 mod state;
 mod theme;
+mod toasts;
 mod tools;
 mod widgets;
 

@@ -103,6 +103,11 @@ pub(crate) struct Config {
     /// Named develop presets, global to the app and reusable across images. An old
     /// config with no presets loads with an empty list (`#[serde(default)]`).
     pub(crate) presets: Vec<Preset>,
+    /// Whether the user has seen the first-run welcome hint (pointing at Open /
+    /// drag-drop). Defaults to `false` so the hint shows on a fresh config and is
+    /// set `true` once it is dismissed or the first file opens. Forward-compatible:
+    /// an older config without it loads as "not yet seen".
+    pub(crate) seen_welcome_hint: bool,
 }
 
 impl Config {
@@ -229,6 +234,7 @@ mod tests {
                 "Test".to_owned(),
                 &Settings::default(),
             )],
+            seen_welcome_hint: true,
         };
         let text = cfg.to_ron().expect("serialize");
         let back = Config::from_ron(&text).expect("parse");
@@ -349,6 +355,9 @@ mod tests {
         assert_eq!(cfg.recent_files, Vec::<PathBuf>::new());
         assert!(!cfg.gpu);
         assert_eq!(cfg.theme, Theme::Dark);
+        // The first-run hint flag defaults to "not yet seen", so a config that
+        // predates it shows the hint once on the next launch.
+        assert!(!cfg.seen_welcome_hint);
     }
 
     #[test]

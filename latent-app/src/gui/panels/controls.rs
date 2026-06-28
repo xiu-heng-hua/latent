@@ -66,6 +66,11 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     });
                 ui.separator();
 
+                // Capture the export-in-flight / busy facts before the session is
+                // borrowed, so the Export button can read as in-progress and stay
+                // disabled while a render/export runs.
+                let exporting = app.exporting;
+                let busy = app.render.is_busy();
                 let sections_open = &app.config.sections_open;
                 let session = app.session.as_mut().expect("session present");
                 // The scopes sit above the develop sections. They only paint the
@@ -269,7 +274,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                 ui.separator();
                 // → moves to a dialog in a later pass; left as-is for now.
                 ui.heading("Export");
-                export_section(session, ui, &mut do_export);
+                export_section(session, ui, &mut do_export, exporting, busy);
             });
         });
 
@@ -416,8 +421,16 @@ fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
 /// The export section: the format/depth/quality chooser and the Export button.
 /// The bare path field is gone — the destination is chosen in a native Save
 /// dialog when Export is clicked. Sets `do_export` rather than calling the app
-/// directly (the session borrow is released by the caller first).
-fn export_section(session: &mut Session, ui: &mut egui::Ui, do_export: &mut bool) {
+/// directly (the session borrow is released by the caller first). While a job is
+/// in flight the button is disabled and, for an export, reads "Exporting…" with a
+/// spinner so the user sees why it's grayed rather than a dead button.
+fn export_section(
+    session: &mut Session,
+    ui: &mut egui::Ui,
+    do_export: &mut bool,
+    exporting: bool,
+    busy: bool,
+) {
     use latent_export::Depth;
 
     // Format chooser.
@@ -454,7 +467,17 @@ fn export_section(session: &mut Session, ui: &mut egui::Ui, do_export: &mut bool
         ui.add(egui::Slider::new(&mut session.export.quality, 1..=100).text("Quality"));
     }
 
-    if ui.button("Export…").clicked() {
+    if exporting {
+        // Mid-export: a disabled, in-progress affordance (spinner + label) rather
+        // than a dead grey button. The status bar carries the same spinner.
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.add_enabled(false, egui::Button::new("Exporting…"));
+        });
+    } else if ui
+        .add_enabled(!busy, egui::Button::new("Export…"))
+        .clicked()
+    {
         *do_export = true;
     }
 }

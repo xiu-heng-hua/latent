@@ -40,8 +40,16 @@ pub(crate) fn show(
                 ui.add_enabled(false, egui::Button::new("Save sidecar"));
                 ui.separator();
                 let can_export = app.session().is_some() && !app.render.is_busy();
+                // While an export is in flight the action is disabled *and* reads as
+                // in-progress ("Exporting…"), so the user sees why it's grayed out
+                // rather than a dead button.
+                let export_label = if app.exporting {
+                    "Exporting…"
+                } else {
+                    "Export…"
+                };
                 if ui
-                    .add_enabled(can_export, egui::Button::new("Export…"))
+                    .add_enabled(can_export, egui::Button::new(export_label))
                     .clicked()
                 {
                     app.export_via_dialog(ctx);
@@ -179,8 +187,10 @@ pub(crate) fn show(
                     app.shortcuts_open = true;
                     ui.close();
                 }
-                // Planned: an About dialog.
-                ui.add_enabled(false, egui::Button::new("About latent"));
+                if ui.button("About latent").clicked() {
+                    app.about_open = true;
+                    ui.close();
+                }
             });
 
             // The open file's title (basename), right-aligned; the full path is
@@ -212,7 +222,10 @@ pub(crate) fn show_minimal(app: &mut App, ctx: &egui::Context) {
                     app.shortcuts_open = true;
                     ui.close();
                 }
-                ui.add_enabled(false, egui::Button::new("About latent"));
+                if ui.button("About latent").clicked() {
+                    app.about_open = true;
+                    ui.close();
+                }
             });
         });
     });
