@@ -193,32 +193,65 @@ fn lensfun_version_string() -> String {
     format!("{major}.{minor}.{micro}")
 }
 
-/// The RAW extensions the Open dialog filters to. The real gate is
+/// The RAW extensions the Open dialog filters to, in lower case. The real gate is
 /// `latent_raw::unpack`, not this filter, so an "All files" entry keeps an
 /// unusual extension reachable; this list is a convenience, kept deliberately
-/// broad across the common camera makers.
+/// broad across the common camera makers. The set mirrors the formats LibRaw /
+/// dcraw recognize.
 const RAW_EXTENSIONS: &[&str] = &[
     "nef", "nrw", // Nikon
     "cr2", "cr3", "crw", // Canon
     "arw", "sr2", "srf", // Sony
     "dng", // Adobe / open
     "raf", // Fujifilm
-    "orf", // Olympus
+    "orf", "ori", // Olympus
     "rw2", // Panasonic
-    "pef", // Pentax
+    "pef", "ptx", "pxn", // Pentax
     "srw", // Samsung
-    "raw", "rwl", // Leica / generic
-    "iiq", // Phase One
+    "raw", "rwl", "rwz", // Leica / generic
+    "iiq", "cap", "eip", // Phase One
     "3fr", "fff", // Hasselblad
     "x3f", // Sigma
+    "ari", // Arri
+    "bay", // Casio
+    "cs1", "sti", // Sinar
+    "dcr", "dcs", "drf", "k25", "kc2", "kdc", // Kodak
+    "erf", // Epson
+    "gpr", // GoPro
+    "mef", // Mamiya
+    "mdc", // Minolta / Agfa
+    "mos", // Leaf
+    "mrw", // Minolta
+    "obm", "qtk", // assorted
+    "rdc", // Digital Foto Maker
 ];
+
+/// Build the Open dialog's RAW extension filter from [`RAW_EXTENSIONS`], emitting
+/// each entry in both lower- and upper-case (e.g. `nef` and `NEF`), de-duplicated.
+///
+/// rfd's Linux backend (XDG portal / GTK) matches `add_filter` extensions
+/// case-sensitively, while cameras commonly write upper-case extensions
+/// (`DSC_0001.NEF`). Carrying both cases keeps those files visible by default
+/// across rfd backends.
+fn raw_filter_extensions() -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(RAW_EXTENSIONS.len() * 2);
+    for ext in RAW_EXTENSIONS {
+        for cased in [ext.to_lowercase(), ext.to_uppercase()] {
+            if !out.contains(&cased) {
+                out.push(cased);
+            }
+        }
+    }
+    out
+}
 
 /// Open a native file picker filtered to RAW images (plus an All-files escape
 /// hatch), starting in `start_dir` when given. Returns the chosen path, or `None`
 /// when the user cancels. Blocks while the dialog is open.
 pub(crate) fn pick_raw_file(start_dir: Option<&Path>) -> Option<PathBuf> {
+    let extensions = raw_filter_extensions();
     let mut dialog = rfd::FileDialog::new()
-        .add_filter("RAW images", RAW_EXTENSIONS)
+        .add_filter("RAW images", &extensions)
         .add_filter("All files", &["*"]);
     if let Some(dir) = start_dir {
         dialog = dialog.set_directory(dir);
@@ -374,6 +407,27 @@ impl ExportSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_filter_carries_both_cases() {
+        // The Open dialog filter emits each base extension in both lower- and
+        // upper-case so that camera-written upper-case files (e.g. `DSC_0001.NEF`)
+        // are matched by rfd's case-sensitive Linux backend. A base entry and a
+        // newly added maker both appear in both cases.
+        let exts = raw_filter_extensions();
+        for cased in ["nef", "NEF", "mrw", "MRW"] {
+            assert!(exts.iter().any(|e| e == cased), "filter is missing {cased}");
+        }
+        // The list is de-duplicated.
+        let mut sorted = exts.clone();
+        sorted.sort();
+        let unique = {
+            let mut u = sorted.clone();
+            u.dedup();
+            u
+        };
+        assert_eq!(sorted, unique, "the filter list has no duplicates");
+    }
 
     #[test]
     fn about_reports_versions() {
