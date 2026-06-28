@@ -140,29 +140,6 @@ fn opt_reset() -> Option<f32> {
     None
 }
 
-/// Whether an optional adjustment field is modified from its default — i.e. set
-/// to `Some(_)` rather than off. Pure predicate behind the modified indicator.
-fn opt_is_modified(value: Option<f32>) -> bool {
-    value.is_some()
-}
-
-/// Whether a plain `f32` field differs from its default value. Pure predicate
-/// behind the modified indicator for non-optional controls.
-fn value_is_modified(value: f32, default: f32) -> bool {
-    value != default
-}
-
-/// Paint a subtle dot at the right edge of `rect`'s row when `modified` is true,
-/// marking a control whose value differs from its default. Pure egui paint with
-/// no interaction and no history effect.
-fn modified_marker(ui: &egui::Ui, rect: egui::Rect, modified: bool) {
-    if !modified {
-        return;
-    }
-    let center = egui::pos2(rect.right() - 2.0, rect.center().y);
-    ui.painter().circle_filled(center, 2.5, theme::ACCENT);
-}
-
 /// Draw a non-interactive tick at the neutral/default position on a slider's
 /// track, so the user sees where "off" is. `neutral` is in the slider's value
 /// range. Pure painting over the slider rect — no interaction, no history.
@@ -230,17 +207,14 @@ pub(crate) struct SliderSpec<'a> {
 }
 
 /// Render the slider for `spec`, mutating `value`, and return the
-/// `(slider, double_clicked)` outcome plus paint the tooltip, neutral marker, and
-/// modified dot. Shared by both flavors so the egui plumbing — the `Slider` and
-/// the markers — lives in one place; the flavors only differ in their `get`/`set`
-/// value mapping. The slider's own value display is click-to-edit, so a precise
-/// value is typed there directly — no separate numeric field is rendered.
-fn paint_slider(
-    ui: &mut egui::Ui,
-    spec: &SliderSpec,
-    value: &mut f32,
-    modified: bool,
-) -> (egui::Response, bool) {
+/// `(slider, double_clicked)` outcome plus paint the tooltip and neutral marker.
+/// Shared by both flavors so the egui plumbing — the `Slider` and the marker —
+/// lives in one place; the flavors only differ in their `get`/`set` value mapping.
+/// The slider's own value display is click-to-edit, so a precise value is typed
+/// there directly — no separate numeric field is rendered. Whether a value differs
+/// from its default is shown by the section reset button's enabled state, not a
+/// per-control dot.
+fn paint_slider(ui: &mut egui::Ui, spec: &SliderSpec, value: &mut f32) -> (egui::Response, bool) {
     let hint = help_text(spec.help, &spec.range, spec.neutral);
     let slider = ui.add(
         egui::Slider::new(value, spec.range.clone())
@@ -249,7 +223,6 @@ fn paint_slider(
     );
     slider.clone().on_hover_text(&hint);
     neutral_marker(ui, slider.rect, &spec.range, spec.neutral);
-    modified_marker(ui, slider.rect, modified);
     let reset = slider.double_clicked();
     (slider, reset)
 }
@@ -271,8 +244,7 @@ fn opt_adjust_slider(
     set: impl Fn(&mut Settings, Option<f32>),
 ) {
     let mut value = get(history.current()).unwrap_or(spec.neutral);
-    let modified = opt_is_modified(get(history.current()));
-    let (slider, reset) = paint_slider(ui, &spec, &mut value, modified);
+    let (slider, reset) = paint_slider(ui, &spec, &mut value);
 
     scope.record(&slider);
 
@@ -298,8 +270,7 @@ fn adjust_slider(
     set: impl Fn(&mut Settings, f32),
 ) {
     let mut value = get(history.current());
-    let modified = value_is_modified(value, spec.neutral);
-    let (slider, reset) = paint_slider(ui, &spec, &mut value, modified);
+    let (slider, reset) = paint_slider(ui, &spec, &mut value);
 
     scope.record(&slider);
 
@@ -2107,27 +2078,10 @@ mod tests {
     }
 
     #[test]
-    fn opt_neutral_maps_to_none() {
-        // Resetting an optional field yields the off (None) default, and the
-        // modified predicate reads Some as modified, None as not.
-        assert_eq!(opt_reset(), None);
-        assert!(opt_is_modified(Some(0.5)));
-        assert!(opt_is_modified(Some(0.0)));
-        assert!(!opt_is_modified(None));
-    }
-
-    #[test]
-    fn double_click_resets_to_default() {
-        // The pure reset logic: a plain field resets to its default value and an
-        // optional field resets to None. (The begin/commit bracketing of the
-        // reset is display-driven and is not exercised headless.)
-        let default = 0.0_f32;
-        assert!(value_is_modified(1.0, default));
-        assert!(!value_is_modified(default, default));
-        // Resetting to default makes the field un-modified.
-        let reset = default;
-        assert!(!value_is_modified(reset, default));
-        // The optional flavor resets to None.
+    fn opt_reset_yields_none() {
+        // Resetting an optional field yields the off (None) default. (Whether a
+        // value differs from default is shown by the section reset button's enabled
+        // state, not a per-control predicate.)
         assert_eq!(opt_reset(), None);
     }
 
