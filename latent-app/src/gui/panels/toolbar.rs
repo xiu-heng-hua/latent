@@ -61,24 +61,25 @@ pub(crate) fn show(
             // in one place), so it is applied after this closure via the flag set
             // below.
             let mut orient: Option<fn(latent_edit::Orientation) -> latent_edit::Orientation> = None;
-            if ui
-                .button("⟳")
-                .on_hover_text("Rotate 90° clockwise")
+            if crate::gui::icons::icon_button(ui, true, "rotate_cw", "Rotate 90° clockwise")
                 .clicked()
             {
                 orient = Some(|o| o.rotate_cw());
             }
-            if ui
-                .button("⟲")
-                .on_hover_text("Rotate 90° counter-clockwise")
-                .clicked()
+            if crate::gui::icons::icon_button(
+                ui,
+                true,
+                "rotate_ccw",
+                "Rotate 90° counter-clockwise",
+            )
+            .clicked()
             {
                 orient = Some(|o| o.rotate_ccw());
             }
-            if ui.button("⇋").on_hover_text("Flip horizontal").clicked() {
+            if crate::gui::icons::icon_button(ui, true, "flip_h", "Flip horizontal").clicked() {
                 orient = Some(|o| o.flip_h());
             }
-            if ui.button("⇅").on_hover_text("Flip vertical").clicked() {
+            if crate::gui::icons::icon_button(ui, true, "flip_v", "Flip vertical").clicked() {
                 orient = Some(|o| o.flip_v());
             }
             if let Some(f) = orient {

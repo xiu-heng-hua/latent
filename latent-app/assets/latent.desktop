@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Latent
+GenericName=RAW Photo Developer
+Comment=A small, readable RAW developer
+Exec=latent %f
+Icon=latent
+Terminal=false
+Categories=Graphics;Photography;
+StartupWMClass=latent
+MimeType=image/x-dcraw;

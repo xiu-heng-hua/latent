@@ -27,7 +27,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 // Push the content down to roughly the vertical middle.
                 ui.add_space(ui.available_height() * 0.18);
 
-                ui.heading(egui::RichText::new("latent").size(40.0).strong());
+                ui.heading(egui::RichText::new("Latent").size(40.0).strong());
                 ui.label(
                     egui::RichText::new(format!("version {}", env!("CARGO_PKG_VERSION"))).weak(),
                 );

@@ -187,7 +187,7 @@ pub(crate) fn show(
                     app.shortcuts_open = true;
                     ui.close();
                 }
-                if ui.button("About latent").clicked() {
+                if ui.button("About Latent").clicked() {
                     app.about_open = true;
                     ui.close();
                 }
@@ -222,7 +222,7 @@ pub(crate) fn show_minimal(app: &mut App, ctx: &egui::Context) {
                     app.shortcuts_open = true;
                     ui.close();
                 }
-                if ui.button("About latent").clicked() {
+                if ui.button("About Latent").clicked() {
                     app.about_open = true;
                     ui.close();
                 }

@@ -14,24 +14,28 @@ use super::theme;
 /// as a box instead of crashing the UI.
 pub(crate) fn icon(name: &str) -> char {
     match name {
-        "open" => '\u{e256}',      // folder-open
-        "save" => '\u{e248}',      // floppy-disk
-        "export" => '\u{eaf0}',    // export
-        "undo" => '\u{e038}',      // arrow-counter-clockwise
-        "redo" => '\u{e036}',      // arrow-clockwise
-        "zoom_in" => '\u{e310}',   // magnifying-glass-plus
-        "zoom_out" => '\u{e30e}',  // magnifying-glass-minus
-        "zoom_fit" => '\u{e0a2}',  // arrows-out
-        "zoom_100" => '\u{e30c}',  // magnifying-glass
-        "crop" => '\u{e1d4}',      // crop
-        "brush" => '\u{e6f0}',     // paint-brush
-        "mask" => '\u{e9f4}',      // mask-happy
-        "histogram" => '\u{e150}', // chart-bar
-        "settings" => '\u{e270}',  // gear
-        "info" => '\u{e2ce}',      // info
-        "image" => '\u{e2ca}',     // image
-        "quit" => '\u{e42a}',      // sign-out
-        _ => '\u{e2ce}',           // info, as a visible fallback
+        "open" => '\u{e256}',       // folder-open
+        "save" => '\u{e248}',       // floppy-disk
+        "export" => '\u{eaf0}',     // export
+        "undo" => '\u{e014}',       // arrow-arc-left
+        "redo" => '\u{e016}',       // arrow-arc-right
+        "rotate_cw" => '\u{e036}',  // arrow-clockwise
+        "rotate_ccw" => '\u{e038}', // arrow-counter-clockwise
+        "flip_h" => '\u{ed6a}',     // flip-horizontal
+        "flip_v" => '\u{ed6c}',     // flip-vertical
+        "zoom_in" => '\u{e310}',    // magnifying-glass-plus
+        "zoom_out" => '\u{e30e}',   // magnifying-glass-minus
+        "zoom_fit" => '\u{e0a2}',   // arrows-out
+        "zoom_100" => '\u{e30c}',   // magnifying-glass
+        "crop" => '\u{e1d4}',       // crop
+        "brush" => '\u{e6f0}',      // paint-brush
+        "mask" => '\u{e9f4}',       // mask-happy
+        "histogram" => '\u{e150}',  // chart-bar
+        "settings" => '\u{e270}',   // gear
+        "info" => '\u{e2ce}',       // info
+        "image" => '\u{e2ca}',      // image
+        "quit" => '\u{e42a}',       // sign-out
+        _ => '\u{e2ce}',            // info, as a visible fallback
     }
 }
 
@@ -44,6 +48,10 @@ const ICON_NAMES: &[&str] = &[
     "export",
     "undo",
     "redo",
+    "rotate_cw",
+    "rotate_ccw",
+    "flip_h",
+    "flip_v",
     "zoom_in",
     "zoom_out",
     "zoom_fit",

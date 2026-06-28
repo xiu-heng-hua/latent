@@ -177,7 +177,7 @@ pub(crate) struct AboutInfo {
 /// (a trailing bugfix is dropped). Pure, so [`about_reports_versions`] pins it.
 pub(crate) fn about_text(backend: &str) -> AboutInfo {
     AboutInfo {
-        name: "latent".to_owned(),
+        name: "Latent".to_owned(),
         description: "A small, readable RAW developer.".to_owned(),
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         lensfun_version: lensfun_version_string(),
@@ -392,7 +392,7 @@ mod tests {
         );
 
         assert_eq!(info.backend, "GPU", "the active backend label is carried");
-        assert_eq!(info.name, "latent");
+        assert_eq!(info.name, "Latent");
         assert!(!info.description.is_empty());
         assert_eq!(info.license, "MIT");
     }

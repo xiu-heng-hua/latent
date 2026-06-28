@@ -164,7 +164,7 @@ pub(crate) struct Session {
     pub(crate) saved: Vec<Settings>,
     /// Last variant names written to the sidecar, so a rename autosaves.
     pub(crate) saved_names: Vec<String>,
-    /// Window title (`<filename> — latent`).
+    /// Window title (`<filename> — Latent`).
     pub(crate) title: String,
     /// Full input path, surfaced on hover (the title shows only the basename).
     pub(crate) path: String,
@@ -459,15 +459,19 @@ pub fn run(
     let title = input
         .as_deref()
         .map(window_title)
-        .unwrap_or_else(|| "latent".to_owned());
+        .unwrap_or_else(|| "Latent".to_owned());
     // The persisted window size overrides the default when present.
     let size = config
         .window_size
         .map(|(w, h)| [w, h])
         .unwrap_or(theme::DEFAULT_WINDOW_SIZE);
+    // The lowercase application id matches the installed `latent.desktop` so the
+    // Wayland/X11 taskbar shows the bundled icon and name (the displayed title is
+    // the capitalized "Latent").
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(size)
         .with_min_inner_size(theme::MIN_WINDOW_SIZE)
+        .with_app_id("latent")
         .with_title(&title);
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
@@ -518,14 +522,14 @@ pub fn run(
     Ok(())
 }
 
-/// The window title for `input`: `<basename> — latent`, falling back to the full
+/// The window title for `input`: `<basename> — Latent`, falling back to the full
 /// path when there's no file name.
 pub(crate) fn window_title(input: &Path) -> String {
     let name = input
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| input.display().to_string());
-    format!("{name} — latent")
+    format!("{name} — Latent")
 }
 
 /// Decode the committed app icon into eframe's `IconData`. The PNG is decoded
@@ -1764,7 +1768,7 @@ mod tests {
     fn window_title_uses_the_basename() {
         assert_eq!(
             window_title(Path::new("/photos/sunset.nef")),
-            "sunset.nef — latent"
+            "sunset.nef — Latent"
         );
     }
 
