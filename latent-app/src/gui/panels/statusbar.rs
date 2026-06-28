@@ -1,7 +1,10 @@
-//! The bottom status bar: zoom %, image dimensions, the hover pixel readout, the
-//! active backend, and the render/autosave state. Shown only with an open session.
-//! Numeric readouts use the monospace style so they don't jitter as digits change
-//! width.
+//! The bottom status bar: zoom %, image dimensions, the active backend, the
+//! render/autosave state, and — pinned to the far right — the hover pixel readout.
+//! Shown only with an open session. Numeric readouts use the monospace style so
+//! they don't jitter as digits change width. The pixel readout is the only field
+//! whose width varies (it appears/widens with the cursor over the image), so it
+//! lives last, at the right edge, where its varying width grows into empty space
+//! and never shifts the fixed fields on the left.
 
 use eframe::egui;
 use egui::RichText;
@@ -34,18 +37,6 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             );
             ui.separator();
 
-            // The pixel under the cursor (sRGB display value), when over the image.
-            if let Some(p) = session.pixel_readout {
-                ui.label(
-                    RichText::new(format!(
-                        "{},{}  sRGB {} {} {}",
-                        p.x, p.y, p.rgb[0], p.rgb[1], p.rgb[2]
-                    ))
-                    .monospace(),
-                );
-                ui.separator();
-            }
-
             // Active backend (CPU/GPU): the one actually rendering, reflecting any
             // GPU→CPU fallback, with a hint that a switch is in flight.
             let backend = app.backend_kind.label();
@@ -75,6 +66,22 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 ui.label("Saved");
             } else {
                 ui.label("Editing");
+            }
+
+            // The pixel under the cursor (sRGB display value), when over the image —
+            // pinned to the right edge. Its width varies as the cursor moves (and it
+            // vanishes off-image), so a right-to-left layout lets that varying width
+            // grow into the gap on the left without nudging any fixed field.
+            if let Some(p) = session.pixel_readout {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{},{}  sRGB {} {} {}",
+                            p.x, p.y, p.rgb[0], p.rgb[1], p.rgb[2]
+                        ))
+                        .monospace(),
+                    );
+                });
             }
         });
     });
