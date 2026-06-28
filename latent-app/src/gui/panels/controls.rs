@@ -862,41 +862,44 @@ fn export_section(
 fn lens_block(session: &mut Session, ui: &mut egui::Ui, vis: &mut VisCtx) -> bool {
     let active = session.active;
     let mut dirty = false;
+
+    // Look the profile up once, independent of whether the correction is applied,
+    // so the panel can show the matched lens even while disabled. A one-shot lookup
+    // on the main thread (the lensfun `Database` is not `Send`), cached afterward.
+    if session.lens_lookup.is_none() {
+        session.lens_lookup = Some(crate::gui::state::auto_lens_profile(&session.meta));
+    }
+    let found = matches!(session.lens_lookup, Some(Some(_)));
+
     let mut enabled = session.variants[active].current().geometry.lens.is_some();
+    // Only toggleable when a profile was found — or when one is already applied (a
+    // saved sidecar), so it can still be turned off even if the database no longer
+    // matches it.
+    let toggleable = found || enabled;
     ui.add_space(2.0);
     let shown = vis.is_shown("lens");
     let shown = ui
         .horizontal(|ui| {
             let changed = ui
-                .checkbox(&mut enabled, "Lens correction")
-                .on_hover_text("Correct lens distortion/vignetting from the lens profile")
+                .add_enabled(
+                    toggleable,
+                    egui::Checkbox::new(&mut enabled, "Lens correction"),
+                )
+                .on_hover_text("Correct lens distortion/vignetting from the matched lens profile")
                 .changed();
             if changed {
-                if enabled {
-                    // Detect synchronously on the main thread (a one-shot lookup,
-                    // never a per-frame cost) and apply when a profile is found.
-                    match crate::gui::state::auto_lens_profile(&session.meta) {
-                        Some(profile) => {
-                            let history = &mut session.variants[active];
-                            history.begin();
-                            history.current_mut().geometry.lens = Some(profile);
-                            history.commit();
-                            session.lens_name = Some(lens_display_name(&session.meta));
-                            dirty = true;
-                        }
-                        None => {
-                            // No match: leave the lens off and report it.
-                            session.lens_name = None;
-                        }
-                    }
+                // Apply the cached profile on enable, clear it on disable, as one
+                // undo step.
+                let to_apply = if enabled {
+                    session.lens_lookup.as_ref().and_then(|o| o.clone())
                 } else {
-                    let history = &mut session.variants[active];
-                    history.begin();
-                    history.current_mut().geometry.lens = None;
-                    history.commit();
-                    session.lens_name = None;
-                    dirty = true;
-                }
+                    None
+                };
+                let history = &mut session.variants[active];
+                history.begin();
+                history.current_mut().geometry.lens = to_apply;
+                history.commit();
+                dirty = true;
             }
             // The eye button sits at the right edge of the header row.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -906,19 +909,15 @@ fn lens_block(session: &mut Session, ui: &mut egui::Ui, vis: &mut VisCtx) -> boo
         })
         .inner;
 
-    // Show the detected-lens name (or a "none found" note) as the small body
-    // whenever shown. When disabled it greys out, so toggling the box never moves
-    // the layout.
+    // Show the matched lens name whenever a profile was found (or one is applied),
+    // else a "none matched" note. The name is greyed while the correction is off, so
+    // toggling the box never moves the layout — but the matched lens stays visible.
     if shown {
         let on = session.variants[active].current().geometry.lens.is_some();
-        let name = if on {
-            session
-                .lens_name
-                .clone()
-                .unwrap_or_else(|| "Lens profile applied".to_owned())
+        let name = if found || on {
+            lens_display_name(&session.meta)
         } else {
-            // No profile applied — the user has not enabled it, or nothing matched.
-            "No lens profile found".to_owned()
+            "No matching lens profile".to_owned()
         };
         ui.indent("lens", |ui| {
             ui.add_enabled_ui(on, |ui| ui.label(name));

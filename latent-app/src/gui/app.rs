@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::mpsc::channel;
 
 use eframe::egui;
-use latent_edit::{Document, History, Settings};
+use latent_edit::{Document, History, LensProfile, Settings};
 use latent_image::ImageBuf;
 use latent_pipeline::Backend;
 use latent_pipeline::render;
@@ -215,9 +215,11 @@ pub(crate) struct Session {
     /// The RAW's decoded EXIF metadata, for on-demand lens detection on the main
     /// thread (the lensfun `Database` is not `Send`).
     pub(crate) meta: latent_raw::Metadata,
-    /// The detected lens's display name once the user enables lens correction, for
-    /// the panel label. `None` until a successful detection.
-    pub(crate) lens_name: Option<String>,
+    /// The cached lens-profile lookup, run once (independent of whether the
+    /// correction is applied) so the panel can show the matched lens even while it
+    /// is disabled: `None` = not looked up yet, `Some(None)` = looked up, no match,
+    /// `Some(Some(profile))` = the matched profile.
+    pub(crate) lens_lookup: Option<Option<LensProfile>>,
     /// Brush tool settings for painting dabs onto a brush mask (normalized).
     pub(crate) brush_radius: f32,
     pub(crate) brush_feather: f32,
@@ -329,7 +331,7 @@ impl Session {
             shape_sel: 0,
             wb_action: crate::gui::widgets::WbAction::None,
             meta: data.meta,
-            lens_name: None,
+            lens_lookup: None,
             brush_radius: 0.08,
             brush_feather: 0.04,
             brush_erase: false,
