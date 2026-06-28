@@ -345,7 +345,12 @@ pub(crate) fn curves_block(
     {
         dirty |= set_curves_enabled(history, access, enabled);
     }
-    dirty | curves_body(ui, history, channel, access)
+    // Local surface: the checkbox alone gates the body — an unchecked effect hides
+    // its controls (there is no eye button here). Only render the editor when on.
+    if enabled {
+        dirty |= curves_body(ui, history, channel, access);
+    }
+    dirty
 }
 
 /// Flip `Adjustments.curves` on (a neutral identity [`Curves`]) or off (`None`) as
@@ -362,10 +367,12 @@ pub(crate) fn set_curves_enabled(
     true
 }
 
-/// The curve editor controls only (channel picker + the draggable graph), assuming
-/// curves are enabled — a no-op when off. Split from [`curves_block`] so the
-/// controls-panel header can own the enable checkbox while the body renders the
-/// same editor.
+/// The curve editor controls only (channel picker + the draggable graph). Split
+/// from [`curves_block`] so the controls-panel header can own the enable checkbox
+/// while the body renders the same editor. When curves are off (`None`) it renders
+/// the identity [`Curves::default`] so the controls are still visible — the caller
+/// greys them via `add_enabled_ui` and a disabled (non-interactive) editor never
+/// drags, so it writes nothing; only a `Some` curve is ever mutated.
 pub(crate) fn curves_body(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
@@ -373,9 +380,6 @@ pub(crate) fn curves_body(
     access: impl AdjustAccess,
 ) -> bool {
     let mut dirty = false;
-    if access.get(history.current()).curves.is_none() {
-        return dirty;
-    }
 
     ui.horizontal(|ui| {
         for (i, name) in ["Master", "R", "G", "B"].into_iter().enumerate() {
@@ -384,9 +388,13 @@ pub(crate) fn curves_body(
     });
 
     // Output (y) of each fixed-input point for the selected channel; identity
-    // where a point has not been set yet.
+    // where a point has not been set yet. Off (`None`) reads as the identity.
     let mut ys: [f32; 5] = {
-        let curves = access.get(history.current()).curves.as_ref().unwrap();
+        let curves = access
+            .get(history.current())
+            .curves
+            .clone()
+            .unwrap_or_default();
         let pts = match *channel {
             1 => &curves.red,
             2 => &curves.green,
@@ -425,14 +433,14 @@ pub(crate) fn curves_body(
             })
             .unwrap();
         ys[i] = ny;
-        let curves = access
-            .get_mut(history.current_mut())
-            .curves
-            .as_mut()
-            .unwrap();
-        *curve_channel_mut(curves, *channel) =
-            CURVE_XS.iter().zip(ys).map(|(&x, y)| (x, y)).collect();
-        dirty = true;
+        // Only a `Some` curve is written. A disabled (off) editor is greyed
+        // non-interactive by the caller, so it never drags here; the guard keeps
+        // the write panic-free even so.
+        if let Some(curves) = access.get_mut(history.current_mut()).curves.as_mut() {
+            *curve_channel_mut(curves, *channel) =
+                CURVE_XS.iter().zip(ys).map(|(&x, y)| (x, y)).collect();
+            dirty = true;
+        }
     }
     if resp.drag_stopped() {
         history.commit();
@@ -839,7 +847,12 @@ pub(crate) fn hsl_block(
     {
         dirty |= set_hsl_enabled(history, access, enabled);
     }
-    dirty | hsl_body(ui, history, access)
+    // Local surface: the checkbox alone gates the body — render the band rows only
+    // when enabled, so an unchecked effect hides its controls (no eye button here).
+    if enabled {
+        dirty |= hsl_body(ui, history, access);
+    }
+    dirty
 }
 
 /// Flip `Adjustments.hsl` on (a neutral all-zero [`Hsl`]) or off (`None`) as **one**
@@ -856,16 +869,16 @@ pub(crate) fn set_hsl_enabled(
     true
 }
 
-/// The eight HSL band rows only, assuming HSL is enabled — a no-op when off. Split
-/// from [`hsl_block`] so the controls-panel header can own the enable checkbox.
+/// The eight HSL band rows. Split from [`hsl_block`] so the controls-panel header
+/// can own the enable checkbox. When HSL is off (`None`) the rows render the neutral
+/// [`Hsl::default`] (each band already reads `unwrap_or_default`), so the controls
+/// are still visible; the caller greys them via `add_enabled_ui`, and a
+/// non-interactive slider never `.changed()`, so a disabled body writes nothing.
 pub(crate) fn hsl_body(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
     access: impl AdjustAccess,
 ) -> bool {
-    if access.get(history.current()).hsl.is_none() {
-        return false;
-    }
     let mut scope = GestureScope::default();
     for band in 0..8 {
         hsl_band_row(ui, history, &mut scope, access, band);
@@ -894,7 +907,12 @@ pub(crate) fn channel_mixer_block(
     {
         dirty |= set_channel_mixer_enabled(history, access, enabled);
     }
-    dirty | channel_mixer_body(ui, history, access)
+    // Local surface: the checkbox alone gates the body — render the matrix only when
+    // enabled, so an unchecked effect hides its controls (no eye button here).
+    if enabled {
+        dirty |= channel_mixer_body(ui, history, access);
+    }
+    dirty
 }
 
 /// Flip `Adjustments.channel_mixer` on (the identity [`ChannelMixer`], a no-op) or
@@ -913,19 +931,21 @@ pub(crate) fn set_channel_mixer_enabled(
 }
 
 /// The channel-mixer matrix controls only (the nine input-weight sliders plus the
-/// preserve-luminosity toggle), assuming the mixer is enabled — a no-op when off.
-/// Split from [`channel_mixer_block`] so the controls-panel header can own the
-/// enable checkbox.
+/// preserve-luminosity toggle). Split from [`channel_mixer_block`] so the
+/// controls-panel header can own the enable checkbox. When the mixer is off
+/// (`None`) it renders the identity [`ChannelMixer::default`] so the controls are
+/// still visible; the caller greys them via `add_enabled_ui`, and a non-interactive
+/// control never `.changed()`, so a disabled body writes nothing.
 pub(crate) fn channel_mixer_body(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
     access: impl AdjustAccess,
 ) -> bool {
     let mut dirty = false;
-    let base = match access.get(history.current()).channel_mixer {
-        Some(m) => m,
-        None => return dirty,
-    };
+    let base = access
+        .get(history.current())
+        .channel_mixer
+        .unwrap_or_default();
 
     let mut scope = GestureScope::default();
     for (out, out_name) in ["Red output", "Green output", "Blue output"]
@@ -1108,14 +1128,14 @@ pub(crate) fn set_vignette_enabled(history: &mut History<Settings>, enabled: boo
     true
 }
 
-/// The vignette amount slider only, assuming the effect is enabled (the header
-/// checkbox owns the on/off). Negative darkens the corners, positive lightens
-/// them. The header owns `None`, so the slider keeps the value `Some` even at the
-/// neutral `0` rather than clearing it (which would fight the checkbox).
+/// The vignette amount slider only; the header checkbox owns the on/off. Negative
+/// darkens the corners, positive lightens them. The header owns `None`, so the
+/// slider keeps the value `Some` even at the neutral `0` rather than clearing it
+/// (which would fight the checkbox). When off (`None`) the slider renders at the
+/// neutral `0` (`opt_point_slider` shows `neutral` for `None`) so the control is
+/// still visible; the caller greys it via `add_enabled_ui`, and a non-interactive
+/// slider never `.changed()`, so a disabled body writes nothing.
 pub(crate) fn vignette_body(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    if history.current().geometry.vignette.is_none() {
-        return false;
-    }
     opt_point_slider(
         ui,
         history,
@@ -2026,6 +2046,133 @@ fn rad_set_f(r: &mut Radial, v: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Run `f` once inside a headless egui frame, so a control builder can be
+    /// exercised without a display. The closure may write through a `RefCell` it
+    /// captures; `__run_test_ui` calls it once per frame.
+    fn in_test_ui(f: impl Fn(&mut egui::Ui)) {
+        egui::__run_test_ui(f);
+    }
+
+    #[test]
+    fn set_curves_enabled_round_trips_as_one_step() {
+        // Enabling installs the identity Curves; disabling clears it back to None;
+        // each flip is exactly one undo step. Same shape for the global panel and a
+        // local — here exercised on the global.
+        let mut h = History::new(Settings::default());
+        let access = GlobalAccess;
+        assert!(h.current().global.curves.is_none(), "off by default");
+        assert!(set_curves_enabled(&mut h, access, true));
+        assert_eq!(
+            h.current().global.curves,
+            Some(Curves::default()),
+            "enable installs the identity"
+        );
+        assert_eq!(h.undo_len(), 1, "enabling is one step");
+        assert!(set_curves_enabled(&mut h, access, false));
+        assert!(h.current().global.curves.is_none(), "disable clears it");
+        assert_eq!(h.undo_len(), 2, "disabling is a second step");
+    }
+
+    #[test]
+    fn set_hsl_enabled_round_trips_as_one_step() {
+        let mut h = History::new(Settings::default());
+        let access = GlobalAccess;
+        assert!(set_hsl_enabled(&mut h, access, true));
+        assert_eq!(h.current().global.hsl, Some(Hsl::default()));
+        assert_eq!(h.undo_len(), 1);
+        assert!(set_hsl_enabled(&mut h, access, false));
+        assert!(h.current().global.hsl.is_none());
+        assert_eq!(h.undo_len(), 2);
+    }
+
+    #[test]
+    fn set_channel_mixer_enabled_round_trips_as_one_step() {
+        let mut h = History::new(Settings::default());
+        let access = GlobalAccess;
+        assert!(set_channel_mixer_enabled(&mut h, access, true));
+        assert_eq!(
+            h.current().global.channel_mixer,
+            Some(ChannelMixer::default()),
+            "enable installs the identity mixer"
+        );
+        assert_eq!(h.undo_len(), 1);
+        assert!(set_channel_mixer_enabled(&mut h, access, false));
+        assert!(h.current().global.channel_mixer.is_none());
+        assert_eq!(h.undo_len(), 2);
+    }
+
+    #[test]
+    fn set_vignette_enabled_round_trips_as_one_step() {
+        let mut h = History::new(Settings::default());
+        assert!(set_vignette_enabled(&mut h, true));
+        assert_eq!(
+            h.current().geometry.vignette,
+            Some(0.0),
+            "enable installs the neutral amount"
+        );
+        assert_eq!(h.undo_len(), 1);
+        assert!(set_vignette_enabled(&mut h, false));
+        assert!(h.current().geometry.vignette.is_none());
+        assert_eq!(h.undo_len(), 2);
+    }
+
+    #[test]
+    fn local_blocks_do_not_render_or_edit_when_unchecked() {
+        // On the local surface there is no eye button: an unchecked (None) effect
+        // hides its controls and must edit nothing. Drive each inline-checkbox block
+        // headlessly with the field off and assert it stays off with no undo step —
+        // the body is gated on the checkbox, so it never runs (and never panics on a
+        // None field).
+        let h = RefCell::new(History::new(Settings::default()));
+        let channel = RefCell::new(0_usize);
+        let access = GlobalAccess;
+        in_test_ui(|ui| {
+            let mut hist = h.borrow_mut();
+            let mut ch = channel.borrow_mut();
+            assert!(!curves_block(ui, &mut hist, &mut ch, access));
+            assert!(!hsl_block(ui, &mut hist, access));
+            assert!(!channel_mixer_block(ui, &mut hist, access));
+        });
+        let hist = h.borrow();
+        assert!(hist.current().global.curves.is_none(), "curves stay off");
+        assert!(hist.current().global.hsl.is_none(), "hsl stays off");
+        assert!(
+            hist.current().global.channel_mixer.is_none(),
+            "mixer stays off"
+        );
+        assert_eq!(hist.undo_len(), 0, "an unchecked local edits nothing");
+    }
+
+    #[test]
+    fn disabled_bodies_render_default_without_panicking_or_editing() {
+        // The global panel renders the body whenever the eye says "shown", even when
+        // the effect is disabled (None). With no user interaction the default-valued
+        // controls draw and write nothing — and reading a None field as its default
+        // must not panic. Drives each body on a None field.
+        let h = RefCell::new(History::new(Settings::default()));
+        let channel = RefCell::new(0_usize);
+        let access = GlobalAccess;
+        in_test_ui(|ui| {
+            let mut hist = h.borrow_mut();
+            let mut ch = channel.borrow_mut();
+            assert!(!curves_body(ui, &mut hist, &mut ch, access));
+            assert!(!hsl_body(ui, &mut hist, access));
+            assert!(!channel_mixer_body(ui, &mut hist, access));
+            assert!(!vignette_body(ui, &mut hist));
+        });
+        let hist = h.borrow();
+        assert!(hist.current().global.curves.is_none());
+        assert!(hist.current().global.hsl.is_none());
+        assert!(hist.current().global.channel_mixer.is_none());
+        assert!(hist.current().geometry.vignette.is_none());
+        assert_eq!(
+            hist.undo_len(),
+            0,
+            "a shown-but-disabled body edits nothing"
+        );
+    }
 
     #[test]
     fn add_shape_keeps_ops_parallel_and_appends() {
