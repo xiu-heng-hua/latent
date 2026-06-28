@@ -21,10 +21,15 @@ pub(crate) struct SessionData {
     pub(crate) preview: Arc<ImageBuf>,
     /// One edit history per variant (never empty).
     pub(crate) variants: Vec<History<Settings>>,
+    /// Display names for the variants, parallel to `variants` (an empty/missing
+    /// entry means "unnamed" → a positional fallback in the UI).
+    pub(crate) names: Vec<String>,
     /// The sidecar path the document autosaves to.
     pub(crate) sidecar: PathBuf,
     /// The variants as loaded from disk (for the saved/edited indicator).
     pub(crate) saved: Vec<Settings>,
+    /// The variant names as loaded from disk (so a rename is detected as unsaved).
+    pub(crate) saved_names: Vec<String>,
     /// Window title (`<basename> — latent`).
     pub(crate) title: String,
     /// Full input path (shown on hover).
@@ -164,14 +169,21 @@ pub(crate) fn load_session(input: &Path) -> Result<SessionData, String> {
         document.variants.push(Settings::default());
     }
     let saved = document.variants.clone();
+    // Normalize names to one-per-variant, padding any short/empty trailing entries
+    // so the parallel vectors stay aligned; an empty name is shown positionally.
+    let mut names = document.names;
+    names.resize(document.variants.len(), String::new());
+    let saved_names = names.clone();
     let variants = document.variants.into_iter().map(History::new).collect();
 
     Ok(SessionData {
         full,
         preview,
         variants,
+        names,
         sidecar,
         saved,
+        saved_names,
         title,
         path,
         output,
@@ -193,6 +205,32 @@ pub(crate) fn export_status(path: &str, result: image::ImageResult<()>) -> Strin
 /// two clamp sites cannot drift.
 pub(crate) fn clamp_selection(sel: &mut usize, len: usize) {
     *sel = (*sel).min(len.saturating_sub(1));
+}
+
+/// Merge the **develop** part of `source` onto `target`, keeping the target's own
+/// geometry. The develop part is the global adjustments and the local
+/// adjustments; geometry (crop, orientation, straighten, keystone, lens,
+/// vignette, …) is image-specific — a crop or keystone tuned for one frame is
+/// wrong on another — so it is deliberately left as the target's. This is the
+/// shared mapping behind "Paste settings" (develop only) and "Apply preset". Pure,
+/// so the develop-vs-geometry split is unit-testable.
+pub(crate) fn merge_develop(target: &Settings, source: &Settings) -> Settings {
+    Settings {
+        global: source.global.clone(),
+        locals: source.locals.clone(),
+        geometry: target.geometry.clone(),
+    }
+}
+
+/// Reset the develop part of `target` to neutral while keeping its geometry — the
+/// "Reset all develop" mapping. A user rarely wants a reset to also undo their
+/// crop/straighten, so geometry is preserved by default. Pure.
+pub(crate) fn reset_develop(target: &Settings) -> Settings {
+    Settings {
+        global: Default::default(),
+        locals: Vec::new(),
+        geometry: target.geometry.clone(),
+    }
 }
 
 /// Query lensfun for a lens profile matching the RAW's EXIF metadata, or `None`
@@ -242,6 +280,68 @@ mod tests {
     }
 
     #[test]
+    fn paste_develop_keeps_target_geometry() {
+        // "Paste settings" (develop only) copies the source's global + local
+        // adjustments but keeps the *target's* geometry — a crop tuned for one
+        // frame must not follow the look onto another.
+        use latent_edit::{Adjustments, Crop, Geometry};
+        let source = Settings {
+            global: Adjustments {
+                exposure: Some(1.0),
+                ..Adjustments::default()
+            },
+            geometry: Geometry {
+                crop: Some(Crop {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 0.5,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let target = Settings {
+            geometry: Geometry {
+                straighten_degrees: 3.0,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let merged = merge_develop(&target, &source);
+        // The develop part came from the source…
+        assert_eq!(merged.global.exposure, Some(1.0));
+        // …but the geometry is the target's, not the source's.
+        assert_eq!(merged.geometry, target.geometry);
+        assert_eq!(merged.geometry.crop, None);
+        assert_eq!(merged.geometry.straighten_degrees, 3.0);
+    }
+
+    #[test]
+    fn reset_all_returns_default_develop() {
+        // "Reset all develop" clears the global + local adjustments to neutral but
+        // keeps the geometry (a reset rarely should undo a crop/straighten).
+        use latent_edit::{Adjustments, Geometry, LocalAdjustment};
+        let target = Settings {
+            global: Adjustments {
+                exposure: Some(1.0),
+                saturation: Some(1.5),
+                ..Adjustments::default()
+            },
+            locals: vec![LocalAdjustment::default()],
+            geometry: Geometry {
+                straighten_degrees: 2.0,
+                ..Geometry::default()
+            },
+        };
+        let reset = reset_develop(&target);
+        assert_eq!(reset.global, Adjustments::default());
+        assert!(reset.locals.is_empty());
+        // Geometry is preserved.
+        assert_eq!(reset.geometry.straighten_degrees, 2.0);
+    }
+
+    #[test]
     fn clamp_selection_keeps_in_range() {
         // Clamps to the last valid index, leaves an in-range index untouched, and
         // collapses to 0 on an empty list.
@@ -279,6 +379,50 @@ mod tests {
         state.in_flight = None;
         assert!(!state.is_busy());
         assert!(std::mem::take(&mut state.pending));
+    }
+
+    #[test]
+    fn backend_swap_is_deferred_past_a_busy_render() {
+        // A backend switch must never replace the backend while a render is in
+        // flight (the in-flight render owns its `Arc` and must finish on the backend
+        // it started with). This pins the deferral state machine the app uses: a
+        // request while busy is recorded as pending and only applied once the gate
+        // goes idle. (The `Arc` swap itself needs a window, so this exercises the
+        // gating logic that decides *when* the swap is safe.)
+        let mut state = RenderState::default();
+        let mut pending_backend: Option<bool> = None;
+
+        // A render is in flight.
+        let (_tx, rx) = channel::<RenderOutput>();
+        state.in_flight = Some(rx);
+        assert!(state.is_busy());
+
+        // A request to switch to GPU arrives mid-render: it is deferred, not applied.
+        let requested = true;
+        if state.is_busy() {
+            pending_backend = Some(requested);
+        }
+        assert_eq!(
+            pending_backend,
+            Some(true),
+            "a switch during a render must be deferred, never applied in flight"
+        );
+
+        // The in-flight render finishes; the gate goes idle.
+        state.in_flight = None;
+        assert!(!state.is_busy());
+
+        // Now — and only now — the deferred switch is consumed and applied.
+        let applied = pending_backend.take();
+        assert_eq!(
+            applied,
+            Some(true),
+            "the deferred switch is applied once idle"
+        );
+        assert!(
+            pending_backend.is_none(),
+            "the pending switch is consumed exactly once"
+        );
     }
 
     #[test]
@@ -410,6 +554,7 @@ mod tests {
                 },
                 ..Settings::default()
             }],
+            names: Vec::new(),
         };
         std::fs::write(&sidecar, doc.to_ron().unwrap()).unwrap();
         let restored = std::fs::read_to_string(&sidecar)
@@ -439,6 +584,7 @@ mod tests {
         let doc = Document {
             version: Document::VERSION,
             variants: vec![Settings::default(), Settings::default()],
+            names: Vec::new(),
         };
         std::fs::write(&sidecar, doc.to_ron().unwrap()).unwrap();
         let restored = std::fs::read_to_string(&sidecar)

@@ -5,7 +5,6 @@
 //! with an open session (the welcome state hides it).
 
 use eframe::egui;
-use latent_edit::History;
 
 use crate::gui::app::App;
 use crate::gui::tools::CanvasTool;
@@ -38,18 +37,14 @@ pub(crate) fn show(
 
             ui.label("Variant:");
             for i in 0..session.variants.len() {
-                if ui
-                    .selectable_label(i == session.active, format!("{}", i + 1))
-                    .clicked()
-                {
+                let label = session.variant_label(i);
+                if ui.selectable_label(i == session.active, label).clicked() {
                     session.active = i;
                     *dirty = true;
                 }
             }
             if ui.button("+").on_hover_text("New variant (copy)").clicked() {
-                let copy = session.variants[session.active].current().clone();
-                session.variants.push(History::new(copy));
-                session.active = session.variants.len() - 1;
+                session.duplicate_variant(session.active);
                 *dirty = true;
             }
 

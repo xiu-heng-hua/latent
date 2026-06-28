@@ -980,11 +980,31 @@ impl Geometry {
 /// A saved edit document: a schema version plus one or more variants —
 /// independent edits of the same source image. This is what a sidecar stores.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Document {
     /// Schema version, so the format can evolve compatibly.
     pub version: u32,
     /// One or more independent edits of the source; always at least one.
     pub variants: Vec<Settings>,
+    /// Display names for the variants, parallel to `variants` (`names[i]` names
+    /// `variants[i]`). A name is UI metadata, not develop data, so it lives here
+    /// rather than on `Settings` — keeping the develop settings and their history
+    /// equality untouched. The vector may be shorter than `variants` (or empty): a
+    /// missing or empty entry means "unnamed", and the UI then shows a positional
+    /// fallback. `#[serde(default)]` lets a sidecar written before names existed
+    /// load with this defaulting to empty.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self {
+            version: Self::VERSION,
+            variants: vec![Settings::default()],
+            names: Vec::new(),
+        }
+    }
 }
 
 impl Document {
@@ -1020,15 +1040,6 @@ impl Document {
             variant.sanitize();
         }
         Ok(doc)
-    }
-}
-
-impl Default for Document {
-    fn default() -> Self {
-        Self {
-            version: Self::VERSION,
-            variants: vec![Settings::default()],
-        }
     }
 }
 
@@ -1416,8 +1427,41 @@ mod tests {
         let d = Document {
             version: Document::VERSION,
             variants: vec![Settings::default(), edited],
+            names: Vec::new(),
         };
         assert_eq!(Document::from_ron(&d.to_ron().unwrap()).unwrap(), d);
+    }
+
+    #[test]
+    fn document_names_round_trip_and_old_sidecar_loads() {
+        // Variant names live in a parallel `names` vector on `Document`. A document
+        // carrying names round-trips through RON unchanged.
+        let doc = Document {
+            version: Document::VERSION,
+            variants: vec![Settings::default(), Settings::default()],
+            names: vec!["Portrait".to_owned(), "Black & White".to_owned()],
+        };
+        let back = Document::from_ron(&doc.to_ron().unwrap()).unwrap();
+        assert_eq!(back, doc);
+        assert_eq!(back.names, vec!["Portrait", "Black & White"]);
+
+        // An old sidecar written before `names` existed (no `names` field) still
+        // loads, the field defaulting to empty — so the UI falls back to a
+        // positional label and nothing breaks. `Document::VERSION` is unchanged.
+        let old = "(version: 1, variants: [(global: ()), (global: ())])";
+        let loaded = Document::from_ron(old).expect("a sidecar without names should load");
+        assert_eq!(loaded.variants.len(), 2);
+        assert!(loaded.names.is_empty(), "missing names default to empty");
+
+        // A names vector shorter than variants is allowed (the tail is unnamed) and
+        // survives a round-trip.
+        let ragged = Document {
+            version: Document::VERSION,
+            variants: vec![Settings::default(), Settings::default()],
+            names: vec!["Only the first".to_owned()],
+        };
+        let back = Document::from_ron(&ragged.to_ron().unwrap()).unwrap();
+        assert_eq!(back, ragged);
     }
 
     #[test]
@@ -1771,6 +1815,7 @@ mod tests {
         let doc = Document {
             version: Document::VERSION,
             variants: vec![s.clone()],
+            names: Vec::new(),
         };
         let text = doc.to_ron().expect("serialize");
         let back = Document::from_ron(&text).expect("round-trip");

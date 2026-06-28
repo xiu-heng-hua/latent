@@ -15,10 +15,55 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use latent_edit::Settings;
 use serde::{Deserialize, Serialize};
 
 /// How many recent files to remember. Newest-first, de-duplicated, capped here.
 pub(crate) const RECENT_FILES_CAP: usize = 10;
+
+/// A named develop preset: a reusable *look* stored in the app config (global to
+/// the app, not per-image). It carries only the develop part of a [`Settings`] —
+/// the global and local adjustments — with **geometry excluded**: a crop,
+/// straighten, keystone, lens, or vignette is image-specific and would mis-apply
+/// to a differently-framed image, so a preset never bakes it in. Applying a preset
+/// leaves the target's geometry untouched (see the app's apply path).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Preset {
+    /// The user-chosen preset name (unique within the list; a save under an
+    /// existing name overwrites it).
+    pub(crate) name: String,
+    /// The stored develop settings. Geometry is stripped on save, so this is
+    /// always the identity geometry plus the develop adjustments; only the develop
+    /// part is meaningful and only it is applied.
+    pub(crate) settings: Settings,
+}
+
+impl Preset {
+    /// Build a preset from a variant's current settings, **stripping geometry** so
+    /// only the reusable develop look is stored.
+    pub(crate) fn from_settings(name: String, settings: &Settings) -> Self {
+        Self {
+            name,
+            settings: Settings {
+                global: settings.global.clone(),
+                locals: settings.locals.clone(),
+                geometry: Default::default(),
+            },
+        }
+    }
+}
+
+/// Insert `preset` into the list, replacing any existing preset of the same name
+/// (a save under an existing name overwrites it) and otherwise appending. Pure
+/// over the list so the dedup/overwrite is unit-testable.
+pub(crate) fn upsert_preset(list: &mut Vec<Preset>, preset: Preset) {
+    if let Some(slot) = list.iter_mut().find(|p| p.name == preset.name) {
+        *slot = preset;
+    } else {
+        list.push(preset);
+    }
+}
 
 /// The window theme. A small enum so the surface can grow later; the editor's
 /// tuned dark visuals are the default.
@@ -55,6 +100,9 @@ pub(crate) struct Config {
     /// section key (not the display label, so renaming a header never orphans
     /// saved state). A missing key falls back to the section's own default-open.
     pub(crate) sections_open: BTreeMap<String, bool>,
+    /// Named develop presets, global to the app and reusable across images. An old
+    /// config with no presets loads with an empty list (`#[serde(default)]`).
+    pub(crate) presets: Vec<Preset>,
 }
 
 impl Config {
@@ -177,10 +225,78 @@ mod tests {
                 ("basic".to_owned(), true),
                 ("color".to_owned(), false),
             ]),
+            presets: vec![Preset::from_settings(
+                "Test".to_owned(),
+                &Settings::default(),
+            )],
         };
         let text = cfg.to_ron().expect("serialize");
         let back = Config::from_ron(&text).expect("parse");
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn preset_excludes_geometry_and_round_trips() {
+        use latent_edit::{Adjustments, Crop, Geometry};
+        // A variant with both develop adjustments and geometry; the preset keeps
+        // only the develop part.
+        let settings = Settings {
+            global: Adjustments {
+                exposure: Some(0.7),
+                ..Adjustments::default()
+            },
+            geometry: Geometry {
+                crop: Some(Crop {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.8,
+                    height: 0.8,
+                }),
+                straighten_degrees: 4.0,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        let preset = Preset::from_settings("Look".to_owned(), &settings);
+        // The develop part is kept…
+        assert_eq!(preset.settings.global.exposure, Some(0.7));
+        // …but geometry is stripped to the identity (excluded from the preset).
+        assert!(preset.settings.geometry.is_identity());
+
+        // A config carrying the preset round-trips through RON unchanged.
+        let cfg = Config {
+            presets: vec![preset.clone()],
+            ..Config::default()
+        };
+        let back = Config::from_ron(&cfg.to_ron().unwrap()).unwrap();
+        assert_eq!(back.presets, vec![preset]);
+
+        // An old config with no presets loads with an empty list.
+        let old = "(window_size: Some((800.0, 600.0)))";
+        let loaded = Config::from_ron(old).expect("old config should load");
+        assert!(loaded.presets.is_empty());
+    }
+
+    #[test]
+    fn upsert_preset_overwrites_same_name() {
+        // Saving under an existing name replaces it; a new name appends.
+        let mut list = Vec::new();
+        upsert_preset(
+            &mut list,
+            Preset::from_settings("A".to_owned(), &Settings::default()),
+        );
+        upsert_preset(
+            &mut list,
+            Preset::from_settings("B".to_owned(), &Settings::default()),
+        );
+        assert_eq!(list.len(), 2);
+        // Overwrite "A" with a different settings value.
+        let mut tweaked = Settings::default();
+        tweaked.global.exposure = Some(2.0);
+        upsert_preset(&mut list, Preset::from_settings("A".to_owned(), &tweaked));
+        assert_eq!(list.len(), 2, "same name does not duplicate");
+        let a = list.iter().find(|p| p.name == "A").unwrap();
+        assert_eq!(a.settings.global.exposure, Some(2.0));
     }
 
     #[test]

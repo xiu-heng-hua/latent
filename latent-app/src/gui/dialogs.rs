@@ -14,78 +14,13 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use latent_export::Depth;
 
-/// One keyboard shortcut for the cheat-sheet: the key combination and what it
-/// does. Plain data so the table is the single source of truth and a test can
-/// assert the modal renders exactly the rows registered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Shortcut {
-    /// The printable key combination, e.g. `"Cmd/Ctrl + Z"`.
-    pub(crate) keys: &'static str,
-    /// What the shortcut does.
-    pub(crate) action: &'static str,
-}
+use crate::gui::shortcuts;
 
-/// The current keyboard shortcuts, rendered in the cheat-sheet. This is the one
-/// place the bindings are listed; the handlers in `app` implement them, and this
-/// table describes them, so the two are kept in step here.
-///
-/// Planned: more rows are added as further bindings land; the full set is owned
-/// by a later pass over the keyboard map. Keep this the single registry the modal
-/// reads, not a hardcoded list inside the modal.
-pub(crate) const SHORTCUTS: &[Shortcut] = &[
-    Shortcut {
-        keys: "Cmd/Ctrl + O",
-        action: "Open a RAW file",
-    },
-    Shortcut {
-        keys: "Cmd/Ctrl + Z",
-        action: "Undo",
-    },
-    Shortcut {
-        keys: "Cmd/Ctrl + Shift + Z  /  Cmd/Ctrl + Y",
-        action: "Redo",
-    },
-    Shortcut {
-        keys: "0",
-        action: "Zoom to fit",
-    },
-    Shortcut {
-        keys: "1",
-        action: "Zoom to 100%",
-    },
-    Shortcut {
-        keys: "+  /  −",
-        action: "Zoom in / out",
-    },
-    Shortcut {
-        keys: "`",
-        action: "Cycle before / after view",
-    },
-    Shortcut {
-        keys: "[  /  ]",
-        action: "Brush smaller / larger (Shift for feather)",
-    },
-    Shortcut {
-        keys: "Tab",
-        action: "Hide / show the controls panel",
-    },
-    Shortcut {
-        keys: "?",
-        action: "Show this shortcut list",
-    },
-];
-
-/// Render the rows the cheat-sheet shows from a shortcut table, as `(keys,
-/// action)` pairs. Pure over the table so the row set is testable without a
-/// window (the modal painting itself is display-driven).
-pub(crate) fn shortcut_rows(table: &[Shortcut]) -> Vec<(&'static str, &'static str)> {
-    table.iter().map(|s| (s.keys, s.action)).collect()
-}
-
-/// Show the shortcuts cheat-sheet modal when `open` is set, rendering every row
-/// of the [`SHORTCUTS`] registry. Closes on `Esc`, a click on the backdrop, or
-/// the Close button, clearing `open`. The `?` key that opens it is handled in
-/// `app` (guarded against text-field focus).
+/// Show the shortcuts cheat-sheet modal when `open` is set, rendering every row of
+/// the single [`shortcuts::SHORTCUTS`] table (so the help is generated from the
+/// same list the input handler dispatches from). Closes on `Esc`, a click on the
+/// backdrop, or the Close button, clearing `open`. The `?` key that opens it is
+/// dispatched in `app` (guarded against text-field focus).
 pub(crate) fn show_shortcuts(ctx: &egui::Context, open: &mut bool) {
     if !*open {
         return;
@@ -99,7 +34,7 @@ pub(crate) fn show_shortcuts(ctx: &egui::Context, open: &mut bool) {
             .spacing([16.0, 6.0])
             .striped(true)
             .show(ui, |ui| {
-                for (keys, action) in shortcut_rows(SHORTCUTS) {
+                for (keys, action) in shortcuts::cheat_sheet_rows() {
                     ui.monospace(keys);
                     ui.label(action);
                     ui.end_row();
@@ -298,29 +233,6 @@ impl ExportSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shortcut_registry_lists_registered() {
-        // The modal renders rows straight from the registry (not a hardcoded
-        // list), so the rendered set equals the table. At minimum it includes
-        // undo/redo and the panel toggle.
-        let rows = shortcut_rows(SHORTCUTS);
-        assert_eq!(rows.len(), SHORTCUTS.len());
-        let actions: Vec<&str> = rows.iter().map(|(_, a)| *a).collect();
-        assert!(actions.contains(&"Undo"));
-        assert!(actions.contains(&"Redo"));
-        assert!(actions.contains(&"Hide / show the controls panel"));
-        // Adding a row to the table flows through to the rendered rows.
-        let extended = [
-            SHORTCUTS,
-            &[Shortcut {
-                keys: "X",
-                action: "Test row",
-            }],
-        ]
-        .concat();
-        assert_eq!(shortcut_rows(&extended).len(), SHORTCUTS.len() + 1);
-    }
 
     #[test]
     fn format_from_path_routes_by_extension() {

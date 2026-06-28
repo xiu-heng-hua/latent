@@ -45,12 +45,32 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
         .width_range(theme::SIDE_PANEL_MIN_WIDTH..=theme::SIDE_PANEL_MAX_WIDTH)
         .frame(frame)
         .show(ctx, |ui| {
-            let sections_open = &app.config.sections_open;
-            let session = app.session.as_mut().expect("session present");
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // The scopes sit at the top of the panel, above the develop
-                // sections. They only paint the cached bins/overlay (computed once
-                // per preview), so this never re-renders.
+                // Variant manager, history, and presets sit at the top of the panel.
+                // They take `&mut App`, so they are rendered before the session is
+                // borrowed for the develop sections below.
+                egui::CollapsingHeader::new("Variants")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        dirty |= crate::gui::panels::variants::show(app, ui);
+                    });
+                egui::CollapsingHeader::new("History")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        dirty |= crate::gui::panels::history::show(app, ui);
+                    });
+                egui::CollapsingHeader::new("Presets")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        dirty |= crate::gui::panels::presets::show(app, ui);
+                    });
+                ui.separator();
+
+                let sections_open = &app.config.sections_open;
+                let session = app.session.as_mut().expect("session present");
+                // The scopes sit above the develop sections. They only paint the
+                // cached bins/overlay (computed once per preview), so this never
+                // re-renders.
                 scopes::scope_block(ui, &mut session.scopes);
                 ui.separator();
 

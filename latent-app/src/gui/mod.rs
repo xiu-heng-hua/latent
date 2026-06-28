@@ -10,12 +10,13 @@ mod dialogs;
 mod icons;
 mod panels;
 mod scopes;
+mod shortcuts;
 mod state;
 mod theme;
 mod tools;
 mod widgets;
 
-pub use app::{BackendKind, run};
+pub use app::{run, select_backend};
 
 /// Load the persisted application config from the OS config dir (or defaults on a
 /// missing/corrupt file). The composition root calls this before [`run`].

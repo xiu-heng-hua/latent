@@ -6,11 +6,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use gui::BackendKind;
-use latent_cpu::CpuBackend;
 use latent_image::ImageBuf;
 use latent_image::{Orientation, color};
-use latent_pipeline::Backend;
 
 /// A small, readable RAW developer.
 ///
@@ -69,23 +66,6 @@ enum Command {
         #[arg(long)]
         gpu: bool,
     },
-}
-
-/// Pick a rendering backend at the application's composition root. With `--gpu`,
-/// try the GPU backend and fall back to the CPU one if no device is available;
-/// otherwise use the CPU backend (the complete, always-available reference).
-/// Returns the backend and which kind it is, so the editor can show it.
-fn select_backend(use_gpu: bool) -> (Box<dyn Backend>, BackendKind) {
-    if use_gpu {
-        match latent_gpu::GpuBackend::new() {
-            Ok(gpu) => {
-                eprintln!("using GPU backend");
-                return (Box::new(gpu), BackendKind::Gpu);
-            }
-            Err(e) => eprintln!("GPU unavailable ({e}); using CPU backend"),
-        }
-    }
-    (Box::new(CpuBackend), BackendKind::Cpu)
 }
 
 /// Decode and develop a RAW into a linear working image: normalize, white
@@ -152,7 +132,7 @@ fn main() {
 fn open_editor(input: Option<&Path>, gpu: Option<bool>) -> Result<(), Box<dyn Error>> {
     let config = gui::config_load();
     let use_gpu = gpu.unwrap_or(config.gpu);
-    let (backend, kind) = select_backend(use_gpu);
+    let (backend, kind) = gui::select_backend(use_gpu);
     gui::run(input, backend, kind, config)
 }
 

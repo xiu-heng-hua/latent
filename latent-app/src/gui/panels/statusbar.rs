@@ -6,7 +6,7 @@
 use eframe::egui;
 use egui::RichText;
 
-use crate::gui::app::{App, BackendKind};
+use crate::gui::app::App;
 
 /// Show the status bar.
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
@@ -46,12 +46,16 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 ui.separator();
             }
 
-            // Active backend (CPU/GPU), threaded from `select_backend`.
-            let backend = match app.backend_kind {
-                BackendKind::Cpu => "CPU",
-                BackendKind::Gpu => "GPU",
+            // Active backend (CPU/GPU): the one actually rendering, reflecting any
+            // GPU→CPU fallback, with a hint that a switch is in flight.
+            let backend = app.backend_kind.label();
+            let label = if app.pending_backend.is_some() {
+                format!("{backend} (switching…)")
+            } else {
+                backend.to_owned()
             };
-            ui.label(RichText::new(backend).monospace());
+            ui.label(RichText::new(label).monospace())
+                .on_hover_text("Active rendering backend");
             ui.separator();
 
             // Render / autosave state.

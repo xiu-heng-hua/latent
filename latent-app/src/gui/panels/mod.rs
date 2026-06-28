@@ -3,8 +3,11 @@
 //! them in declaration order, with the central canvas added last.
 
 pub(crate) mod controls;
+pub(crate) mod history;
 pub(crate) mod menubar;
+pub(crate) mod presets;
 pub(crate) mod sections;
 pub(crate) mod statusbar;
 pub(crate) mod toolbar;
+pub(crate) mod variants;
 pub(crate) mod welcome;

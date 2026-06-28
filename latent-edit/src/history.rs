@@ -117,6 +117,63 @@ impl<T: Clone + PartialEq> History<T> {
         !self.redo.is_empty()
     }
 
+    /// How many steps are behind the current state (the number of `undo`s
+    /// available). Reading the `undo` stack directly, so it stays in lockstep with
+    /// the bounded-eviction and redo-clear invariants without any extra state.
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// How many steps are ahead of the current state (the number of `redo`s
+    /// available).
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
+    /// The total number of navigable positions: every retained step plus the
+    /// current one. A position index runs `0..len()`, where `undo_len()` is the
+    /// current position (the steps behind it).
+    pub fn len(&self) -> usize {
+        self.undo.len() + self.redo.len() + 1
+    }
+
+    /// Whether the history holds only the current state (no steps either way).
+    /// Present so a `len()` accessor has its conventional companion.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 1
+    }
+
+    /// The current position along the `0..len()` timeline — equivalently the number
+    /// of steps behind the current state.
+    pub fn position(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Navigate to `target` along the `0..len()` timeline, running as many `undo`s
+    /// or `redo`s as needed to land there. Built purely on the existing single-step
+    /// `undo`/`redo`, so the bounded-undo and redo-clear-on-commit invariants are
+    /// untouched and no new failure mode is introduced. An out-of-range `target` is
+    /// clamped into the valid range. Returns whether the position actually moved
+    /// (so the caller can gate a re-render).
+    #[must_use]
+    pub fn jump_to(&mut self, target: usize) -> bool {
+        let target = target.min(self.len().saturating_sub(1));
+        let mut moved = false;
+        while self.position() > target {
+            if !self.undo() {
+                break;
+            }
+            moved = true;
+        }
+        while self.position() < target {
+            if !self.redo() {
+                break;
+            }
+            moved = true;
+        }
+        moved
+    }
+
     /// True when no edit gesture is in progress (nothing pending a commit).
     /// Used to auto-save only after a gesture completes, not mid-drag.
     pub fn is_idle(&self) -> bool {
@@ -222,6 +279,78 @@ mod tests {
         assert!(floored.undo());
         assert_eq!(*floored.current(), 1);
         assert!(!floored.undo(), "only one step retained at the floored cap");
+    }
+
+    #[test]
+    fn history_reports_len_and_position() {
+        // A fresh history holds only the current state: one position, at index 0.
+        let mut h = History::new(0);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.position(), 0);
+        assert_eq!(h.undo_len(), 0);
+        assert_eq!(h.redo_len(), 0);
+        assert!(h.is_empty());
+
+        // Two committed edits: three navigable positions, currently at the newest.
+        edit(&mut h, 1);
+        edit(&mut h, 2);
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.position(), 2);
+        assert_eq!(h.undo_len(), 2);
+        assert_eq!(h.redo_len(), 0);
+        assert!(!h.is_empty());
+
+        // Undoing once moves the position back and shifts a step onto the redo side;
+        // the total length is conserved.
+        assert!(h.undo());
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.position(), 1);
+        assert_eq!(h.undo_len(), 1);
+        assert_eq!(h.redo_len(), 1);
+    }
+
+    #[test]
+    fn history_jumps_to_an_arbitrary_step() {
+        // Build a five-position timeline (current + four edits).
+        let mut h = History::new(0);
+        for v in 1..=4 {
+            edit(&mut h, v);
+        }
+        assert_eq!(h.len(), 5);
+        assert_eq!(h.position(), 4);
+        assert_eq!(*h.current(), 4);
+
+        // Jumping back N then forward M must land on the same state as N undos
+        // followed by M redos. Here: jump to index 1 (three undos), then to index 3
+        // (two redos).
+        let mut manual = h.clone();
+        for _ in 0..3 {
+            assert!(manual.undo());
+        }
+        for _ in 0..2 {
+            assert!(manual.redo());
+        }
+
+        assert!(h.jump_to(1));
+        assert_eq!(h.position(), 1);
+        assert_eq!(*h.current(), 1);
+        assert!(h.jump_to(3));
+        assert_eq!(h.position(), 3);
+        assert_eq!(*h.current(), 3);
+        // The jump path converges with the explicit undo/redo path.
+        assert_eq!(h.current(), manual.current());
+        assert_eq!(h.position(), manual.position());
+
+        // Jumping to the current position is a no-op (no movement reported).
+        assert!(!h.jump_to(3));
+        // An out-of-range target is clamped to the last position.
+        assert!(h.jump_to(999));
+        assert_eq!(h.position(), 4);
+        assert_eq!(*h.current(), 4);
+        // Jumping all the way back to the origin.
+        assert!(h.jump_to(0));
+        assert_eq!(h.position(), 0);
+        assert_eq!(*h.current(), 0);
     }
 
     #[test]

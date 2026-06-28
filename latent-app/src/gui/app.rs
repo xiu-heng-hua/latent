@@ -61,13 +61,55 @@ impl BeforeAfter {
 /// during editing; export uses the full-resolution image.
 pub(crate) const PREVIEW_MAX_DIM: u32 = 1600;
 
+/// Longest side of a variant thumbnail, in pixels. Tiny, so rendering one is
+/// cheap and a list of them never starves the live preview.
+pub(crate) const THUMB_MAX_DIM: u32 = 96;
+
+/// A cached variant thumbnail: the uploaded texture plus the settings it was
+/// rendered for, so an unchanged variant is not re-rendered and a changed one is
+/// invalidated by comparing the stored settings against the variant's current.
+pub(crate) struct VariantThumb {
+    pub(crate) texture: egui::TextureHandle,
+    /// The settings the thumbnail was rendered from; the cache is valid only while
+    /// this equals the variant's current settings.
+    pub(crate) rendered_for: Settings,
+}
+
 /// Which rendering backend is active, surfaced in the status bar. Threaded from
 /// the composition root (`select_backend`) since the `Arc<dyn Backend>` itself
-/// doesn't carry its kind. A future live backend toggle can reuse this.
+/// doesn't carry its kind. The live backend toggle reuses this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Cpu,
     Gpu,
+}
+
+impl BackendKind {
+    /// The label shown in the status bar.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            BackendKind::Cpu => "CPU",
+            BackendKind::Gpu => "GPU",
+        }
+    }
+}
+
+/// Pick a rendering backend. With `use_gpu`, try the GPU backend and fall back to
+/// the CPU one if no device is available; otherwise use the always-available CPU
+/// backend. Returns the backend and which kind it actually is (so a caller that
+/// requested GPU can tell whether it fell back). Shared by the launch path and the
+/// in-app toggle so both build the backend the exact same way.
+pub fn select_backend(use_gpu: bool) -> (Box<dyn Backend>, BackendKind) {
+    if use_gpu {
+        match latent_gpu::GpuBackend::new() {
+            Ok(gpu) => {
+                eprintln!("using GPU backend");
+                return (Box::new(gpu), BackendKind::Gpu);
+            }
+            Err(e) => eprintln!("GPU unavailable ({e}); using CPU backend"),
+        }
+    }
+    (Box::new(latent_cpu::CpuBackend), BackendKind::Cpu)
 }
 
 /// One opened RAW: the developed working bases, the per-variant edit histories,
@@ -81,14 +123,25 @@ pub(crate) struct Session {
     pub(crate) full: Arc<ImageBuf>,
     /// Downscaled working base, rendered over for the live preview.
     pub(crate) preview: Arc<ImageBuf>,
+    /// A very small working base, rendered over for the variant thumbnails (so a
+    /// thumbnail render is trivially cheap and never contends with the preview).
+    pub(crate) thumb_base: Arc<ImageBuf>,
     /// One independent edit history per variant; never empty.
     pub(crate) variants: Vec<History<Settings>>,
+    /// Display names for the variants, parallel to `variants`. An empty entry is
+    /// "unnamed" and the UI shows "Variant N" instead.
+    pub(crate) names: Vec<String>,
+    /// Cached tiny thumbnail per variant, parallel to `variants`. `None` until
+    /// rendered; invalidated (set back to `None`) when a variant's settings change.
+    pub(crate) thumbs: Vec<Option<VariantThumb>>,
     /// Index of the variant currently being edited and previewed.
     pub(crate) active: usize,
     /// Sidecar path (`<raw>.ron`) the document auto-saves to.
     pub(crate) sidecar: PathBuf,
     /// Last variants written to the sidecar, to avoid redundant writes.
     pub(crate) saved: Vec<Settings>,
+    /// Last variant names written to the sidecar, so a rename autosaves.
+    pub(crate) saved_names: Vec<String>,
     /// Window title (`<filename> — latent`).
     pub(crate) title: String,
     /// Full input path, surfaced on hover (the title shows only the basename).
@@ -163,13 +216,19 @@ impl Session {
     fn from_data(data: SessionData) -> Self {
         let export =
             ExportSettings::for_path(Path::new(&data.output), ExportSettings::default().quality);
+        let thumb_base = Arc::new(data.preview.downscaled(THUMB_MAX_DIM));
+        let variant_count = data.variants.len();
         Self {
             full: data.full,
             preview: data.preview,
+            thumb_base,
             variants: data.variants,
+            names: data.names,
+            thumbs: (0..variant_count).map(|_| None).collect(),
             active: 0,
             sidecar: data.sidecar,
             saved: data.saved,
+            saved_names: data.saved_names,
             title: data.title,
             path: data.path,
             output: data.output,
@@ -224,7 +283,8 @@ impl Session {
             .unwrap_or(1.0)
     }
 
-    /// Whether every variant equals what's on disk (no unsaved edits).
+    /// Whether every variant (and its name) equals what's on disk — no unsaved
+    /// edits or renames.
     pub(crate) fn is_saved(&self) -> bool {
         self.variants.len() == self.saved.len()
             && self
@@ -232,6 +292,65 @@ impl Session {
                 .iter()
                 .zip(&self.saved)
                 .all(|(h, s)| h.current() == s)
+            && self.names == self.saved_names
+    }
+
+    /// The display name for variant `i`: its stored name, or a positional
+    /// "Variant N" fallback when unnamed.
+    pub(crate) fn variant_label(&self, i: usize) -> String {
+        match self.names.get(i) {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => format!("Variant {}", i + 1),
+        }
+    }
+
+    /// Duplicate variant `i`: a fresh history seeded with its current settings, a
+    /// copied name (suffixed " copy"), and an empty thumbnail slot, inserted right
+    /// after it and selected. A UI-state mutation (not a `Settings` edit), so it
+    /// does not go through `History`; it is persisted by autosave.
+    pub(crate) fn duplicate_variant(&mut self, i: usize) {
+        let copy = self.variants[i].current().clone();
+        let base_name = self.variant_label(i);
+        let new = (i + 1).min(self.variants.len());
+        self.variants.insert(new, History::new(copy));
+        self.names.insert(new, format!("{base_name} copy"));
+        self.thumbs.insert(new, None);
+        self.active = new;
+    }
+
+    /// Delete variant `i`, keeping at least one variant (deleting the last is
+    /// refused). Returns whether a variant was removed. Clamps `active` to follow.
+    pub(crate) fn delete_variant(&mut self, i: usize) -> bool {
+        if self.variants.len() <= 1 || i >= self.variants.len() {
+            return false;
+        }
+        self.variants.remove(i);
+        self.names.remove(i);
+        self.thumbs.remove(i);
+        super::state::clamp_selection(&mut self.active, self.variants.len());
+        true
+    }
+
+    /// Move variant `i` by `delta` (`-1` up, `+1` down), carrying its name and
+    /// cached thumbnail in lockstep and re-pointing `active` to follow the moved
+    /// item. Returns whether anything moved. A UI-state mutation, persisted by
+    /// autosave.
+    pub(crate) fn move_variant(&mut self, i: usize, delta: isize) -> bool {
+        let len = self.variants.len() as isize;
+        let j = i as isize + delta;
+        if i >= self.variants.len() || j < 0 || j >= len {
+            return false;
+        }
+        let j = j as usize;
+        self.variants.swap(i, j);
+        self.names.swap(i, j);
+        self.thumbs.swap(i, j);
+        if self.active == i {
+            self.active = j;
+        } else if self.active == j {
+            self.active = i;
+        }
+        true
     }
 }
 
@@ -287,6 +406,9 @@ pub fn run(
                 pending_load: false,
                 panel_visible: true,
                 shortcuts_open: false,
+                pending_backend: None,
+                clipboard: None,
+                preset_name_input: String::new(),
             };
             // Kick off the first file's develop on the worker (off the UI thread),
             // so the window paints immediately and the image arrives when ready.
@@ -347,6 +469,18 @@ pub struct App {
     pub(crate) panel_visible: bool,
     /// Whether the keyboard-shortcuts cheat-sheet modal is open (toggled with `?`).
     pub(crate) shortcuts_open: bool,
+    /// A requested backend switch (the desired GPU on/off) that could not be
+    /// applied immediately because a render was in flight. Consumed in
+    /// [`Self::poll_render`] once the worker goes idle, so the in-flight render
+    /// always finishes on the backend it started with. `None` when no switch is
+    /// pending.
+    pub(crate) pending_backend: Option<bool>,
+    /// The develop-settings clipboard: the last copied variant settings, applied by
+    /// Paste. Process-local UI state — not the OS clipboard, not persisted.
+    pub(crate) clipboard: Option<Settings>,
+    /// The in-progress preset name being typed in the presets block. Held here so
+    /// the field keeps its text across frames; cleared after a save.
+    pub(crate) preset_name_input: String,
 }
 
 impl App {
@@ -637,8 +771,15 @@ impl App {
                         }
                     }
                 }
-                // A request that arrived mid-render coalesced to one; run it now.
-                if std::mem::take(&mut self.render.pending) {
+                // The worker is now idle. A backend switch deferred while it ran is
+                // safe to apply here, before any coalesced re-render is spawned, so
+                // the next render uses the new backend. The swap itself triggers a
+                // re-render, which also satisfies a coalesced request.
+                if self.pending_backend.is_some() {
+                    self.render.pending = false;
+                    self.apply_pending_backend(ctx);
+                } else if std::mem::take(&mut self.render.pending) {
+                    // A request that arrived mid-render coalesced to one; run it now.
                     self.render_preview(ctx);
                 }
             }
@@ -666,16 +807,21 @@ impl App {
             .iter()
             .map(|h| h.current().clone())
             .collect();
-        if current == session.saved {
+        if current == session.saved && session.names == session.saved_names {
             return;
         }
+        let names = session.names.clone();
         let doc = Document {
             version: Document::VERSION,
             variants: current.clone(),
+            names: names.clone(),
         };
         match doc.to_ron() {
             Ok(text) => match config::atomic_write(&session.sidecar, &text) {
-                Ok(()) => session.saved = current,
+                Ok(()) => {
+                    session.saved = current;
+                    session.saved_names = names;
+                }
                 Err(e) => self.status = format!("Save failed: {e}"),
             },
             Err(e) => self.status = format!("Serialize failed: {e}"),
@@ -716,120 +862,161 @@ impl App {
         (scale * 100.0).round().max(1.0) as u32
     }
 
-    /// Apply the view keyboard shortcuts: `+`/`=` zoom in, `−` zoom out, `0` fit,
-    /// `1` 100%, `` ` `` cycle the before/after view. Skipped while a panel widget
-    /// wants keyboard input, and with no session.
-    fn handle_view_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() || self.session.is_none() {
-            return;
+    /// Dispatch the keyboard shortcuts for this frame from the single
+    /// [`shortcuts`](super::shortcuts) table: the dispatcher and the cheat-sheet
+    /// read the same list. Each fired binding is applied through the same `App`
+    /// method its button/menu uses, so a shortcut and a click never diverge.
+    /// Bare-letter bindings are suppressed while a text field / numeric entry /
+    /// name field holds keyboard focus (so typing a name never switches tools);
+    /// command-modified bindings stay live. Returns whether the preview is now
+    /// dirty (a paste/reset/undo/redo changed the settings).
+    fn dispatch_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        // A focused text widget (a TextEdit / DragValue being typed into) gates the
+        // bare bindings; this is the load-bearing typing-collision guard.
+        let focused = ctx.memory(|m| m.focused()).is_some();
+        let actions = ctx.input(|i| super::shortcuts::fired_actions(i, focused));
+        // The brush feather modifier is a live read at apply time (Shift+`[`).
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let mut dirty = false;
+        for action in actions {
+            dirty |= self.apply_action(action, shift, ctx);
         }
-        let mut zoom_in = false;
-        let mut zoom_out = false;
-        let mut fit = false;
-        let mut actual = false;
-        let mut cycle_before = false;
-        ctx.input(|i| {
-            // Don't collide with Cmd/Ctrl shortcuts (undo/redo etc.).
-            if i.modifiers.command {
-                return;
+        dirty
+    }
+
+    /// Apply one shortcut [`Action`](super::shortcuts::Action), returning whether it
+    /// dirtied the preview. The single place a shortcut turns into behavior — every
+    /// arm calls the same method the matching button/menu calls.
+    fn apply_action(
+        &mut self,
+        action: super::shortcuts::Action,
+        shift: bool,
+        ctx: &egui::Context,
+    ) -> bool {
+        use super::shortcuts::Action;
+        match action {
+            Action::Open => {
+                self.open_via_dialog(ctx);
+                false
             }
-            zoom_in = i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals);
-            zoom_out = i.key_pressed(egui::Key::Minus);
-            fit = i.key_pressed(egui::Key::Num0);
-            actual = i.key_pressed(egui::Key::Num1);
-            cycle_before = i.key_pressed(egui::Key::Backtick);
-        });
-        if zoom_in {
-            self.zoom_step(1);
-        }
-        if zoom_out {
-            self.zoom_step(-1);
-        }
-        if fit {
-            self.zoom_fit();
-        }
-        if actual {
-            self.zoom_actual();
-        }
-        if cycle_before && let Some(session) = &mut self.session {
-            session.before = session.before.cycled();
-            ctx.request_repaint();
+            Action::Export => {
+                self.export_via_dialog(ctx);
+                false
+            }
+            Action::Undo => self
+                .session
+                .as_mut()
+                .is_some_and(|s| s.active_history().undo()),
+            Action::Redo => self
+                .session
+                .as_mut()
+                .is_some_and(|s| s.active_history().redo()),
+            Action::Copy => {
+                self.copy_settings();
+                false
+            }
+            Action::Paste => self.paste_settings(),
+            Action::ResetAll => self.reset_all_develop(),
+            Action::ZoomFit => {
+                self.zoom_fit();
+                false
+            }
+            Action::ZoomActual => {
+                self.zoom_actual();
+                false
+            }
+            Action::ZoomIn => {
+                self.zoom_step(1);
+                false
+            }
+            Action::ZoomOut => {
+                self.zoom_step(-1);
+                false
+            }
+            Action::BeforeAfter => {
+                if let Some(session) = &mut self.session {
+                    session.before = session.before.cycled();
+                }
+                false
+            }
+            Action::TogglePanel => {
+                self.panel_visible = !self.panel_visible;
+                false
+            }
+            Action::ToggleHelp => {
+                self.shortcuts_open = !self.shortcuts_open;
+                false
+            }
+            Action::BrushSmaller => {
+                self.nudge_brush(1.0 / super::tools::BRUSH_KEY_STEP, shift);
+                false
+            }
+            Action::BrushLarger => {
+                self.nudge_brush(super::tools::BRUSH_KEY_STEP, shift);
+                false
+            }
+            Action::NextVariant => {
+                self.cycle_variant(1);
+                false
+            }
+            Action::PrevVariant => {
+                self.cycle_variant(-1);
+                false
+            }
+            Action::ToolCrop => {
+                self.select_tool(CanvasTool::Crop);
+                false
+            }
+            Action::ToolBrush => {
+                self.select_tool(CanvasTool::Brush);
+                false
+            }
         }
     }
 
-    /// The brush keyboard shortcuts: `[` / `]` shrink/grow the brush radius, and
-    /// the same with Shift for the feather. Only under the Brush tool, with a
-    /// session, and skipped while a panel widget wants the keyboard.
-    fn handle_brush_shortcuts(&mut self, ctx: &egui::Context) {
-        let Some(session) = &mut self.session else {
-            return;
-        };
-        if session.tool != CanvasTool::Brush || ctx.wants_keyboard_input() {
-            return;
+    /// Toggle the active on-canvas `tool` (re-selecting the current one returns to
+    /// the pure-view tool), matching the toolbar's selectable behavior. No-op
+    /// without a session.
+    fn select_tool(&mut self, tool: CanvasTool) {
+        if let Some(session) = &mut self.session {
+            session.tool = if session.tool == tool {
+                CanvasTool::None
+            } else {
+                tool
+            };
         }
-        let (mut shrink, mut grow, mut shift) = (false, false, false);
-        ctx.input(|i| {
-            if i.modifiers.command {
-                return;
+    }
+
+    /// Cycle the active variant by `delta` (`+1` next, `-1` previous), wrapping.
+    /// No-op without a session or with a single variant.
+    fn cycle_variant(&mut self, delta: isize) {
+        if let Some(session) = &mut self.session {
+            let len = session.variants.len();
+            if len > 1 {
+                let next = (session.active as isize + delta).rem_euclid(len as isize) as usize;
+                session.active = next;
             }
-            shift = i.modifiers.shift;
-            shrink = i.key_pressed(egui::Key::OpenBracket);
-            grow = i.key_pressed(egui::Key::CloseBracket);
-        });
-        let step = if shrink {
-            Some(1.0 / super::tools::BRUSH_KEY_STEP)
-        } else if grow {
-            Some(super::tools::BRUSH_KEY_STEP)
-        } else {
-            None
-        };
-        if let Some(k) = step {
+        }
+    }
+
+    /// Scale the brush radius (or, with `shift`, the feather) by `factor`, clamped
+    /// to the brush range — the `[` / `]` (and `Shift+[`/`]`) behavior, only under
+    /// the Brush tool.
+    fn nudge_brush(&mut self, factor: f32, shift: bool) {
+        if let Some(session) = &mut self.session
+            && session.tool == CanvasTool::Brush
+        {
             if shift {
-                session.brush_feather =
-                    super::tools::scaled_clamped(session.brush_feather.max(0.005), k, 0.0, 0.5);
+                session.brush_feather = super::tools::scaled_clamped(
+                    session.brush_feather.max(0.005),
+                    factor,
+                    0.0,
+                    0.5,
+                );
             } else {
                 session.brush_radius =
-                    super::tools::scaled_clamped(session.brush_radius, k, 0.01, 0.5);
+                    super::tools::scaled_clamped(session.brush_radius, factor, 0.01, 0.5);
             }
-            ctx.request_repaint();
-        }
-    }
-
-    /// Apply the open shortcut (`Cmd`/`Ctrl`+O), opening the native picker. Guards
-    /// against re-entrancy while a load is in flight.
-    fn handle_open_shortcut(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
-            return;
-        }
-        let open = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
-        if open {
-            self.open_via_dialog(ctx);
-        }
-    }
-
-    /// `Tab` hides/shows the controls panel, `?` opens the shortcuts cheat-sheet.
-    /// Both are guarded against a focused text field: `Tab` is egui's focus-cycling
-    /// key and `?` would otherwise pop the modal while typing into the export path
-    /// or a numeric entry, so neither fires while any widget holds keyboard focus.
-    fn handle_panel_shortcuts(&mut self, ctx: &egui::Context) {
-        // A held keyboard focus (a text edit / DragValue being typed into) blocks
-        // both, so Tab still cycles focus and `?` types a literal character there.
-        if ctx.memory(|m| m.focused()).is_some() {
-            return;
-        }
-        let (mut toggle_panel, mut toggle_help) = (false, false);
-        ctx.input(|i| {
-            if i.modifiers.command {
-                return;
-            }
-            toggle_panel = i.key_pressed(egui::Key::Tab);
-            toggle_help = i.key_pressed(egui::Key::Questionmark);
-        });
-        if toggle_panel {
-            self.panel_visible = !self.panel_visible;
-        }
-        if toggle_help {
-            self.shortcuts_open = !self.shortcuts_open;
         }
     }
 
@@ -864,6 +1051,153 @@ impl App {
                 history.commit();
                 true
             }
+        }
+    }
+
+    /// Whether the GPU backend is currently the active one.
+    pub(crate) fn gpu_active(&self) -> bool {
+        self.backend_kind == BackendKind::Gpu
+    }
+
+    /// Copy the active variant's settings into the in-app clipboard. Process-local
+    /// UI state — not the OS clipboard, not persisted. A no-op with no session.
+    pub(crate) fn copy_settings(&mut self) {
+        if let Some(session) = &self.session {
+            self.clipboard = Some(session.variants[session.active].current().clone());
+        }
+    }
+
+    /// Whether a Paste is available (the clipboard holds settings and a session is
+    /// open).
+    pub(crate) fn can_paste(&self) -> bool {
+        self.clipboard.is_some() && self.session.is_some()
+    }
+
+    /// Apply the clipboard's **develop** settings onto the active variant, keeping
+    /// the target's geometry, as **one** undo step. Pasting settings identical to
+    /// the target records no step (the History `prev != current` guard). Returns
+    /// whether the preview is now dirty.
+    pub(crate) fn paste_settings(&mut self) -> bool {
+        let Some(clip) = self.clipboard.clone() else {
+            return false;
+        };
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        let history = &mut session.variants[session.active];
+        let merged = super::state::merge_develop(history.current(), &clip);
+        history.begin();
+        *history.current_mut() = merged;
+        history.commit();
+        true
+    }
+
+    /// Reset the active variant's develop settings to neutral, keeping its
+    /// geometry, as **one** undo step. Returns whether the preview is now dirty.
+    pub(crate) fn reset_all_develop(&mut self) -> bool {
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        let history = &mut session.variants[session.active];
+        let reset = super::state::reset_develop(history.current());
+        history.begin();
+        *history.current_mut() = reset;
+        history.commit();
+        true
+    }
+
+    /// Apply a develop preset's settings onto the active variant, keeping the
+    /// target's geometry, as **one** undo step (sharing the paste path). The
+    /// preset's settings are sanitized first, since a hand-edited config is
+    /// untrusted. Returns whether the preview is now dirty.
+    pub(crate) fn apply_preset(&mut self, preset: &config::Preset) -> bool {
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        let mut clean = preset.settings.clone();
+        clean.sanitize();
+        let history = &mut session.variants[session.active];
+        let merged = super::state::merge_develop(history.current(), &clean);
+        history.begin();
+        *history.current_mut() = merged;
+        history.commit();
+        true
+    }
+
+    /// Save the active variant's current develop settings as a named preset in the
+    /// app config (geometry stripped, since a preset is a reusable *look*) and
+    /// persist. A no-op with no session or an empty name.
+    pub(crate) fn save_preset(&mut self, name: String) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let settings = session.variants[session.active].current();
+        let preset = config::Preset::from_settings(name, settings);
+        config::upsert_preset(&mut self.config.presets, preset);
+        self.save_config();
+    }
+
+    /// Request a switch to the GPU (`true`) or CPU (`false`) backend at runtime.
+    /// A no-op when the requested kind is already active. The swap must never
+    /// replace the backend while a render is in flight (the in-flight render owns
+    /// its `Arc` and must finish on the backend it started with), so when the
+    /// worker is busy the request is deferred to the next idle point in
+    /// [`Self::poll_render`]; when idle it is applied immediately.
+    pub(crate) fn request_backend(&mut self, use_gpu: bool, ctx: &egui::Context) {
+        if use_gpu == self.gpu_active() {
+            self.pending_backend = None;
+            return;
+        }
+        if self.render.is_busy() {
+            // Defer; the worker is mid-render. Applied once it goes idle.
+            self.pending_backend = Some(use_gpu);
+            self.status = "Switching backend…".to_owned();
+            ctx.request_repaint();
+        } else {
+            self.swap_backend(use_gpu, ctx);
+        }
+    }
+
+    /// Build the requested backend via the shared [`select_backend`] and install
+    /// it, persist the preference, and trigger a re-render. GPU init can fail and
+    /// fall back to CPU; the status line and the status-bar kind reflect the
+    /// **actually-active** backend, not the requested one. Only ever called when
+    /// the worker is idle.
+    fn swap_backend(&mut self, use_gpu: bool, ctx: &egui::Context) {
+        let (backend, kind) = select_backend(use_gpu);
+        self.backend = Arc::from(backend);
+        self.backend_kind = kind;
+        // The before texture was rendered on the previous backend; CPU/GPU are
+        // pixel-equivalent, so this is not required for correctness, but it lets the
+        // before/after view re-render through the new backend for consistency.
+        if let Some(session) = &mut self.session {
+            session.before_texture = None;
+        }
+        // Persist the *preference* the user asked for, even if GPU init fell back —
+        // a stored "GPU on" still gracefully degrades on a device-less next launch.
+        if self.config.gpu != use_gpu {
+            self.config.gpu = use_gpu;
+            self.save_config();
+        }
+        // Report a GPU fallback distinctly from a clean switch.
+        self.status = if use_gpu && kind == BackendKind::Cpu {
+            "GPU unavailable, using CPU".to_owned()
+        } else {
+            format!("Using {} backend", kind.label())
+        };
+        self.render_preview(ctx);
+    }
+
+    /// Apply a deferred backend switch once the worker is idle. Called from
+    /// [`Self::poll_render`] right after the in-flight render is consumed and before
+    /// any coalesced re-render is spawned, so the next render uses the new backend.
+    fn apply_pending_backend(&mut self, ctx: &egui::Context) {
+        if let Some(use_gpu) = self.pending_backend.take() {
+            self.swap_backend(use_gpu, ctx);
         }
     }
 }
@@ -923,6 +1257,41 @@ impl Session {
         self.scopes.recompute(ctx, &bytes, w, h);
     }
 
+    /// Ensure variant `i` has an up-to-date thumbnail texture, rendering one only
+    /// when the slot is empty or the cached settings no longer match the variant's
+    /// current settings. The thumbnail goes through the **same** `render` /
+    /// `to_color_image` transform as the live preview, only over a tiny base
+    /// ([`THUMB_MAX_DIM`]), so it is trivially cheap and pixel-consistent. Cached,
+    /// so an unchanged variant is never re-rendered.
+    pub(crate) fn ensure_thumb(&mut self, ctx: &egui::Context, i: usize, backend: &dyn Backend) {
+        let Some(history) = self.variants.get(i) else {
+            return;
+        };
+        let current = history.current();
+        let fresh = self
+            .thumbs
+            .get(i)
+            .and_then(|t| t.as_ref())
+            .is_some_and(|t| &t.rendered_for == current);
+        if fresh {
+            return;
+        }
+        let settings = current.clone();
+        let rendered = render(&self.thumb_base, &settings, backend);
+        let color = canvas::to_color_image(&rendered);
+        let texture = ctx.load_texture(
+            format!("variant_thumb_{i}"),
+            color,
+            egui::TextureOptions::default(),
+        );
+        if let Some(slot) = self.thumbs.get_mut(i) {
+            *slot = Some(VariantThumb {
+                texture,
+                rendered_for: settings,
+            });
+        }
+    }
+
     /// Build the cached "before" texture once: the develop base rendered with
     /// `Settings::default()`, uploaded as a second texture the before/after view
     /// draws. Cheap — over the downscaled preview, only on the first preview.
@@ -960,18 +1329,15 @@ impl eframe::App for App {
         // Accept a dropped file (the first with a path) as an open.
         self.handle_dropped_files(ctx);
 
-        // Cmd/Ctrl+O opens the file picker, regardless of session.
-        self.handle_open_shortcut(ctx);
-
         // A centered banner while a file is dragged over the window (drawn on a
         // foreground layer, so it sits above whichever state is shown).
         self.show_drop_hint(ctx);
 
         // With no open image, show the welcome state and skip the editor entirely.
         if self.session.is_none() {
-            // The shortcuts cheat-sheet is reachable from the welcome state too
-            // (`?` to open, Help ▸ Keyboard shortcuts to open).
-            self.handle_panel_shortcuts(ctx);
+            // The file-open and help shortcuts are reachable from the welcome state
+            // too (`Cmd/Ctrl+O` to open, `?`/Help ▸ Keyboard shortcuts for help).
+            self.dispatch_shortcuts(ctx);
             dialogs::show_shortcuts(ctx, &mut self.shortcuts_open);
             panels::menubar::show_minimal(self, ctx);
             panels::welcome::show(self, ctx);
@@ -992,32 +1358,20 @@ impl eframe::App for App {
             .unwrap_or(true);
         let mut dirty = !texture_ready && !self.render.is_busy() && !self.render.pending;
 
-        // Keyboard: Cmd/Ctrl+Z undo, Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y redo.
-        let (mut do_undo, mut do_redo) = (false, false);
-        ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            if cmd && i.key_pressed(egui::Key::Z) {
-                if i.modifiers.shift {
-                    do_redo = true;
-                } else {
-                    do_undo = true;
-                }
-            }
-            if cmd && i.key_pressed(egui::Key::Y) {
-                do_redo = true;
-            }
-        });
+        // All keyboard shortcuts (undo/redo, zoom, brush, tools, copy/paste/reset,
+        // variant cycling, panel/help) dispatch from the single shortcuts table.
+        dirty |= self.dispatch_shortcuts(ctx);
 
-        self.handle_view_shortcuts(ctx);
-        self.handle_brush_shortcuts(ctx);
-        self.handle_panel_shortcuts(ctx);
+        // The toolbar/menu Undo/Redo buttons set these so the button and the
+        // shortcut land on the same single history path.
+        let (mut do_undo, mut do_redo) = (false, false);
 
         // The shortcuts cheat-sheet modal (opened with `?`), drawn over the chrome.
         dialogs::show_shortcuts(ctx, &mut self.shortcuts_open);
 
         // Chrome, in panel order: menu bar, toolbar, status bar, controls — then
         // the central canvas last so it takes the remaining space.
-        panels::menubar::show(self, ctx, &mut do_undo, &mut do_redo);
+        panels::menubar::show(self, ctx, &mut do_undo, &mut do_redo, &mut dirty);
         panels::toolbar::show(self, ctx, &mut do_undo, &mut do_redo, &mut dirty);
         panels::statusbar::show(self, ctx);
         dirty |= panels::controls::show(self, ctx);
@@ -1066,6 +1420,9 @@ mod tests {
             pending_load: false,
             panel_visible: true,
             shortcuts_open: false,
+            pending_backend: None,
+            clipboard: None,
+            preset_name_input: String::new(),
         }
     }
 

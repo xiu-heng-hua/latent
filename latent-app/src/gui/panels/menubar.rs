@@ -10,8 +10,15 @@ use crate::gui::config;
 
 /// Show the full menu bar (with an open session). `do_undo` / `do_redo` are set
 /// when the Edit menu's Undo/Redo items are clicked, so `update` applies them on
-/// the single shared history path.
-pub(crate) fn show(app: &mut App, ctx: &egui::Context, do_undo: &mut bool, do_redo: &mut bool) {
+/// the single shared history path. `dirty` is set when a menu action (paste, reset)
+/// changes the settings, so `update` re-renders.
+pub(crate) fn show(
+    app: &mut App,
+    ctx: &egui::Context,
+    do_undo: &mut bool,
+    do_redo: &mut bool,
+    dirty: &mut bool,
+) {
     egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             let (can_undo, can_redo, title, path) = app
@@ -62,9 +69,53 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context, do_undo: &mut bool, do_re
                     ui.close();
                 }
                 ui.separator();
-                // Planned: copy/paste develop settings.
-                ui.add_enabled(false, egui::Button::new("Copy settings"));
-                ui.add_enabled(false, egui::Button::new("Paste settings"));
+                // Copy the active variant's settings to the in-app clipboard;
+                // Paste applies the develop part (global + locals), keeping the
+                // target's geometry. Reset returns the develop to neutral, geometry
+                // kept. Each routes through the shared App methods the shortcuts use.
+                let has_session = app.session().is_some();
+                if ui
+                    .add_enabled(has_session, egui::Button::new("Copy settings"))
+                    .clicked()
+                {
+                    app.copy_settings();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(app.can_paste(), egui::Button::new("Paste settings"))
+                    .on_hover_text("Apply the copied develop look (keeps this image's geometry)")
+                    .clicked()
+                {
+                    *dirty |= app.paste_settings();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(has_session, egui::Button::new("Reset all develop"))
+                    .on_hover_text("Reset develop adjustments to neutral (keeps geometry)")
+                    .clicked()
+                {
+                    *dirty |= app.reset_all_develop();
+                    ui.close();
+                }
+                ui.separator();
+                // Apply a saved develop preset (the look only — geometry is kept).
+                let has_presets = !app.config.presets.is_empty();
+                ui.add_enabled_ui(has_session && has_presets, |ui| {
+                    ui.menu_button("Apply preset", |ui| {
+                        let mut chosen: Option<usize> = None;
+                        for (i, preset) in app.config.presets.iter().enumerate() {
+                            if ui.button(&preset.name).clicked() {
+                                chosen = Some(i);
+                                ui.close();
+                            }
+                        }
+                        if let Some(i) = chosen
+                            && let Some(preset) = app.config.presets.get(i).cloned()
+                        {
+                            *dirty |= app.apply_preset(&preset);
+                        }
+                    });
+                });
             });
 
             ui.menu_button("View", |ui| {
@@ -103,6 +154,22 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context, do_undo: &mut bool, do_re
                 };
                 if ui.button(panel_label).clicked() {
                     app.panel_visible = !app.panel_visible;
+                    ui.close();
+                }
+                ui.separator();
+                // Runtime CPU↔GPU backend toggle. A check next to "Use GPU"
+                // reflects the active backend (which shows CPU if GPU init fell
+                // back); toggling rebuilds the backend and re-renders. The switch is
+                // deferred if a render is in flight, so this stays clickable.
+                let mut use_gpu = app.gpu_active();
+                if ui
+                    .checkbox(&mut use_gpu, "Use GPU")
+                    .on_hover_text(
+                        "Render on the GPU when a device is available (falls back to CPU)",
+                    )
+                    .changed()
+                {
+                    app.request_backend(use_gpu, ctx);
                     ui.close();
                 }
             });
