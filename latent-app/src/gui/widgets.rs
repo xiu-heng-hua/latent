@@ -15,12 +15,60 @@
 
 use eframe::egui;
 use latent_edit::{
-    Adjustments, Brush, ColorRange, Crop, Curves, Gradient, History, LocalAdjustment,
-    LuminanceRange, Mask, MaskShape, Perspective, Radial, SelectiveTone, Settings, WhiteBalance,
+    Adjustments, Brush, ChannelMixer, ColorRange, Crop, Curves, Gradient, History, Hsl,
+    LocalAdjustment, LuminanceRange, Mask, MaskOp, MaskShape, Perspective, Radial, SelectiveTone,
+    Settings, WhiteBalance,
 };
 
 use super::state::clamp_selection;
 use super::theme;
+
+pub(crate) mod wb;
+
+/// A pair of accessors that bind a control block to *one* [`Adjustments`] inside a
+/// [`Settings`] — either the global develop (`|s| &s.global` / `|s| &mut s.global`)
+/// or one local's (`|s| &s.locals[i].adjustments`). The blocks below build their
+/// per-field get/set closures by composing through these, so the same block edits
+/// the global panel or a local sub-panel with no behavioral change to either.
+///
+/// Both closures must be `Copy` so a block can hand them to several per-field
+/// closures; a closure that captures only `Copy` data (a local index `usize`, or
+/// nothing) is itself `Copy`, which both call sites satisfy.
+pub(crate) trait AdjustAccess: Copy {
+    /// Borrow the bound adjustments out of the settings.
+    fn get<'a>(&self, s: &'a Settings) -> &'a Adjustments;
+    /// Borrow the bound adjustments mutably out of the settings.
+    fn get_mut<'a>(&self, s: &'a mut Settings) -> &'a mut Adjustments;
+}
+
+/// The global develop adjustments (`s.global`).
+#[derive(Clone, Copy)]
+pub(crate) struct GlobalAccess;
+
+impl AdjustAccess for GlobalAccess {
+    fn get<'a>(&self, s: &'a Settings) -> &'a Adjustments {
+        &s.global
+    }
+    fn get_mut<'a>(&self, s: &'a mut Settings) -> &'a mut Adjustments {
+        &mut s.global
+    }
+}
+
+/// One local's adjustments (`s.locals[i].adjustments`). Carries the local index by
+/// value, so it is `Copy` and safe to `move` into the per-field closures.
+#[derive(Clone, Copy)]
+pub(crate) struct LocalAccess {
+    pub(crate) index: usize,
+}
+
+impl AdjustAccess for LocalAccess {
+    fn get<'a>(&self, s: &'a Settings) -> &'a Adjustments {
+        &s.locals[self.index].adjustments
+    }
+    fn get_mut<'a>(&self, s: &'a mut Settings) -> &'a mut Adjustments {
+        &mut s.locals[self.index].adjustments
+    }
+}
 
 /// Accumulates the [`egui::Response`]s of several sliders so a block of them
 /// commits as **one** history transaction. Each [`adjust_slider`] in the block
@@ -333,21 +381,22 @@ pub(crate) fn curves_block(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
     channel: &mut usize,
+    access: impl AdjustAccess,
 ) -> bool {
     let mut dirty = false;
 
-    let mut enabled = history.current().global.curves.is_some();
+    let mut enabled = access.get(history.current()).curves.is_some();
     if ui
         .checkbox(&mut enabled, "Curves")
         .on_hover_text("Master and per-channel tone curves; drag the five points")
         .changed()
     {
         history.begin();
-        history.current_mut().global.curves = enabled.then(Curves::default);
+        access.get_mut(history.current_mut()).curves = enabled.then(Curves::default);
         history.commit();
         dirty = true;
     }
-    if history.current().global.curves.is_none() {
+    if access.get(history.current()).curves.is_none() {
         return dirty;
     }
 
@@ -360,7 +409,7 @@ pub(crate) fn curves_block(
     // Output (y) of each fixed-input point for the selected channel; identity
     // where a point has not been set yet.
     let mut ys: [f32; 5] = {
-        let curves = history.current().global.curves.as_ref().unwrap();
+        let curves = access.get(history.current()).curves.as_ref().unwrap();
         let pts = match *channel {
             1 => &curves.red,
             2 => &curves.green,
@@ -399,7 +448,11 @@ pub(crate) fn curves_block(
             })
             .unwrap();
         ys[i] = ny;
-        let curves = history.current_mut().global.curves.as_mut().unwrap();
+        let curves = access
+            .get_mut(history.current_mut())
+            .curves
+            .as_mut()
+            .unwrap();
         *curve_channel_mut(curves, *channel) =
             CURVE_XS.iter().zip(ys).map(|(&x, y)| (x, y)).collect();
         dirty = true;
@@ -428,60 +481,23 @@ pub(crate) fn curves_block(
     dirty
 }
 
-/// White balance: two sliders (temp/tint) editing one optional adjustment. The
-/// two sliders share one gesture scope, so dragging both is one undo step.
-pub(crate) fn white_balance_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    let wb = history.current().global.white_balance.unwrap_or_default();
-    let mut scope = GestureScope::default();
-    adjust_slider(
-        ui,
-        history,
-        &mut scope,
-        SliderSpec {
-            label: "Temp",
-            range: -1.0..=1.0,
-            neutral: 0.0,
-            help: "Warm/cool shift",
-        },
-        move |s| s.global.white_balance.unwrap_or(wb).temp,
-        move |s, v| {
-            let mut now = s.global.white_balance.unwrap_or(wb);
-            now.temp = v;
-            s.global.white_balance = wb_or_none(now);
-        },
-    );
-    adjust_slider(
-        ui,
-        history,
-        &mut scope,
-        SliderSpec {
-            label: "Tint",
-            range: -1.0..=1.0,
-            neutral: 0.0,
-            help: "Green/magenta shift",
-        },
-        move |s| s.global.white_balance.unwrap_or(wb).tint,
-        move |s, v| {
-            let mut now = s.global.white_balance.unwrap_or(wb);
-            now.tint = v;
-            s.global.white_balance = wb_or_none(now);
-        },
-    );
-    scope.finish(history)
-}
-
 /// Drop a white balance back to `None` when both channels are neutral, matching
 /// the original block's "off when zeroed" behavior.
-fn wb_or_none(wb: WhiteBalance) -> Option<WhiteBalance> {
+pub(crate) fn wb_or_none(wb: WhiteBalance) -> Option<WhiteBalance> {
     (wb.temp != 0.0 || wb.tint != 0.0).then_some(wb)
 }
 
 /// Selective tone: four sliders editing one optional adjustment, all sharing one
-/// gesture scope so the whole block commits as a single undo step.
-pub(crate) fn tone_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    let t = history.current().global.tone.unwrap_or_default();
+/// gesture scope so the whole block commits as a single undo step. Bound to the
+/// `access`-selected adjustments (global or a local).
+pub(crate) fn tone_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let t = access.get(history.current()).tone.unwrap_or_default();
     let mut scope = GestureScope::default();
-    for (label, help, get, set) in tone_fields(t) {
+    for (label, help, get, set) in tone_fields(t, access) {
         adjust_slider(
             ui,
             history,
@@ -500,11 +516,12 @@ pub(crate) fn tone_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> 
 }
 
 /// The four selective-tone fields as `(label, help, get, set)` tuples; each
-/// get/set reads and writes one component of the optional [`SelectiveTone`],
-/// clearing it back to `None` once every component is neutral.
+/// get/set reads and writes one component of the optional [`SelectiveTone`]
+/// behind `access`, clearing it back to `None` once every component is neutral.
 #[allow(clippy::type_complexity)]
 fn tone_fields(
     base: SelectiveTone,
+    access: impl AdjustAccess,
 ) -> [(
     &'static str,
     &'static str,
@@ -513,22 +530,23 @@ fn tone_fields(
 ); 4] {
     fn field(
         base: SelectiveTone,
+        access: impl AdjustAccess,
         getc: fn(&SelectiveTone) -> f32,
         setc: fn(&mut SelectiveTone, f32),
     ) -> (impl Fn(&Settings) -> f32, impl Fn(&mut Settings, f32)) {
         (
-            move |s: &Settings| getc(&s.global.tone.unwrap_or(base)),
+            move |s: &Settings| getc(&access.get(s).tone.unwrap_or(base)),
             move |s: &mut Settings, v: f32| {
-                let mut now = s.global.tone.unwrap_or(base);
+                let mut now = access.get(s).tone.unwrap_or(base);
                 setc(&mut now, v);
-                s.global.tone = (now != SelectiveTone::default()).then_some(now);
+                access.get_mut(s).tone = (now != SelectiveTone::default()).then_some(now);
             },
         )
     }
-    let (cg, cs) = field(base, |t| t.contrast, |t, v| t.contrast = v);
-    let (hg, hs) = field(base, |t| t.highlights, |t, v| t.highlights = v);
-    let (sg, ss) = field(base, |t| t.shadows, |t, v| t.shadows = v);
-    let (bg, bs) = field(base, |t| t.blacks, |t, v| t.blacks = v);
+    let (cg, cs) = field(base, access, |t| t.contrast, |t, v| t.contrast = v);
+    let (hg, hs) = field(base, access, |t| t.highlights, |t, v| t.highlights = v);
+    let (sg, ss) = field(base, access, |t| t.shadows, |t, v| t.shadows = v);
+    let (bg, bs) = field(base, access, |t| t.blacks, |t, v| t.blacks = v);
     [
         ("Contrast", "Overall contrast", cg, cs),
         ("Highlights", "Recover or lift the brights", hg, hs),
@@ -538,9 +556,13 @@ fn tone_fields(
 }
 
 /// Sharpening: amount/radius sliders editing one optional adjustment, sharing one
-/// gesture scope.
-pub(crate) fn sharpen_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    let s = history.current().global.sharpen.unwrap_or_default();
+/// gesture scope. Bound to the `access`-selected adjustments (global or a local).
+pub(crate) fn sharpen_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let s = access.get(history.current()).sharpen.unwrap_or_default();
     let mut scope = GestureScope::default();
     adjust_slider(
         ui,
@@ -552,11 +574,11 @@ pub(crate) fn sharpen_block(ui: &mut egui::Ui, history: &mut History<Settings>) 
             neutral: 0.0,
             help: "Edge sharpening strength",
         },
-        move |st| st.global.sharpen.unwrap_or(s).amount,
+        move |st| access.get(st).sharpen.unwrap_or(s).amount,
         move |st, v| {
-            let mut now = st.global.sharpen.unwrap_or(s);
+            let mut now = access.get(st).sharpen.unwrap_or(s);
             now.amount = v;
-            st.global.sharpen = Some(now);
+            access.get_mut(st).sharpen = Some(now);
         },
     );
     adjust_slider(
@@ -569,20 +591,24 @@ pub(crate) fn sharpen_block(ui: &mut egui::Ui, history: &mut History<Settings>) 
             neutral: s.radius,
             help: "Sharpening blur radius (px)",
         },
-        move |st| st.global.sharpen.unwrap_or(s).radius,
+        move |st| access.get(st).sharpen.unwrap_or(s).radius,
         move |st, v| {
-            let mut now = st.global.sharpen.unwrap_or(s);
+            let mut now = access.get(st).sharpen.unwrap_or(s);
             now.radius = v;
-            st.global.sharpen = Some(now);
+            access.get_mut(st).sharpen = Some(now);
         },
     );
     scope.finish(history)
 }
 
 /// Clarity: midtone local-contrast amount/radius sliders editing one adjustment,
-/// sharing one gesture scope.
-pub(crate) fn clarity_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    let c = history.current().global.clarity.unwrap_or_default();
+/// sharing one gesture scope. Bound to the `access`-selected adjustments.
+pub(crate) fn clarity_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let c = access.get(history.current()).clarity.unwrap_or_default();
     let mut scope = GestureScope::default();
     adjust_slider(
         ui,
@@ -594,11 +620,11 @@ pub(crate) fn clarity_block(ui: &mut egui::Ui, history: &mut History<Settings>) 
             neutral: 0.0,
             help: "Midtone local contrast",
         },
-        move |st| st.global.clarity.unwrap_or(c).amount,
+        move |st| access.get(st).clarity.unwrap_or(c).amount,
         move |st, v| {
-            let mut now = st.global.clarity.unwrap_or(c);
+            let mut now = access.get(st).clarity.unwrap_or(c);
             now.amount = v;
-            st.global.clarity = Some(now);
+            access.get_mut(st).clarity = Some(now);
         },
     );
     adjust_slider(
@@ -611,20 +637,27 @@ pub(crate) fn clarity_block(ui: &mut egui::Ui, history: &mut History<Settings>) 
             neutral: c.radius,
             help: "Local-contrast blur radius (px)",
         },
-        move |st| st.global.clarity.unwrap_or(c).radius,
+        move |st| access.get(st).clarity.unwrap_or(c).radius,
         move |st, v| {
-            let mut now = st.global.clarity.unwrap_or(c);
+            let mut now = access.get(st).clarity.unwrap_or(c);
             now.radius = v;
-            st.global.clarity = Some(now);
+            access.get_mut(st).clarity = Some(now);
         },
     );
     scope.finish(history)
 }
 
 /// Noise reduction: independent luminance/color strengths plus a radius, all
-/// sharing one gesture scope.
-pub(crate) fn noise_reduction_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    let nr = history.current().global.noise_reduction.unwrap_or_default();
+/// sharing one gesture scope. Bound to the `access`-selected adjustments.
+pub(crate) fn noise_reduction_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let nr = access
+        .get(history.current())
+        .noise_reduction
+        .unwrap_or_default();
     let mut scope = GestureScope::default();
     adjust_slider(
         ui,
@@ -636,11 +669,11 @@ pub(crate) fn noise_reduction_block(ui: &mut egui::Ui, history: &mut History<Set
             neutral: 0.0,
             help: "Luminance noise reduction",
         },
-        move |st| st.global.noise_reduction.unwrap_or(nr).luminance,
+        move |st| access.get(st).noise_reduction.unwrap_or(nr).luminance,
         move |st, v| {
-            let mut now = st.global.noise_reduction.unwrap_or(nr);
+            let mut now = access.get(st).noise_reduction.unwrap_or(nr);
             now.luminance = v;
-            st.global.noise_reduction = Some(now);
+            access.get_mut(st).noise_reduction = Some(now);
         },
     );
     adjust_slider(
@@ -653,11 +686,11 @@ pub(crate) fn noise_reduction_block(ui: &mut egui::Ui, history: &mut History<Set
             neutral: 0.0,
             help: "Color noise reduction",
         },
-        move |st| st.global.noise_reduction.unwrap_or(nr).color,
+        move |st| access.get(st).noise_reduction.unwrap_or(nr).color,
         move |st, v| {
-            let mut now = st.global.noise_reduction.unwrap_or(nr);
+            let mut now = access.get(st).noise_reduction.unwrap_or(nr);
             now.color = v;
-            st.global.noise_reduction = Some(now);
+            access.get_mut(st).noise_reduction = Some(now);
         },
     );
     adjust_slider(
@@ -670,14 +703,306 @@ pub(crate) fn noise_reduction_block(ui: &mut egui::Ui, history: &mut History<Set
             neutral: nr.radius,
             help: "Noise-reduction neighborhood (px)",
         },
-        move |st| st.global.noise_reduction.unwrap_or(nr).radius,
+        move |st| access.get(st).noise_reduction.unwrap_or(nr).radius,
         move |st, v| {
-            let mut now = st.global.noise_reduction.unwrap_or(nr);
+            let mut now = access.get(st).noise_reduction.unwrap_or(nr);
             now.radius = v;
-            st.global.noise_reduction = Some(now);
+            access.get_mut(st).noise_reduction = Some(now);
         },
     );
     scope.finish(history)
+}
+
+/// The eight HSL bands' names and their representative hue (in degrees) for the
+/// swatch, in index order red (0) … magenta (7) — matching the engine's band
+/// layout (`Hsl::bands`).
+const HSL_BANDS: [(&str, f32); 8] = [
+    ("Red", 0.0),
+    ("Orange", 30.0),
+    ("Yellow", 60.0),
+    ("Green", 120.0),
+    ("Aqua", 180.0),
+    ("Blue", 240.0),
+    ("Purple", 270.0),
+    ("Magenta", 300.0),
+];
+
+/// A fully-saturated, full-value [`egui::Color32`] for a hue in degrees, for the
+/// HSL band swatches. A small HSV→RGB so the swatch shows the band's color
+/// without pulling in a color crate.
+fn hue_swatch(hue_deg: f32) -> egui::Color32 {
+    let h = (hue_deg.rem_euclid(360.0)) / 60.0;
+    let x = 1.0 - (h % 2.0 - 1.0).abs();
+    let (r, g, b) = match h as u32 {
+        0 => (1.0, x, 0.0),
+        1 => (x, 1.0, 0.0),
+        2 => (0.0, 1.0, x),
+        3 => (0.0, x, 1.0),
+        4 => (x, 0.0, 1.0),
+        _ => (1.0, 0.0, x),
+    };
+    egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// One HSL band row: a small color swatch in the band's representative hue, then
+/// Hue / Sat / Lum [`adjust_slider`]s bound to that band's `[hue, sat, lum]`. The
+/// row shares the block's `scope`, so a drag across any band is one undo step. The
+/// `hue` slider *shifts* the band (small range), while `sat`/`lum` *scale* it by
+/// `1 + value` (so `0` is unchanged) — matching the engine's interpretation.
+fn hsl_band_row(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    scope: &mut GestureScope,
+    access: impl AdjustAccess,
+    band: usize,
+) {
+    let (name, hue_deg) = HSL_BANDS[band];
+    let base = access.get(history.current()).hsl.unwrap_or_default();
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, hue_swatch(hue_deg));
+        ui.label(name);
+    });
+    // `hue` shifts in turns (a gentle range); `sat`/`lum` scale by `1 + value`.
+    let specs = [
+        ("Hue", -0.1_f32..=0.1_f32, "Shift this band's hue", 0_usize),
+        ("Sat", -1.0..=1.0, "Scale this band's saturation", 1),
+        ("Lum", -1.0..=1.0, "Scale this band's lightness", 2),
+    ];
+    for (label, range, help, channel) in specs {
+        adjust_slider(
+            ui,
+            history,
+            scope,
+            SliderSpec {
+                label,
+                range,
+                neutral: 0.0,
+                help,
+            },
+            move |s| access.get(s).hsl.unwrap_or(base).bands[band][channel],
+            move |s, v| {
+                let mut now = access.get(s).hsl.unwrap_or(base);
+                now.bands[band][channel] = v;
+                access.get_mut(s).hsl = Some(now);
+            },
+        );
+    }
+}
+
+/// The HSL mixer: an enable checkbox over `Adjustments.hsl` (unchecked → `None`,
+/// checked → a neutral all-zero [`Hsl`]), then eight band rows of Hue/Sat/Lum
+/// sliders with hue swatches. All the band sliders share one gesture scope, so a
+/// drag is one undo step. Bound to the `access`-selected adjustments.
+pub(crate) fn hsl_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let mut dirty = false;
+    let mut enabled = access.get(history.current()).hsl.is_some();
+    if ui
+        .checkbox(&mut enabled, "HSL Mixer")
+        .on_hover_text("Per-hue-band hue/saturation/lightness")
+        .changed()
+    {
+        history.begin();
+        access.get_mut(history.current_mut()).hsl = enabled.then(Hsl::default);
+        history.commit();
+        dirty = true;
+    }
+    if access.get(history.current()).hsl.is_none() {
+        return dirty;
+    }
+    let mut scope = GestureScope::default();
+    for band in 0..8 {
+        hsl_band_row(ui, history, &mut scope, access, band);
+    }
+    dirty | scope.finish(history)
+}
+
+/// The channel mixer: an enable checkbox over `Adjustments.channel_mixer`
+/// (unchecked → `None`, checked → the identity [`ChannelMixer`], a no-op), then
+/// three output-channel groups (Red / Green / Blue output) each with three
+/// input-weight sliders, plus the preserve-luminosity toggle. All nine matrix
+/// sliders share one gesture scope. Each cell's neutral is its identity entry
+/// (diagonal `1`, off-diagonal `0`), so a double-click resets to identity. Bound
+/// to the `access`-selected adjustments.
+pub(crate) fn channel_mixer_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let mut dirty = false;
+    let mut enabled = access.get(history.current()).channel_mixer.is_some();
+    if ui
+        .checkbox(&mut enabled, "Channel Mixer")
+        .on_hover_text("Mix each output channel from the input R/G/B")
+        .changed()
+    {
+        history.begin();
+        access.get_mut(history.current_mut()).channel_mixer = enabled.then(ChannelMixer::default);
+        history.commit();
+        dirty = true;
+    }
+    let base = match access.get(history.current()).channel_mixer {
+        Some(m) => m,
+        None => return dirty,
+    };
+
+    let mut scope = GestureScope::default();
+    for (out, out_name) in ["Red output", "Green output", "Blue output"]
+        .into_iter()
+        .enumerate()
+    {
+        ui.label(out_name);
+        for (inp, in_name) in ["from R", "from G", "from B"].into_iter().enumerate() {
+            // Identity neutral: 1 on the diagonal, 0 off it, so a reset returns
+            // the cell to the no-op identity, not a flat zero.
+            let neutral = if out == inp { 1.0 } else { 0.0 };
+            adjust_slider(
+                ui,
+                history,
+                &mut scope,
+                SliderSpec {
+                    label: in_name,
+                    range: -2.0..=2.0,
+                    neutral,
+                    help: "Input channel weight",
+                },
+                move |s| access.get(s).channel_mixer.unwrap_or(base).matrix[out][inp],
+                move |s, v| {
+                    let mut now = access.get(s).channel_mixer.unwrap_or(base);
+                    now.matrix[out][inp] = v;
+                    access.get_mut(s).channel_mixer = Some(now);
+                },
+            );
+        }
+    }
+
+    let mut preserve = base.preserve_luminosity;
+    if ui
+        .checkbox(&mut preserve, "Preserve luminosity")
+        .on_hover_text("Normalize each row to sum 1 so a neutral gray stays put")
+        .changed()
+    {
+        history.begin();
+        let mut now = access.get(history.current()).channel_mixer.unwrap_or(base);
+        now.preserve_luminosity = preserve;
+        access.get_mut(history.current_mut()).channel_mixer = Some(now);
+        history.commit();
+        dirty = true;
+    }
+
+    dirty | scope.finish(history)
+}
+
+/// What a white-balance block asks the caller to do beyond the in-place slider/
+/// preset edits it already applied: activate the gray eyedropper (a canvas tool
+/// the panel can't reach), or run the gray-world Auto estimate (which needs the
+/// preview image the panel doesn't hold). `None` means the block handled
+/// everything itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WbAction {
+    #[default]
+    None,
+    /// Activate the eyedropper (pick a neutral pixel on the canvas).
+    PickGray,
+    /// Estimate a gray-world white balance from the preview.
+    Auto,
+}
+
+/// White balance over `WhiteBalance { temp, tint }`: a Kelvin slider + a tint
+/// slider (mapped through the documented invertible [`wb`] functions), an
+/// eyedropper button, and the presets. Writes the single `WhiteBalance` field —
+/// no second representation. Returns whether the preview is dirty and, via
+/// `action`, any canvas/preview work only the caller can do. Bound to the
+/// `access`-selected adjustments.
+pub(crate) fn white_balance_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    action: &mut WbAction,
+) -> bool {
+    let wb = access
+        .get(history.current())
+        .white_balance
+        .unwrap_or_default();
+    let mut scope = GestureScope::default();
+    // Kelvin slider, mapped to `temp` through the mired-difference curve.
+    adjust_slider(
+        ui,
+        history,
+        &mut scope,
+        SliderSpec {
+            label: "Temp (K)",
+            range: wb::KELVIN_MIN..=wb::KELVIN_MAX,
+            neutral: wb::T0,
+            help: "Color temperature in Kelvin",
+        },
+        move |s| wb::temp_to_kelvin(access.get(s).white_balance.unwrap_or(wb).temp),
+        move |s, k| {
+            let mut now = access.get(s).white_balance.unwrap_or(wb);
+            now.temp = wb::kelvin_to_temp(k);
+            access.get_mut(s).white_balance = wb_or_none(now);
+        },
+    );
+    // Tint slider, mapped linearly to `tint`.
+    adjust_slider(
+        ui,
+        history,
+        &mut scope,
+        SliderSpec {
+            label: "Tint",
+            range: -wb::TINT_RANGE..=wb::TINT_RANGE,
+            neutral: 0.0,
+            help: "Green/magenta shift",
+        },
+        move |s| wb::tint_to_slider(access.get(s).white_balance.unwrap_or(wb).tint),
+        move |s, t| {
+            let mut now = access.get(s).white_balance.unwrap_or(wb);
+            now.tint = wb::slider_to_tint(t);
+            access.get_mut(s).white_balance = wb_or_none(now);
+        },
+    );
+    let mut dirty = scope.finish(history);
+
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("Pick gray")
+            .on_hover_text("Click a neutral patch on the image to set the balance")
+            .clicked()
+        {
+            *action = WbAction::PickGray;
+        }
+        for preset in wb::Preset::ALL {
+            if ui.button(preset.label()).clicked() {
+                match preset.kelvin() {
+                    Some(kelvin) => {
+                        history.begin();
+                        access.get_mut(history.current_mut()).white_balance =
+                            wb_or_none(WhiteBalance {
+                                temp: wb::kelvin_to_temp(kelvin),
+                                tint: 0.0,
+                            });
+                        history.commit();
+                        dirty = true;
+                    }
+                    None if preset == wb::Preset::AsShot => {
+                        // As Shot clears the editable offset to None; the as-shot
+                        // decode balance applies underneath.
+                        history.begin();
+                        access.get_mut(history.current_mut()).white_balance = None;
+                        history.commit();
+                        dirty = true;
+                    }
+                    // Auto needs the preview; defer to the caller.
+                    None => *action = WbAction::Auto,
+                }
+            }
+        }
+    });
+    dirty
 }
 
 /// Straighten angle (degrees), applied before the crop.
@@ -844,112 +1169,119 @@ fn crop_or_none(c: Crop) -> Option<Crop> {
     (!full).then_some(c)
 }
 
-/// The Local Adjustments panel: add/select/delete masked adjustments and edit
-/// the selected one. `sel` is the selected index (UI state). Returns whether
-/// the preview needs a redraw.
+/// The default mask shape for each "add shape" button, by kind. The first shape
+/// in a fresh local is the base; later shapes append with an [`MaskOp::Add`].
+fn default_shape(kind: ShapeKind) -> MaskShape {
+    match kind {
+        ShapeKind::Gradient => MaskShape::Gradient(Gradient {
+            x0: 0.5,
+            y0: 0.0,
+            x1: 0.5,
+            y1: 1.0,
+        }),
+        ShapeKind::Radial => MaskShape::Radial(Radial {
+            cx: 0.5,
+            cy: 0.5,
+            radius: 0.25,
+            feather: 0.25,
+        }),
+        // Defaults to the shadows; drag the range to retarget.
+        ShapeKind::Luminosity => MaskShape::Luminosity(LuminanceRange {
+            lo: 0.0,
+            hi: 0.3,
+            feather: 0.1,
+        }),
+        // Defaults to reds; drag the hue to retarget.
+        ShapeKind::ColorRange => MaskShape::ColorRange(ColorRange {
+            hue: 0.0,
+            hue_width: 0.08,
+            sat_min: 0.15,
+            feather: 0.08,
+        }),
+        ShapeKind::Brush => MaskShape::Brush(Brush::default()),
+    }
+}
+
+/// The five mask-shape kinds the add buttons create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeKind {
+    Gradient,
+    Radial,
+    Luminosity,
+    ColorRange,
+    Brush,
+}
+
+/// The short label naming a shape's kind in the shape list.
+fn shape_kind_label(shape: &MaskShape) -> &'static str {
+    match shape {
+        MaskShape::Gradient(_) => "Gradient",
+        MaskShape::Radial(_) => "Radial",
+        MaskShape::Luminosity(_) => "Luminosity",
+        MaskShape::ColorRange(_) => "Color",
+        MaskShape::Brush(_) => "Brush",
+    }
+}
+
+/// Append a new shape (with a default [`MaskOp::Add`], kept parallel to `shapes`)
+/// to the selected local's mask, select it, and record one undo step. The first
+/// shape pushes an `Add` too — its op is ignored but keeping `ops.len() ==
+/// shapes.len()` keeps the two vectors aligned, the invariant `weight_at` relies
+/// on.
+fn add_shape(
+    history: &mut History<Settings>,
+    local: usize,
+    kind: ShapeKind,
+    shape_sel: &mut usize,
+) {
+    history.begin();
+    let mask = &mut history.current_mut().locals[local].mask;
+    mask.shapes.push(default_shape(kind));
+    mask.ops.push(MaskOp::Add);
+    history.commit();
+    *shape_sel = history.current().locals[local].mask.shapes.len() - 1;
+}
+
+/// The Local Adjustments panel: add/select/delete masked adjustments, edit the
+/// selected local's mask shape list (add/remove shapes, per-shape combine op,
+/// invert), and edit the local's full `Adjustments` surface. `sel` is the
+/// selected local, `shape_sel` the selected shape within it (UI state). Any white
+/// balance the local block needs the caller to act on is reported through
+/// `wb_action`. Returns whether the preview needs a redraw.
 pub(crate) fn local_adjustments(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
     sel: &mut usize,
+    shape_sel: &mut usize,
+    wb_action: &mut WbAction,
 ) -> bool {
     let mut dirty = false;
 
-    ui.horizontal(|ui| {
-        if ui.button("+ Graduated").clicked() {
-            history.begin();
-            history.current_mut().locals.push(LocalAdjustment {
-                mask: Mask {
-                    shapes: vec![MaskShape::Gradient(Gradient {
-                        x0: 0.5,
-                        y0: 0.0,
-                        x1: 0.5,
-                        y1: 1.0,
-                    })],
-                    ops: Vec::new(),
-                    invert: false,
-                },
-                adjustments: Adjustments::default(),
-                opacity: 1.0,
-            });
-            history.commit();
-            *sel = history.current().locals.len() - 1;
-            dirty = true;
-        }
-        if ui.button("+ Radial").clicked() {
-            history.begin();
-            history.current_mut().locals.push(LocalAdjustment {
-                mask: Mask {
-                    shapes: vec![MaskShape::Radial(Radial {
-                        cx: 0.5,
-                        cy: 0.5,
-                        radius: 0.25,
-                        feather: 0.25,
-                    })],
-                    ops: Vec::new(),
-                    invert: false,
-                },
-                adjustments: Adjustments::default(),
-                opacity: 1.0,
-            });
-            history.commit();
-            *sel = history.current().locals.len() - 1;
-            dirty = true;
-        }
-        if ui.button("+ Luminosity").clicked() {
-            history.begin();
-            history.current_mut().locals.push(LocalAdjustment {
-                mask: Mask {
-                    // Defaults to the shadows; drag the range to retarget.
-                    shapes: vec![MaskShape::Luminosity(LuminanceRange {
-                        lo: 0.0,
-                        hi: 0.3,
-                        feather: 0.1,
-                    })],
-                    ops: Vec::new(),
-                    invert: false,
-                },
-                adjustments: Adjustments::default(),
-                opacity: 1.0,
-            });
-            history.commit();
-            *sel = history.current().locals.len() - 1;
-            dirty = true;
-        }
-        if ui.button("+ Color").clicked() {
-            history.begin();
-            history.current_mut().locals.push(LocalAdjustment {
-                mask: Mask {
-                    // Defaults to reds; drag the hue to retarget.
-                    shapes: vec![MaskShape::ColorRange(ColorRange {
-                        hue: 0.0,
-                        hue_width: 0.08,
-                        sat_min: 0.15,
-                        feather: 0.08,
-                    })],
-                    ops: Vec::new(),
-                    invert: false,
-                },
-                adjustments: Adjustments::default(),
-                opacity: 1.0,
-            });
-            history.commit();
-            *sel = history.current().locals.len() - 1;
-            dirty = true;
-        }
-        if ui.button("+ Brush").clicked() {
-            history.begin();
-            history.current_mut().locals.push(LocalAdjustment {
-                mask: Mask {
-                    shapes: vec![MaskShape::Brush(Brush::default())],
-                    ops: Vec::new(),
-                    invert: false,
-                },
-                adjustments: Adjustments::default(),
-                opacity: 1.0,
-            });
-            history.commit();
-            *sel = history.current().locals.len() - 1;
-            dirty = true;
+    // The add-local buttons each create a one-shape mask of the chosen kind.
+    ui.horizontal_wrapped(|ui| {
+        for (label, kind) in [
+            ("+ Graduated", ShapeKind::Gradient),
+            ("+ Radial", ShapeKind::Radial),
+            ("+ Luminosity", ShapeKind::Luminosity),
+            ("+ Color", ShapeKind::ColorRange),
+            ("+ Brush", ShapeKind::Brush),
+        ] {
+            if ui.button(label).clicked() {
+                history.begin();
+                history.current_mut().locals.push(LocalAdjustment {
+                    mask: Mask {
+                        shapes: vec![default_shape(kind)],
+                        ops: vec![MaskOp::Add],
+                        invert: false,
+                    },
+                    adjustments: Adjustments::default(),
+                    opacity: 1.0,
+                });
+                history.commit();
+                *sel = history.current().locals.len() - 1;
+                *shape_sel = 0;
+                dirty = true;
+            }
         }
     });
 
@@ -967,6 +1299,7 @@ pub(crate) fn local_adjustments(
                 .clicked()
             {
                 *sel = i;
+                *shape_sel = 0;
             }
         }
         if ui.button("Delete").clicked() {
@@ -983,16 +1316,24 @@ pub(crate) fn local_adjustments(
     clamp_selection(sel, history.current().locals.len());
     let i = *sel;
 
-    dirty |= local_shape_block(ui, history, i);
+    ui.separator();
+    dirty |= mask_shape_list(ui, history, i, shape_sel);
+    dirty |= local_shape_block(ui, history, i, *shape_sel);
 
     let mut invert = history.current().locals[i].mask.invert;
-    if ui.checkbox(&mut invert, "Invert mask").changed() {
+    if ui
+        .checkbox(&mut invert, "Invert mask")
+        .on_hover_text("Invert the combined mask")
+        .changed()
+    {
         history.begin();
         history.current_mut().locals[i].mask.invert = invert;
         history.commit();
         dirty = true;
     }
 
+    ui.separator();
+    let access = LocalAccess { index: i };
     dirty |= value_slider(
         ui,
         history,
@@ -1005,6 +1346,26 @@ pub(crate) fn local_adjustments(
         move |s| s.locals[i].opacity,
         move |s, v| s.locals[i].opacity = v,
     );
+    dirty |= local_adjustment_surface(ui, history, access, wb_action);
+
+    dirty
+}
+
+/// The full per-local adjustment surface — the **same** control blocks the global
+/// panel uses, bound to `locals[i].adjustments` via [`LocalAccess`]. So a local
+/// carries exposure, white balance, tone, curves, saturation, HSL, the channel
+/// mixer, sharpen, clarity, dehaze, and noise reduction — all rendered within its
+/// mask at its opacity by the unchanged engine. The curve channel reuses a
+/// transient id (a local's curve editor doesn't persist its channel choice across
+/// reselection, which is acceptable for a sub-panel).
+fn local_adjustment_surface(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: LocalAccess,
+    wb_action: &mut WbAction,
+) -> bool {
+    let mut dirty = false;
+    let i = access.index;
     dirty |= opt_point_slider(
         ui,
         history,
@@ -1017,6 +1378,10 @@ pub(crate) fn local_adjustments(
         move |s| s.locals[i].adjustments.exposure,
         move |s, v| s.locals[i].adjustments.exposure = v,
     );
+    dirty |= white_balance_block(ui, history, access, wb_action);
+    dirty |= tone_block(ui, history, access);
+    let mut channel = 0_usize;
+    dirty |= curves_block(ui, history, &mut channel, access);
     dirty |= opt_point_slider(
         ui,
         history,
@@ -1029,15 +1394,137 @@ pub(crate) fn local_adjustments(
         move |s| s.locals[i].adjustments.saturation,
         move |s, v| s.locals[i].adjustments.saturation = v,
     );
-
+    dirty |= hsl_block(ui, history, access);
+    dirty |= channel_mixer_block(ui, history, access);
+    dirty |= sharpen_block(ui, history, access);
+    dirty |= clarity_block(ui, history, access);
+    dirty |= opt_point_slider(
+        ui,
+        history,
+        SliderSpec {
+            label: "Dehaze",
+            range: 0.0..=1.0,
+            neutral: 0.0,
+            help: "Cut atmospheric haze",
+        },
+        move |s| s.locals[i].adjustments.dehaze,
+        move |s, v| s.locals[i].adjustments.dehaze = v,
+    );
+    dirty |= noise_reduction_block(ui, history, access);
     dirty
 }
 
-/// Sliders for the selected local adjustment's first mask shape (gradient
-/// endpoints or radial center/radius/feather), in normalized coordinates. Each
-/// shape's sliders share one gesture scope, so editing a shape is one undo step.
-fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usize) -> bool {
-    match history.current().locals[i].mask.shapes.first().cloned() {
+/// The mask shape list for the selected local: a selectable row per shape labeled
+/// by kind, with a per-shape combine op (the base shape shows no op), an add menu,
+/// and a remove button (which drops the matching `ops` entry too, keeping the two
+/// vectors parallel). The selected shape drives the on-canvas handles. Each list
+/// mutation is one undo step.
+fn mask_shape_list(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    local: usize,
+    shape_sel: &mut usize,
+) -> bool {
+    let mut dirty = false;
+    let count = history.current().locals[local].mask.shapes.len();
+    clamp_selection(shape_sel, count.max(1));
+
+    ui.label("Mask shapes:");
+    for s in 0..count {
+        ui.horizontal(|ui| {
+            let label = {
+                let shape = &history.current().locals[local].mask.shapes[s];
+                format!("{}. {}", s + 1, shape_kind_label(shape))
+            };
+            if ui.selectable_label(*shape_sel == s, label).clicked() {
+                *shape_sel = s;
+            }
+            // The base shape's op is ignored; later shapes pick how they combine.
+            if s > 0 {
+                let mut op = history.current().locals[local]
+                    .mask
+                    .ops
+                    .get(s)
+                    .copied()
+                    .unwrap_or(MaskOp::Add);
+                let before = op;
+                egui::ComboBox::from_id_salt(("mask_op", local, s))
+                    .selected_text(op_label(op))
+                    .show_ui(ui, |ui| {
+                        for choice in [MaskOp::Add, MaskOp::Subtract, MaskOp::Intersect] {
+                            ui.selectable_value(&mut op, choice, op_label(choice));
+                        }
+                    });
+                if op != before {
+                    history.begin();
+                    let ops = &mut history.current_mut().locals[local].mask.ops;
+                    // Keep ops parallel before indexing (older masks may be short).
+                    while ops.len() <= s {
+                        ops.push(MaskOp::Add);
+                    }
+                    ops[s] = op;
+                    history.commit();
+                    dirty = true;
+                }
+            } else {
+                ui.label("(base)");
+            }
+            // Remove this shape (and its op), keeping the two vectors parallel.
+            if count > 1 && ui.button("✕").on_hover_text("Remove shape").clicked() {
+                history.begin();
+                let mask = &mut history.current_mut().locals[local].mask;
+                mask.shapes.remove(s);
+                if s < mask.ops.len() {
+                    mask.ops.remove(s);
+                }
+                history.commit();
+                dirty = true;
+            }
+        });
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Add:");
+        for (label, kind) in [
+            ("Gradient", ShapeKind::Gradient),
+            ("Radial", ShapeKind::Radial),
+            ("Luminosity", ShapeKind::Luminosity),
+            ("Color", ShapeKind::ColorRange),
+            ("Brush", ShapeKind::Brush),
+        ] {
+            if ui.button(label).clicked() {
+                add_shape(history, local, kind, shape_sel);
+                dirty = true;
+            }
+        }
+    });
+
+    // The remove above may have shrunk the list; re-clamp the selection.
+    let now = history.current().locals[local].mask.shapes.len();
+    clamp_selection(shape_sel, now.max(1));
+    dirty
+}
+
+/// The combine-op label shown in the op selector.
+fn op_label(op: MaskOp) -> &'static str {
+    match op {
+        MaskOp::Add => "Add",
+        MaskOp::Subtract => "Subtract",
+        MaskOp::Intersect => "Intersect",
+    }
+}
+
+/// Sliders for the selected local adjustment's selected mask shape (gradient
+/// endpoints or radial center/radius/feather, etc.), in normalized coordinates.
+/// Each shape's sliders share one gesture scope, so editing a shape is one undo
+/// step. `shape` is the index of the shape being edited within the mask.
+fn local_shape_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    i: usize,
+    shape: usize,
+) -> bool {
+    match history.current().locals[i].mask.shapes.get(shape).cloned() {
         Some(MaskShape::Gradient(g)) => {
             let mut scope = GestureScope::default();
             for (label, help, default, getc, setc) in [
@@ -1062,12 +1549,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                         neutral: default,
                         help,
                     },
-                    move |s| match &s.locals[i].mask.shapes[0] {
+                    move |s| match &s.locals[i].mask.shapes[shape] {
                         MaskShape::Gradient(g) => getc(g),
                         _ => default,
                     },
                     move |s, v| {
-                        if let MaskShape::Gradient(g) = &mut s.locals[i].mask.shapes[0] {
+                        if let MaskShape::Gradient(g) = &mut s.locals[i].mask.shapes[shape] {
                             setc(g, v);
                         }
                     },
@@ -1099,12 +1586,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                         neutral: default,
                         help,
                     },
-                    move |s| match &s.locals[i].mask.shapes[0] {
+                    move |s| match &s.locals[i].mask.shapes[shape] {
                         MaskShape::Radial(r) => getc(r),
                         _ => default,
                     },
                     move |s, v| {
-                        if let MaskShape::Radial(r) = &mut s.locals[i].mask.shapes[0] {
+                        if let MaskShape::Radial(r) = &mut s.locals[i].mask.shapes[shape] {
                             setc(r, v);
                         }
                     },
@@ -1124,12 +1611,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: l.lo,
                     help: "Darkest selected tone",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::Luminosity(l) => l.lo,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::Luminosity(l) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::Luminosity(l) = &mut s.locals[i].mask.shapes[shape] {
                         l.lo = v;
                     }
                 },
@@ -1144,12 +1631,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: l.hi,
                     help: "Brightest selected tone",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::Luminosity(l) => l.hi,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::Luminosity(l) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::Luminosity(l) = &mut s.locals[i].mask.shapes[shape] {
                         l.hi = v;
                     }
                 },
@@ -1164,12 +1651,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: l.feather,
                     help: "Edge softness",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::Luminosity(l) => l.feather,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::Luminosity(l) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::Luminosity(l) = &mut s.locals[i].mask.shapes[shape] {
                         l.feather = v;
                     }
                 },
@@ -1188,12 +1675,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: c.hue,
                     help: "Target hue",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::ColorRange(c) => c.hue,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[shape] {
                         c.hue = v;
                     }
                 },
@@ -1208,12 +1695,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: c.hue_width,
                     help: "Hue band half-width",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::ColorRange(c) => c.hue_width,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[shape] {
                         c.hue_width = v;
                     }
                 },
@@ -1228,12 +1715,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: c.sat_min,
                     help: "Reject paler colors",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::ColorRange(c) => c.sat_min,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[shape] {
                         c.sat_min = v;
                     }
                 },
@@ -1248,12 +1735,12 @@ fn local_shape_block(ui: &mut egui::Ui, history: &mut History<Settings>, i: usiz
                     neutral: c.feather,
                     help: "Edge softness",
                 },
-                move |s| match &s.locals[i].mask.shapes[0] {
+                move |s| match &s.locals[i].mask.shapes[shape] {
                     MaskShape::ColorRange(c) => c.feather,
                     _ => 0.0,
                 },
                 move |s, v| {
-                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[0] {
+                    if let MaskShape::ColorRange(c) = &mut s.locals[i].mask.shapes[shape] {
                         c.feather = v;
                     }
                 },
@@ -1320,6 +1807,56 @@ fn rad_set_f(r: &mut Radial, v: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_shape_keeps_ops_parallel_and_appends() {
+        // Appending a shape pushes a parallel default Add op and selects the new
+        // shape, keeping `ops.len() == shapes.len()` — the invariant `weight_at`
+        // relies on. The base shape's op is present but ignored by the engine.
+        let mut h = History::new(Settings {
+            locals: vec![LocalAdjustment {
+                mask: Mask {
+                    shapes: vec![default_shape(ShapeKind::Radial)],
+                    ops: vec![MaskOp::Add],
+                    invert: false,
+                },
+                adjustments: Adjustments::default(),
+                opacity: 1.0,
+            }],
+            ..Settings::default()
+        });
+        let mut shape_sel = 0;
+        add_shape(&mut h, 0, ShapeKind::Luminosity, &mut shape_sel);
+        let mask = &h.current().locals[0].mask;
+        assert_eq!(mask.shapes.len(), 2, "shape appended");
+        assert_eq!(mask.ops.len(), mask.shapes.len(), "ops stay parallel");
+        assert_eq!(shape_sel, 1, "new shape selected");
+        assert!(matches!(mask.shapes[1], MaskShape::Luminosity(_)));
+        // One undo removes the whole append (one step).
+        assert!(h.undo());
+        assert_eq!(h.current().locals[0].mask.shapes.len(), 1);
+    }
+
+    #[test]
+    fn local_access_binds_writes_to_the_right_local() {
+        // The `LocalAccess` get/set reach into `locals[i].adjustments`, not the
+        // global — so a block bound to a local edits only that local's catalog,
+        // proving the reusable surface is correctly parameterized.
+        let mut s = Settings {
+            locals: vec![LocalAdjustment::default(), LocalAdjustment::default()],
+            ..Settings::default()
+        };
+        let access = LocalAccess { index: 1 };
+        access.get_mut(&mut s).exposure = Some(1.5);
+        assert_eq!(s.locals[1].adjustments.exposure, Some(1.5), "local 1 set");
+        assert_eq!(s.locals[0].adjustments.exposure, None, "local 0 untouched");
+        assert_eq!(s.global.exposure, None, "global untouched");
+        assert_eq!(access.get(&s).exposure, Some(1.5));
+        // GlobalAccess reaches the global catalog.
+        GlobalAccess.get_mut(&mut s).saturation = Some(0.8);
+        assert_eq!(s.global.saturation, Some(0.8));
+        assert_eq!(s.locals[1].adjustments.saturation, None);
+    }
 
     #[test]
     fn opt_neutral_maps_to_none() {

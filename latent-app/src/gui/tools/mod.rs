@@ -153,6 +153,7 @@ pub(crate) fn interact(
     transform: &ViewTransform,
     active: usize,
     local_sel: usize,
+    shape_sel: usize,
 ) -> bool {
     // A pan gesture always wins, and `None` is pure view.
     if session.tool == CanvasTool::None || pan_gesture(resp) {
@@ -161,13 +162,57 @@ pub(crate) fn interact(
     match session.tool {
         CanvasTool::Crop => crop_interact(session, resp, painter, transform, active),
         CanvasTool::Keystone => keystone_interact(session, resp, painter, transform, active),
-        CanvasTool::MaskShape => {
-            mask_interact(session, resp, painter, transform, active, local_sel)
-        }
+        CanvasTool::MaskShape => mask_interact(
+            session, resp, painter, transform, active, local_sel, shape_sel,
+        ),
         CanvasTool::Straighten => straighten_interact(session, resp, painter, transform, active),
-        CanvasTool::Brush => brush_interact(session, resp, painter, transform, active, local_sel),
-        CanvasTool::None | CanvasTool::WbPick => false,
+        CanvasTool::Brush => brush_interact(
+            session, resp, painter, transform, active, local_sel, shape_sel,
+        ),
+        CanvasTool::WbPick => wb_pick_interact(session, resp, transform, active),
+        CanvasTool::None => false,
     }
+}
+
+/// The gray eyedropper: a click on the image samples the linear working pixel
+/// there and sets the global white balance so that patch renders neutral, then
+/// disarms the tool (one click, one undo step). The sampled pixel is the
+/// **post-WB** preview pixel (the image as currently rendered), so the
+/// neutralizing math composes the delta onto the current offset. Off-image clicks
+/// are ignored.
+fn wb_pick_interact(
+    session: &mut super::app::Session,
+    resp: &egui::Response,
+    transform: &ViewTransform,
+    active: usize,
+) -> bool {
+    use super::widgets::{wb, wb_or_none};
+    if !resp.clicked() {
+        return false;
+    }
+    let Some(pos) = resp.interact_pointer_pos() else {
+        return false;
+    };
+    let norm = transform.screen_to_image_norm(pos);
+    if norm[0] < 0.0 || norm[0] > 1.0 || norm[1] < 0.0 || norm[1] > 1.0 {
+        return false;
+    }
+    let Some(img) = &session.preview_rendered else {
+        return false;
+    };
+    let (px, py) = super::canvas::norm_to_pixel(norm, img.width(), img.height());
+    let Some(sample) = img.try_get(px, py) else {
+        return false;
+    };
+    let history = &mut session.variants[active];
+    let current = history.current().global.white_balance.unwrap_or_default();
+    let neutralized = wb::neutralizing_wb(sample, current);
+    history.begin();
+    history.current_mut().global.white_balance = wb_or_none(neutralized);
+    history.commit();
+    // One pick is enough; return to plain view so the next click doesn't re-pick.
+    session.tool = CanvasTool::None;
+    true
 }
 
 /// The normalized pointer position for a drag this frame, if any.
@@ -257,8 +302,10 @@ fn mask_interact(
     transform: &ViewTransform,
     active: usize,
     local_sel: usize,
+    shape_sel: usize,
 ) -> bool {
-    let Some(shape) = mask_shape::selected_shape(session.variants[active].current(), local_sel)
+    let Some(shape) =
+        mask_shape::selected_shape(session.variants[active].current(), local_sel, shape_sel)
     else {
         return false;
     };
@@ -275,7 +322,7 @@ fn mask_interact(
         && let Some(p) = pointer_norm(resp, transform)
     {
         let updated = mask_shape::apply_drag(&start, grab, p);
-        mask_shape::write(&mut session.variants[active], local_sel, updated);
+        mask_shape::write(&mut session.variants[active], local_sel, shape_sel, updated);
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::MaskShape(..))) {
@@ -333,14 +380,16 @@ fn brush_interact(
     transform: &ViewTransform,
     active: usize,
     local_sel: usize,
+    shape_sel: usize,
 ) -> bool {
     use latent_edit::{Dab, MaskShape};
-    // Only paint when the selected local is a brush mask.
+    // Only paint when the selected shape of the selected local is a brush mask.
     let is_brush = session.variants[active]
         .current()
         .locals
         .get(local_sel)
-        .is_some_and(|l| matches!(l.mask.shapes.first(), Some(MaskShape::Brush(_))));
+        .and_then(|l| l.mask.shapes.get(shape_sel))
+        .is_some_and(|s| matches!(s, MaskShape::Brush(_)));
     if !is_brush {
         return false;
     }
@@ -359,7 +408,7 @@ fn brush_interact(
         if let Some(MaskShape::Brush(b)) = session.variants[active].current_mut().locals[local_sel]
             .mask
             .shapes
-            .first_mut()
+            .get_mut(shape_sel)
         {
             b.dabs.push(Dab {
                 x: nx,

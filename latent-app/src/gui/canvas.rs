@@ -257,6 +257,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     let before_id = session.before_texture.as_ref().map(|t| t.id());
     let active = session.active;
     let local_sel = session.local_sel;
+    let shape_sel = session.shape_sel;
     let mut painted = false;
     // Cleared each frame; re-set below when the cursor is over the image.
     session.pixel_readout = None;
@@ -336,7 +337,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             // and consumes the drag when it grabs one, falling through to pan
             // otherwise. One undo step per drag (begin on grab, commit on
             // release). `dirty` is set when the tool changed the settings.
-            let changed = tools::interact(session, &resp, &painter, &transform, active, local_sel);
+            let changed = tools::interact(
+                session, &resp, &painter, &transform, active, local_sel, shape_sel,
+            );
             painted |= changed;
         });
 

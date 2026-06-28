@@ -29,11 +29,11 @@ pub(crate) enum ShapeGrab {
 }
 
 /// The selected shape of the selected local, if it is a gradient or radial (the
-/// only shapes with positional handles). The selected shape is the first until a
-/// multi-shape selection lands.
-pub(crate) fn selected_shape(settings: &Settings, local: usize) -> Option<MaskShape> {
+/// only shapes with positional handles). `shape` is the index within the local's
+/// shape list, so the handles follow the shape selected in the panel.
+pub(crate) fn selected_shape(settings: &Settings, local: usize, shape: usize) -> Option<MaskShape> {
     let l = settings.locals.get(local)?;
-    match l.mask.shapes.first()? {
+    match l.mask.shapes.get(shape)? {
         s @ (MaskShape::Gradient(_) | MaskShape::Radial(_)) => Some(s.clone()),
         _ => None,
     }
@@ -144,12 +144,17 @@ pub(crate) fn apply_drag(shape: &MaskShape, grab: ShapeGrab, p: [f32; 2]) -> Mas
     }
 }
 
-/// Write the updated shape to the selected local's first shape (mid-drag).
-pub(crate) fn write(history: &mut History<Settings>, local: usize, shape: MaskShape) {
+/// Write the updated shape to the selected local's selected shape (mid-drag).
+pub(crate) fn write(
+    history: &mut History<Settings>,
+    local: usize,
+    shape_sel: usize,
+    shape: MaskShape,
+) {
     if let Some(l) = history.current_mut().locals.get_mut(local)
-        && let Some(first) = l.mask.shapes.first_mut()
+        && let Some(slot) = l.mask.shapes.get_mut(shape_sel)
     {
-        *first = shape;
+        *slot = shape;
     }
 }
 

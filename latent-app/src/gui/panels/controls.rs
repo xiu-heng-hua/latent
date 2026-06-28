@@ -75,7 +75,14 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                             |st| st.global.exposure,
                             |st, v| st.global.exposure = v,
                         );
-                        d |= widgets::white_balance_block(ui, &mut s.variants[s.active]);
+                        let mut action = widgets::WbAction::None;
+                        d |= widgets::white_balance_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::GlobalAccess,
+                            &mut action,
+                        );
+                        s.wb_action = action;
                         d
                     },
                 );
@@ -87,7 +94,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     sections_open,
                     &mut toggles,
                     SectionId::Tone,
-                    |ui, s| widgets::tone_block(ui, &mut s.variants[s.active]),
+                    |ui, s| {
+                        widgets::tone_block(ui, &mut s.variants[s.active], widgets::GlobalAccess)
+                    },
                 );
 
                 dirty |= section(
@@ -98,7 +107,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     &mut toggles,
                     SectionId::Color,
                     |ui, s| {
-                        widgets::opt_point_slider(
+                        let mut d = false;
+                        d |= widgets::opt_point_slider(
                             ui,
                             &mut s.variants[s.active],
                             widgets::SliderSpec {
@@ -109,7 +119,18 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                             },
                             |st| st.global.saturation,
                             |st, v| st.global.saturation = v,
-                        )
+                        );
+                        d |= widgets::hsl_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::GlobalAccess,
+                        );
+                        d |= widgets::channel_mixer_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::GlobalAccess,
+                        );
+                        d
                     },
                 );
 
@@ -122,7 +143,12 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     SectionId::Curves,
                     |ui, s| {
                         let active = s.active;
-                        widgets::curves_block(ui, &mut s.variants[active], &mut s.curve_channel)
+                        widgets::curves_block(
+                            ui,
+                            &mut s.variants[active],
+                            &mut s.curve_channel,
+                            widgets::GlobalAccess,
+                        )
                     },
                 );
 
@@ -135,8 +161,16 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     SectionId::Detail,
                     |ui, s| {
                         let mut d = false;
-                        d |= widgets::sharpen_block(ui, &mut s.variants[s.active]);
-                        d |= widgets::clarity_block(ui, &mut s.variants[s.active]);
+                        d |= widgets::sharpen_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::GlobalAccess,
+                        );
+                        d |= widgets::clarity_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::GlobalAccess,
+                        );
                         d |= widgets::opt_point_slider(
                             ui,
                             &mut s.variants[s.active],
@@ -149,7 +183,11 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                             |st| st.global.dehaze,
                             |st, v| st.global.dehaze = v,
                         );
-                        d |= widgets::noise_reduction_block(ui, &mut s.variants[s.active]);
+                        d |= widgets::noise_reduction_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::GlobalAccess,
+                        );
                         d
                     },
                 );
@@ -176,6 +214,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         geometry_tools(s, ui);
                         d |= widgets::straighten_slider(ui, &mut s.variants[s.active]);
                         d |= widgets::keystone_block(ui, &mut s.variants[s.active]);
+                        d |= lens_block(s, ui);
                         crop_aspect_row(s, ui);
                         d |= widgets::crop_block(ui, &mut s.variants[s.active]);
                         d
@@ -191,11 +230,17 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     SectionId::Masks,
                     |ui, s| {
                         let mut d = false;
+                        let mut action = widgets::WbAction::None;
                         d |= widgets::local_adjustments(
                             ui,
                             &mut s.variants[s.active],
                             &mut s.local_sel,
+                            &mut s.shape_sel,
+                            &mut action,
                         );
+                        if action != widgets::WbAction::None {
+                            s.wb_action = action;
+                        }
                         local_tool_row(s, ui);
                         d
                     },
@@ -310,14 +355,15 @@ fn reset_section(history: &mut History<Settings>, id: SectionId) {
 }
 
 /// The local-adjustment tool row: the brush/shape activator and brush sliders that
-/// follow the selected local's first shape.
+/// follow the selected local's selected shape.
 fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
     use crate::gui::tools::CanvasTool;
+    let shape_sel = session.shape_sel;
     let shape = session.variants[session.active]
         .current()
         .locals
         .get(session.local_sel)
-        .and_then(|l| l.mask.shapes.first().cloned());
+        .and_then(|l| l.mask.shapes.get(shape_sel).cloned());
     match shape {
         Some(MaskShape::Brush(_)) => {
             if ui
@@ -390,6 +436,72 @@ fn export_section(session: &mut Session, ui: &mut egui::Ui, do_export: &mut bool
 
     if ui.button("Export…").clicked() {
         *do_export = true;
+    }
+}
+
+/// The lens-correction panel: an enable checkbox over `geometry.lens`, off by
+/// default. Enabling detects a profile from the RAW's EXIF on the main thread
+/// (the lensfun `Database` is not `Send`, so it never crosses the render worker)
+/// and applies it — or reports that none was found and leaves the checkbox off.
+/// Disabling clears the correction. Returns whether the preview is now dirty.
+fn lens_block(session: &mut Session, ui: &mut egui::Ui) -> bool {
+    let active = session.active;
+    let mut dirty = false;
+    let mut enabled = session.variants[active].current().geometry.lens.is_some();
+    let changed = ui
+        .checkbox(&mut enabled, "Lens Corrections")
+        .on_hover_text("Correct lens distortion/vignetting from the lens profile")
+        .changed();
+    if changed {
+        if enabled {
+            // Detect synchronously on the main thread (a one-shot lookup, never a
+            // per-frame cost) and apply when a profile is found.
+            match crate::gui::state::auto_lens_profile(&session.meta) {
+                Some(profile) => {
+                    let history = &mut session.variants[active];
+                    history.begin();
+                    history.current_mut().geometry.lens = Some(profile);
+                    history.commit();
+                    session.lens_name = Some(lens_display_name(&session.meta));
+                    dirty = true;
+                }
+                None => {
+                    // No match: leave the lens off and report it.
+                    session.lens_name = None;
+                }
+            }
+        } else {
+            let history = &mut session.variants[active];
+            history.begin();
+            history.current_mut().geometry.lens = None;
+            history.commit();
+            session.lens_name = None;
+            dirty = true;
+        }
+    }
+
+    if session.variants[active].current().geometry.lens.is_some() {
+        let name = session
+            .lens_name
+            .clone()
+            .unwrap_or_else(|| "Lens profile applied".to_owned());
+        ui.label(name);
+    } else if enabled {
+        // The user ticked the box but nothing matched (the box reads back off).
+        ui.label("No lens profile found");
+    }
+    dirty
+}
+
+/// A display name for the detected lens: the EXIF lens model when present, else
+/// the camera body. Used only for the panel label.
+fn lens_display_name(meta: &latent_raw::Metadata) -> String {
+    if !meta.lens.is_empty() {
+        meta.lens.clone()
+    } else if !meta.model.is_empty() {
+        meta.model.clone()
+    } else {
+        "Lens profile applied".to_owned()
     }
 }
 

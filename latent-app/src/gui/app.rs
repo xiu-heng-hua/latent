@@ -115,6 +115,18 @@ pub(crate) struct Session {
     pub(crate) pixel_readout: Option<PixelReadout>,
     /// Index of the local adjustment selected for editing in the panel.
     pub(crate) local_sel: usize,
+    /// Index of the mask shape (within the selected local) being edited — the one
+    /// the on-canvas handles and the brush follow.
+    pub(crate) shape_sel: usize,
+    /// A white-balance action the panel requested this frame (eyedropper / auto),
+    /// handled after the panel closure releases the session borrow.
+    pub(crate) wb_action: crate::gui::widgets::WbAction,
+    /// The RAW's decoded EXIF metadata, for on-demand lens detection on the main
+    /// thread (the lensfun `Database` is not `Send`).
+    pub(crate) meta: latent_raw::Metadata,
+    /// The detected lens's display name once the user enables lens correction, for
+    /// the panel label. `None` until a successful detection.
+    pub(crate) lens_name: Option<String>,
     /// Brush tool settings for painting dabs onto a brush mask (normalized).
     pub(crate) brush_radius: f32,
     pub(crate) brush_feather: f32,
@@ -170,6 +182,10 @@ impl Session {
             before: BeforeAfter::default(),
             pixel_readout: None,
             local_sel: 0,
+            shape_sel: 0,
+            wb_action: crate::gui::widgets::WbAction::None,
+            meta: data.meta,
+            lens_name: None,
             brush_radius: 0.08,
             brush_feather: 0.04,
             brush_erase: false,
@@ -816,6 +832,65 @@ impl App {
             self.shortcuts_open = !self.shortcuts_open;
         }
     }
+
+    /// Apply a white-balance action the panel requested this frame: activating the
+    /// gray eyedropper (a canvas tool), or running a gray-world Auto estimate from
+    /// the preview's average linear RGB. Both write only the global
+    /// `WhiteBalance { temp, tint }` field; Auto is one undo step. Returns whether
+    /// the preview is now dirty.
+    fn handle_wb_action(&mut self) -> bool {
+        use crate::gui::widgets::{WbAction, wb};
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        let action = std::mem::take(&mut session.wb_action);
+        match action {
+            WbAction::None => false,
+            WbAction::PickGray => {
+                // Arm the eyedropper; the pick is consumed on the next canvas click.
+                session.tool = CanvasTool::WbPick;
+                false
+            }
+            WbAction::Auto => {
+                let Some(mean) = session.preview_rendered.as_ref().and_then(image_mean_rgb) else {
+                    return false;
+                };
+                let history = &mut session.variants[session.active];
+                let current = history.current().global.white_balance.unwrap_or_default();
+                let estimated = wb::auto_wb(mean, current);
+                history.begin();
+                history.current_mut().global.white_balance =
+                    crate::gui::widgets::wb_or_none(estimated);
+                history.commit();
+                true
+            }
+        }
+    }
+}
+
+/// The average linear RGB over a whole image, or `None` for an empty image. Used
+/// by the gray-world Auto white balance as the patch to neutralize.
+fn image_mean_rgb(img: &ImageBuf) -> Option<[f32; 3]> {
+    let (w, h) = (img.width(), img.height());
+    let count = (w as u64) * (h as u64);
+    if count == 0 {
+        return None;
+    }
+    let mut sum = [0.0_f64; 3];
+    for y in 0..h {
+        for x in 0..w {
+            let p = img.get(x, y);
+            sum[0] += p[0] as f64;
+            sum[1] += p[1] as f64;
+            sum[2] += p[2] as f64;
+        }
+    }
+    let n = count as f64;
+    Some([
+        (sum[0] / n) as f32,
+        (sum[1] / n) as f32,
+        (sum[2] / n) as f32,
+    ])
 }
 
 impl Session {
@@ -946,6 +1021,10 @@ impl eframe::App for App {
         panels::toolbar::show(self, ctx, &mut do_undo, &mut do_redo, &mut dirty);
         panels::statusbar::show(self, ctx);
         dirty |= panels::controls::show(self, ctx);
+
+        // Apply any white-balance action the panel requested (eyedropper / auto),
+        // released from the panel's session borrow.
+        dirty |= self.handle_wb_action();
 
         if let Some(session) = &mut self.session {
             if do_undo && session.active_history().undo() {

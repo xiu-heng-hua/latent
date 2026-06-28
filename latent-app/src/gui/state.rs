@@ -31,6 +31,10 @@ pub(crate) struct SessionData {
     pub(crate) path: String,
     /// Default export file name (the source stem with an image extension).
     pub(crate) output: String,
+    /// The RAW's decoded EXIF metadata, carried onto the session so the lens
+    /// panel can detect a profile on demand (the lensfun `Database` is not `Send`,
+    /// so detection runs later on the main thread, never on this worker).
+    pub(crate) meta: latent_raw::Metadata,
 }
 
 /// What the render worker produces back to the main thread: a freshly rendered
@@ -128,8 +132,15 @@ impl RenderJob {
 
 /// Develop `input` into a [`SessionData`]: decode and develop the RAW, build the
 /// full-res and downscaled-preview bases, resolve the title and default export
-/// name, and restore the edit sidecar (`<raw>.ron`) when present. On a fresh
-/// document (no sidecar) a detected lens profile is auto-applied from the EXIF.
+/// name, and restore the edit sidecar (`<raw>.ron`) when present.
+///
+/// Lens correction is off by default: a fresh document (no sidecar) opens with
+/// `geometry.lens == None` and no correction applied — the user enables it from
+/// the lens panel. A saved sidecar's lens is loaded verbatim (kept as the user's
+/// prior choice), since only the fresh-document default changed, never saved
+/// intent. The decoded EXIF is carried on the result so the panel can detect a
+/// profile on demand on the main thread (the lensfun `Database` is not `Send`).
+///
 /// Pure — no egui, no `App` — so it is testable without a window and runs on the
 /// worker thread. A bad/corrupt input returns an `Err` (never a panic), which the
 /// caller surfaces while leaving the current session intact.
@@ -141,22 +152,16 @@ pub(crate) fn load_session(input: &Path) -> Result<SessionData, String> {
     let path = input.display().to_string();
     let output = input.with_extension("jpg").to_string_lossy().into_owned();
 
-    // Reload edits from the sidecar (photo.nef → photo.ron) if present.
+    // Reload edits from the sidecar (photo.nef → photo.ron) if present. A saved
+    // lens (the user's prior choice) is kept exactly as stored; a fresh document
+    // gets no lens (off by default).
     let sidecar = input.with_extension("ron");
     let loaded = std::fs::read_to_string(&sidecar)
         .ok()
         .and_then(|text| Document::from_ron(&text).ok());
-    let from_sidecar = loaded.is_some();
     let mut document = loaded.unwrap_or_default();
     if document.variants.is_empty() {
         document.variants.push(Settings::default());
-    }
-    // On a fresh document (no sidecar), auto-apply a lens profile from the RAW's
-    // EXIF if lensfun has one. A saved sidecar always wins — we never overwrite it.
-    if !from_sidecar && let Some(profile) = auto_lens_profile(&meta) {
-        for variant in &mut document.variants {
-            variant.geometry.lens = Some(profile);
-        }
     }
     let saved = document.variants.clone();
     let variants = document.variants.into_iter().map(History::new).collect();
@@ -170,6 +175,7 @@ pub(crate) fn load_session(input: &Path) -> Result<SessionData, String> {
         title,
         path,
         output,
+        meta,
     })
 }
 
@@ -364,6 +370,58 @@ mod tests {
             "a bad input must surface as Err, not panic"
         );
         std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn fresh_document_has_no_lens_by_default() {
+        // Lens correction is off by default: a fresh document (the no-sidecar
+        // fallback `load_session` builds) carries no lens. Only the user enabling
+        // it — or a saved sidecar — sets `geometry.lens`. This pins the
+        // off-by-default behavior independently of a real RAW decode.
+        let doc = Document::default();
+        for variant in &doc.variants {
+            assert_eq!(
+                variant.geometry.lens, None,
+                "a fresh document applies no lens correction"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_sidecar_lens_is_kept_verbatim() {
+        // A sidecar that already carries a lens (the user enabled it before) loads
+        // with that lens still applied — the fresh-document default never overrides
+        // saved intent. Exercises the sidecar-restore half of `load_session`.
+        use latent_edit::{DistortionModel, Geometry, LensProfile};
+        let dir = std::env::temp_dir().join("latent_lens_sidecar_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("photo.ron");
+        let lens = LensProfile {
+            model: DistortionModel::Poly3,
+            distortion: [0.0, -0.1, 0.0, 0.0],
+            ..LensProfile::default()
+        };
+        let doc = Document {
+            version: Document::VERSION,
+            variants: vec![Settings {
+                geometry: Geometry {
+                    lens: Some(lens),
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            }],
+        };
+        std::fs::write(&sidecar, doc.to_ron().unwrap()).unwrap();
+        let restored = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|t| Document::from_ron(&t).ok())
+            .expect("sidecar restores");
+        assert_eq!(
+            restored.variants[0].geometry.lens,
+            Some(lens),
+            "a saved lens is kept verbatim"
+        );
+        std::fs::remove_file(&sidecar).ok();
     }
 
     #[test]
