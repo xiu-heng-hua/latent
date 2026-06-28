@@ -22,6 +22,13 @@ const GAIN: f32 = 1.6;
 /// The four corner anchors (normalized), in TL, TR, BR, BL order.
 pub(crate) const CORNERS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 
+/// The no-correction keystone parameters, the absolute-mapping reference a corner
+/// drag reduces the pointer against.
+pub(crate) const ZERO: Perspective = Perspective {
+    vertical: 0.0,
+    horizontal: 0.0,
+};
+
 /// Reduce a dragged corner to the two symmetric keystone parameters.
 ///
 /// `corner` is which corner moved (0=TL, 1=TR, 2=BR, 3=BL) and `p` its new
@@ -56,17 +63,39 @@ pub(crate) fn corner_to_params(corner: usize, p: [f32; 2], start: Perspective) -
     }
 }
 
-/// The current keystone parameters, or both-zero when there is no correction.
-pub(crate) fn current(settings: &Settings) -> Perspective {
-    settings.geometry.perspective.unwrap_or(Perspective {
-        vertical: 0.0,
-        horizontal: 0.0,
-    })
+/// Where the four corner handles sit for the keystone parameters `p`, as
+/// normalized anchors in [`CORNERS`] order — the inverse of [`corner_to_params`]
+/// about a zero start. So the handles *move* off the frame corners to show the
+/// pending correction (e.g. a positive `vertical` pulls the two top corners
+/// inward), and the quad they span is the pending corrected outline.
+pub(crate) fn corner_positions(p: Perspective) -> [[f32; 2]; 4] {
+    let mut out = CORNERS;
+    for (i, anchor) in out.iter_mut().enumerate() {
+        let is_top = i == 0 || i == 1;
+        let is_left = i == 0 || i == 3;
+        let v_dir = if is_top { 1.0 } else { -1.0 };
+        let h_dir = if is_left { 1.0 } else { -1.0 };
+        // Recover the displacement that maps to these params (inverse of the
+        // forward reduction in `corner_to_params`).
+        let inward_x = p.vertical / (v_dir * GAIN);
+        let dx = if is_left { inward_x } else { -inward_x };
+        let inward_y = p.horizontal / (h_dir * GAIN);
+        let dy = if is_top { inward_y } else { -inward_y };
+        anchor[0] = (CORNERS[i][0] + dx).clamp(-0.5, 1.5);
+        anchor[1] = (CORNERS[i][1] + dy).clamp(-0.5, 1.5);
+    }
+    out
 }
 
-/// Hit-test the four corner handles; returns the corner index a press grabs.
-pub(crate) fn hit_test(pointer: Pos2, transform: &ViewTransform) -> Option<usize> {
-    nearest_handle(&CORNERS, pointer, transform, HANDLE_HIT_RADIUS)
+/// The current keystone parameters, or both-zero when there is no correction.
+pub(crate) fn current(settings: &Settings) -> Perspective {
+    settings.geometry.perspective.unwrap_or(ZERO)
+}
+
+/// Hit-test the four corner handles at their current (params-displaced)
+/// positions; returns the corner index a press grabs.
+pub(crate) fn hit_test(p: Perspective, pointer: Pos2, transform: &ViewTransform) -> Option<usize> {
+    nearest_handle(&corner_positions(p), pointer, transform, HANDLE_HIT_RADIUS)
 }
 
 /// Write the keystone parameters (mid-drag), clearing to `None` when both reach
@@ -76,19 +105,35 @@ pub(crate) fn write(history: &mut History<Settings>, p: Perspective) {
         (p.vertical != 0.0 || p.horizontal != 0.0).then_some(p);
 }
 
-/// Draw the keystone overlay: the four corner handles and the edges between them.
-pub(crate) fn draw_overlay(painter: &egui::Painter, transform: &ViewTransform) {
-    let pts: Vec<Pos2> = CORNERS
+/// Draw the keystone overlay: the un-warped frame (a faint reference rectangle)
+/// and, over it, the pending corrected quad — the four corner handles at their
+/// params-displaced positions joined by an accent outline — so the handles move
+/// to show the correction while the image underneath stays put.
+pub(crate) fn draw_overlay(painter: &egui::Painter, transform: &ViewTransform, p: Perspective) {
+    // The static frame reference (where the corners start).
+    let frame: Vec<Pos2> = CORNERS
         .iter()
         .map(|&c| transform.image_norm_to_screen(c))
         .collect();
     for w in 0..4 {
         painter.line_segment(
-            [pts[w], pts[(w + 1) % 4]],
-            Stroke::new(1.0, Color32::from_white_alpha(120)),
+            [frame[w], frame[(w + 1) % 4]],
+            Stroke::new(1.0, Color32::from_white_alpha(70)),
         );
     }
-    for &c in &CORNERS {
+    // The pending corrected quad and its draggable corner handles.
+    let corners = corner_positions(p);
+    let quad: Vec<Pos2> = corners
+        .iter()
+        .map(|&c| transform.image_norm_to_screen(c))
+        .collect();
+    for w in 0..4 {
+        painter.line_segment(
+            [quad[w], quad[(w + 1) % 4]],
+            Stroke::new(1.5, Color32::WHITE),
+        );
+    }
+    for &c in &corners {
         draw_handle(painter, transform, c);
     }
 }
@@ -102,6 +147,29 @@ mod tests {
             vertical: 0.0,
             horizontal: 0.0,
         }
+    }
+
+    #[test]
+    fn corner_positions_invert_corner_to_params() {
+        // The drawn handle positions are the inverse of the param reduction: a
+        // press at a handle's drawn position (against a zero start) reproduces the
+        // very params it was drawn from — so the grabbed handle tracks the pointer
+        // with no jump. Exercise both axes at once.
+        let p = Perspective {
+            vertical: 0.3,
+            horizontal: -0.2,
+        };
+        let positions = corner_positions(p);
+        for (corner, pos) in positions.iter().enumerate() {
+            let back = corner_to_params(corner, *pos, zero());
+            assert!(
+                (back.vertical - p.vertical).abs() < 1e-4
+                    && (back.horizontal - p.horizontal).abs() < 1e-4,
+                "corner {corner} round-trip: {back:?} vs {p:?}"
+            );
+        }
+        // Zero params leave the handles on the frame corners.
+        assert_eq!(corner_positions(zero()), CORNERS);
     }
 
     #[test]

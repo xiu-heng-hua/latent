@@ -530,8 +530,10 @@ impl Default for NoiseReduction {
 }
 
 /// Framing and orientation of the rendered image: an optional crop and a
-/// straighten angle. The default is the identity — no crop, no rotation.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// straighten angle. The default is the identity — no crop, no rotation — except
+/// that `auto_constrain` defaults on (it is a no-op until a rotation/keystone
+/// actually produces border wedges).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Geometry {
     /// Crop rectangle in normalized coordinates, or `None` for the full frame.
@@ -555,6 +557,13 @@ pub struct Geometry {
     /// default, so a distortion/keystone/straighten correction leaves the wedges
     /// for the user to crop; when on it may *minify* the image to fit.
     pub auto_scale: bool,
+    /// Trim the output to the largest valid (non-black) axis-aligned rectangle
+    /// after a straighten rotation (and, conservatively, a keystone warp) so the
+    /// border wedges never reach the result, composing with any explicit `crop`.
+    /// On by default; a no-op until a rotation/keystone produces wedges. Unlike
+    /// `auto_scale` (which *minifies* to fill the frame) this *crops* to the
+    /// valid interior, keeping the corrected pixels at full scale.
+    pub auto_constrain: bool,
     /// Output sharpening applied *after* geometry (OUTPUT space, post-resample),
     /// using the same perceptual L\* luma-sharpen as capture sharpen. `None` (or a
     /// `0` amount) is off; distinct from [`Adjustments::sharpen`], which runs in
@@ -562,9 +571,31 @@ pub struct Geometry {
     pub output_sharpen: Option<Sharpen>,
 }
 
+impl Default for Geometry {
+    /// The identity framing, except `auto_constrain` defaults on. With no crop,
+    /// rotation, keystone, lens, or vignette there are no border wedges, so the
+    /// default geometry is still a render no-op (`is_identity` stays true); the
+    /// constrain only does anything once a correction produces wedges.
+    fn default() -> Self {
+        Self {
+            crop: None,
+            orientation: Orientation::IDENTITY,
+            straighten_degrees: 0.0,
+            perspective: None,
+            lens: None,
+            vignette: None,
+            auto_scale: false,
+            auto_constrain: true,
+            output_sharpen: None,
+        }
+    }
+}
+
 impl Geometry {
     /// True if this geometry changes nothing (no crop, orientation, rotation,
-    /// keystone, lens, vignette, auto-scale, or output sharpen).
+    /// keystone, lens, vignette, auto-scale, or output sharpen). `auto_constrain`
+    /// is excluded: on its own (no rotation/keystone) it produces no wedges and so
+    /// is a no-op, and it is on by default.
     pub fn is_identity(&self) -> bool {
         self.crop.is_none()
             && self.orientation.is_identity()
@@ -973,7 +1004,7 @@ impl Geometry {
             sharpen.amount = finite_or(sharpen.amount, 0.0);
             sharpen.radius = finite_clamped(sharpen.radius, 0.0, 0.0, f32::MAX);
         }
-        // `auto_scale` is a plain bool — nothing to scrub.
+        // `auto_scale` and `auto_constrain` are plain bools — nothing to scrub.
     }
 }
 
@@ -1055,6 +1086,35 @@ mod tests {
         assert_eq!(s.global.sharpen, None);
         assert!(s.locals.is_empty());
         assert!(s.geometry.is_identity());
+    }
+
+    #[test]
+    fn auto_constrain_defaults_on_and_is_not_part_of_identity() {
+        // The constrain defaults on but, on its own (no rotation/keystone), it
+        // produces no wedges — so the default geometry is still a render no-op.
+        assert!(Geometry::default().auto_constrain);
+        assert!(Geometry::default().is_identity());
+        // Turning it off alone leaves the geometry an identity (it only ever trims
+        // wedges, which a default geometry has none of).
+        let off = Geometry {
+            auto_constrain: false,
+            ..Geometry::default()
+        };
+        assert!(off.is_identity());
+    }
+
+    #[test]
+    fn old_sidecar_without_auto_constrain_loads_on() {
+        // A sidecar written before the field existed omits `auto_constrain`; the
+        // serde struct default fills it from `Geometry::default()` — on — so an
+        // older edit gains the wedge trim rather than loading it off.
+        let ron = "(version: 1, variants: [(geometry: (straighten_degrees: 5.0))])";
+        let doc = Document::from_ron(ron).expect("a partial geometry loads");
+        assert!(
+            doc.variants[0].geometry.auto_constrain,
+            "a missing auto_constrain defaults on"
+        );
+        assert_eq!(doc.variants[0].geometry.straighten_degrees, 5.0);
     }
 
     #[test]
@@ -1417,6 +1477,8 @@ mod tests {
                 }),
                 vignette: Some(0.3),
                 auto_scale: true,
+                // A non-default value, so the round-trip exercises the field.
+                auto_constrain: false,
                 output_sharpen: Some(Sharpen {
                     amount: 0.6,
                     radius: 1.5,

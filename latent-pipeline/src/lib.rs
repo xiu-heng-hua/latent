@@ -1390,6 +1390,180 @@ fn auto_scale_factor(output: Extent, src: Extent, map: impl Fn(f32, f32) -> (f32
     if k.is_finite() && k > 0.0 { k } else { 1.0 }
 }
 
+/// A normalized axis-aligned rectangle in `[0, 1]²` over an image, used to carry
+/// the valid (non-black) region the auto-constrain trims to. `x, y` is the
+/// top-left, `w, h` the size; the full frame is `(0, 0, 1, 1)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NormRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl NormRect {
+    /// The full frame.
+    const FULL: NormRect = NormRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+
+    /// A centered rectangle of normalized size `(w, h)`.
+    fn centered(w: f32, h: f32) -> NormRect {
+        let w = w.clamp(0.0, 1.0);
+        let h = h.clamp(0.0, 1.0);
+        NormRect {
+            x: (1.0 - w) / 2.0,
+            y: (1.0 - h) / 2.0,
+            w,
+            h,
+        }
+    }
+
+    /// Whether this is (essentially) the full frame, so constraining to it is a
+    /// no-op and the explicit crop can be used as-is.
+    fn is_full(&self) -> bool {
+        self.x <= 1e-4 && self.y <= 1e-4 && self.w >= 1.0 - 1e-4 && self.h >= 1.0 - 1e-4
+    }
+
+    /// Intersect with `other`; returns `None` if the rectangles do not overlap.
+    fn intersect(&self, other: &NormRect) -> Option<NormRect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.w).min(other.x + other.w);
+        let y1 = (self.y + self.h).min(other.y + other.h);
+        (x1 > x0 && y1 > y0).then_some(NormRect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        })
+    }
+
+    /// Whether this rectangle lies fully inside `other` (within a small
+    /// tolerance), so intersecting the two leaves this one unchanged.
+    fn inside(&self, other: &NormRect) -> bool {
+        self.x >= other.x - 1e-5
+            && self.y >= other.y - 1e-5
+            && self.x + self.w <= other.x + other.w + 1e-5
+            && self.y + self.h <= other.y + other.h + 1e-5
+    }
+}
+
+/// The largest axis-aligned rectangle inscribed in a `w × h` source rectangle
+/// rotated by `angle` radians, expressed as normalized fractions of the rotated
+/// bounding box `output` (the canvas [`Transform::rotation`] produces). This is
+/// the closed-form "largest rotated rectangle with maximal area": for the rotated
+/// source there is one centered axis-aligned rectangle of maximal area free of
+/// the corner wedges, and the output canvas shares the source's center, so the
+/// result is centered in `output`. A zero angle gives the full frame.
+fn rotated_valid_region(src: Extent, output: Extent, angle: f32) -> NormRect {
+    let (w, h) = (src.width as f32, src.height as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return NormRect::FULL;
+    }
+    let (sin, cos) = angle.sin_cos();
+    let (sin_a, cos_a) = (sin.abs(), cos.abs());
+    // No rotation (axis-aligned): the inscribed rectangle is the whole source.
+    if sin_a < 1e-6 {
+        return NormRect::FULL;
+    }
+    let width_is_longer = w >= h;
+    let (side_long, side_short) = if width_is_longer { (w, h) } else { (h, w) };
+    let (wr, hr) = if side_short <= 2.0 * sin_a * cos_a * side_long || (sin_a - cos_a).abs() < 1e-10
+    {
+        // The fully-constrained (degenerate) case: the inscribed rectangle is
+        // bounded by the short side, a triangle whose half is the limit.
+        let x = 0.5 * side_short;
+        if width_is_longer {
+            (x / sin_a, x / cos_a)
+        } else {
+            (x / cos_a, x / sin_a)
+        }
+    } else {
+        let cos_2a = cos_a * cos_a - sin_a * sin_a;
+        (
+            (w * cos_a - h * sin_a) / cos_2a,
+            (h * cos_a - w * sin_a) / cos_2a,
+        )
+    };
+    // Express the inscribed source-space rectangle as a fraction of the output
+    // (rotated bounding box) canvas, centered.
+    let (ow, oh) = (output.width as f32, output.height as f32);
+    if ow <= 0.0 || oh <= 0.0 {
+        return NormRect::FULL;
+    }
+    NormRect::centered((wr / ow).clamp(0.0, 1.0), (hr / oh).clamp(0.0, 1.0))
+}
+
+/// A conservative largest centered valid rectangle for a general output → source
+/// `map` (keystone, keystone + rotation, lens). Binary-searches the largest
+/// centered axis-aligned rectangle whose entire boundary maps inside the source's
+/// valid pixel region — so no border wedge reaches it. Sampling the boundary (not
+/// the interior) suffices because every map here is a homography composed with a
+/// monotone radial term, so a boundary fully inside implies the interior is too.
+/// Conservative by construction: it only ever shrinks, never claims invalid area.
+fn sampled_valid_region(
+    output: Extent,
+    src: Extent,
+    map: impl Fn(f32, f32) -> (f32, f32),
+) -> NormRect {
+    let (ow, oh) = (output.width as f32, output.height as f32);
+    let (sw, sh) = (src.width as f32 - 1.0, src.height as f32 - 1.0);
+    if ow <= 1.0 || oh <= 1.0 || sw <= 0.0 || sh <= 0.0 {
+        return NormRect::FULL;
+    }
+    // Whether every boundary sample of the centered rectangle of normalized size
+    // `(fw, fh)` maps inside the source, inset by `margin` output-pixels so the
+    // kept region stays clear of the wedge after `crop_image` rounds the
+    // normalized rect to whole pixels. `margin = 0` is the exact source bounds.
+    let covered = |fw: f32, fh: f32, margin: f32| -> bool {
+        const EDGE_SAMPLES: u32 = 64;
+        let (rw, rh) = (fw * (ow - 1.0), fh * (oh - 1.0));
+        let (x0, y0) = ((ow - 1.0 - rw) / 2.0, (oh - 1.0 - rh) / 2.0);
+        let (x1, y1) = (x0 + rw, y0 + rh);
+        let mut ok = true;
+        let mut check = |x: f32, y: f32| {
+            let (mx, my) = map(x, y);
+            if mx < margin || my < margin || mx > sw - margin || my > sh - margin {
+                ok = false;
+            }
+        };
+        for i in 0..=EDGE_SAMPLES {
+            let f = i as f32 / EDGE_SAMPLES as f32;
+            check(x0 + f * rw, y0); // top
+            check(x0 + f * rw, y1); // bottom
+            check(x0, y0 + f * rh); // left
+            check(x1, y0 + f * rh); // right
+        }
+        ok
+    };
+    // The full frame already maps inside the source (an exact identity/orientation
+    // warp, or auto-scale already filled it) → nothing to constrain. Tested at
+    // zero margin, since a frame that exactly fits the source has no wedge.
+    if covered(1.0, 1.0, 0.0) {
+        return NormRect::FULL;
+    }
+    // A one-pixel inset so the rounding `crop_image` does can never pull a wedge
+    // pixel back into the kept region.
+    let margin = 1.0;
+    // Binary-search a single shrink factor that keeps the output aspect, so the
+    // constrained crop matches the framing the user sees. (A per-axis search can
+    // win marginally more area but risks an off-center bias under keystone.)
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..30 {
+        let mid = 0.5 * (lo + hi);
+        if covered(mid, mid, margin) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    NormRect::centered(lo, lo)
+}
+
 /// Stage: geometry — the single SOURCE → OUTPUT step.
 ///
 /// Lens distortion, keystone, and straighten all compose into one coordinate map
@@ -1470,6 +1644,14 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
     let lens = geometry.lens.filter(|l| {
         l.model != DistortionModel::None || l.ca[0] != CA_IDENTITY || l.ca[1] != CA_IDENTITY
     });
+    // The valid (non-black) region of the warped output, as a normalized rect, so
+    // auto-constrain can trim the border wedges a straighten/keystone produces.
+    // The full frame when nothing warps (or auto-scale already filled it).
+    let mut valid = NormRect::FULL;
+    // Whether the warp is a pure straighten rotation (no keystone, lens, or
+    // orientation), so the exact closed-form inscribed rectangle applies; any
+    // other warp uses the conservative sampled region.
+    let pure_rotation = orient.is_none() && keystone.is_none() && lens.is_none();
     match (homography, lens) {
         (h, Some(l)) => {
             let base = h.unwrap_or_else(|| Transform::identity(extent));
@@ -1496,6 +1678,10 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
                 let k = auto_scale_factor(warp.output, extent, |x, y| warp.map(x, y));
                 warp.m = prescale_homography(warp.m, frame_center, k);
             }
+            // Auto-scale already fills the frame, so only constrain when it is off.
+            if geometry.auto_constrain && !geometry.auto_scale {
+                valid = sampled_valid_region(warp.output, extent, |x, y| warp.map(x, y));
+            }
             img = backend.warp(&img, &warp);
         }
         (Some(mut t), None) => {
@@ -1507,6 +1693,13 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
                 let k = auto_scale_factor(t.output, extent, |x, y| t.map(x, y));
                 t.m = prescale_homography(t.m, frame_center, k);
             }
+            if geometry.auto_constrain && !geometry.auto_scale {
+                valid = if pure_rotation {
+                    rotated_valid_region(extent, t.output, geometry.straighten_degrees.to_radians())
+                } else {
+                    sampled_valid_region(t.output, extent, |x, y| t.map(x, y))
+                };
+            }
             img = backend.resample(&img, &t);
         }
         (None, None) => {
@@ -1515,7 +1708,12 @@ fn apply_geometry(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Backend)
             // when composed with a future crop-aware fill — left as identity here).
         }
     }
-    if let Some(crop) = geometry.crop {
+    // Compose the auto-constrain valid region with the explicit user crop: the
+    // user crop is in the warped-output frame, so the kept region is their
+    // intersection. An empty intersection (the crop lies entirely in a wedge)
+    // falls back to the valid region so the result is never degenerate.
+    let crop = compose_crop(geometry.crop, valid);
+    if let Some(crop) = crop {
         img = crop_image(&img, crop);
     }
     // Creative vignette: a radial gain about the *output* (post-crop) frame
@@ -1564,6 +1762,48 @@ fn apply_output_sharpen(mut img: ImageBuf, geometry: &Geometry, backend: &dyn Ba
         backend.combine(&mut img, &base, &CombineKind::UnsharpLuma { gain });
     }
     img
+}
+
+/// Combine the user's explicit `crop` (in the warped-output frame) with the
+/// auto-constrain `valid` region into the single crop the output is clipped to.
+///
+/// - No user crop, valid is full → `None` (no clip, the default render path).
+/// - No user crop, valid is a sub-region → the valid region (wedges trimmed).
+/// - A user crop, valid is full → the user crop unchanged.
+/// - Both → their intersection (so the kept region is both inside the user's
+///   framing and free of wedges); if they don't overlap, fall back to the valid
+///   region rather than produce an empty crop.
+fn compose_crop(crop: Option<Crop>, valid: NormRect) -> Option<Crop> {
+    let to_crop = |r: NormRect| Crop {
+        x: r.x,
+        y: r.y,
+        width: r.w,
+        height: r.h,
+    };
+    match crop {
+        None => (!valid.is_full()).then(|| to_crop(valid)),
+        Some(c) => {
+            if valid.is_full() {
+                return Some(c);
+            }
+            let user = NormRect {
+                x: c.x,
+                y: c.y,
+                w: c.width,
+                h: c.height,
+            };
+            // A user crop already inside the valid region is kept verbatim — no
+            // float-epsilon re-derivation that could shift the pixel rounding.
+            if user.inside(&valid) {
+                return Some(c);
+            }
+            match user.intersect(&valid) {
+                Some(i) => Some(to_crop(i)),
+                // The crop lies entirely in a wedge: fall back to the valid region.
+                None => Some(to_crop(valid)),
+            }
+        }
+    }
 }
 
 /// Clip `img` to a normalized crop rectangle. Fractions become pixels at this
@@ -3074,6 +3314,8 @@ mod tests {
             geometry: Geometry {
                 orientation,
                 straighten_degrees: 6.0,
+                // Compare the raw warped canvas, not the auto-trimmed one.
+                auto_constrain: false,
                 ..Geometry::default()
             },
             ..Settings::default()
@@ -3097,6 +3339,7 @@ mod tests {
             &Settings {
                 geometry: Geometry {
                     straighten_degrees: 6.0,
+                    auto_constrain: false,
                     ..Geometry::default()
                 },
                 ..Settings::default()
@@ -3127,6 +3370,9 @@ mod tests {
                 perspective: None,
                 lens: None,
                 vignette: None,
+                // Hold the raw (un-trimmed) warp so the grown canvas and the black
+                // corner wedge are observable; the trim is exercised separately.
+                auto_constrain: false,
                 ..Geometry::default()
             },
             ..Settings::default()
@@ -3316,6 +3562,9 @@ mod tests {
                 }),
                 lens: None,
                 vignette: None,
+                // Keep the full warped frame so the corrected pixel positions are
+                // checkable against the source; the wedge trim is tested apart.
+                auto_constrain: false,
                 ..Geometry::default()
             },
             ..Settings::default()
@@ -4190,6 +4439,8 @@ mod tests {
                 geometry: Geometry {
                     perspective,
                     auto_scale: false,
+                    // Observe the raw wedge here; auto-scale's fill is the subject.
+                    auto_constrain: false,
                     ..Geometry::default()
                 },
                 ..Settings::default()
@@ -4270,5 +4521,191 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(render(&src, &settings, &TestBackend), src);
+    }
+
+    #[test]
+    fn rotated_valid_region_is_centered_and_wedge_free() {
+        // The closed-form inscribed rectangle of a square rotated 45° is the
+        // largest centered axis-aligned square inside it. For a unit square the
+        // inscribed square has side 1/√2 of the source — and the output (rotated
+        // bounding box) is √2 wide — so the inscribed fraction of the output is
+        // (side/√2)/(side·√2) = 1/2 on each axis, centered.
+        let src = Extent {
+            width: 100,
+            height: 100,
+        };
+        let angle = 45.0_f32.to_radians();
+        let rot = Transform::rotation(src, angle);
+        let r = rotated_valid_region(src, rot.output, angle);
+        assert!((r.w - 0.5).abs() < 0.02, "inscribed width fraction: {r:?}");
+        assert!((r.h - 0.5).abs() < 0.02, "inscribed height fraction: {r:?}");
+        // Centered.
+        assert!((r.x - (1.0 - r.w) / 2.0).abs() < 1e-4);
+        assert!((r.y - (1.0 - r.h) / 2.0).abs() < 1e-4);
+        // A zero angle is the full frame (nothing to trim).
+        assert!(rotated_valid_region(src, src, 0.0).is_full());
+    }
+
+    #[test]
+    fn auto_constrain_trims_straighten_wedges() {
+        // A leveled (rotated) image with auto-constrain on must show no black
+        // border wedges, and its canvas must shrink to the valid interior — the
+        // pure-rotation closed-form path. The same render with the constrain off
+        // keeps the grown canvas and its black corners.
+        let mut src = ImageBuf::new(40, 30);
+        for p in src.pixels_mut() {
+            *p = [0.4, 0.6, 0.8];
+        }
+        let constrained = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    straighten_degrees: 12.0,
+                    auto_constrain: true,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        let raw = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    straighten_degrees: 12.0,
+                    auto_constrain: false,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        let black = |img: &ImageBuf| {
+            img.pixels()
+                .iter()
+                .filter(|p| **p == [0.0, 0.0, 0.0])
+                .count()
+        };
+        assert!(black(&raw) > 0, "the raw rotation leaves black wedges");
+        assert_eq!(black(&constrained), 0, "constrain removes every wedge");
+        assert!(
+            constrained.width() < raw.width() && constrained.height() < raw.height(),
+            "the constrained canvas trims to the valid interior"
+        );
+        // It also stays no larger than the source (a sub-region of the leveled
+        // image), and keeps the center content.
+        assert!(constrained.width() <= 40 && constrained.height() <= 30);
+    }
+
+    #[test]
+    fn auto_constrain_trims_keystone_wedges_conservatively() {
+        // A keystone correction leaves a wedge; the conservative sampled region
+        // must trim it so no black pixel remains, without auto-scale's minify.
+        let mut src = ImageBuf::new(31, 31);
+        for p in src.pixels_mut() {
+            *p = [0.5, 0.6, 0.7];
+        }
+        let out = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    perspective: Some(Perspective {
+                        vertical: 0.25,
+                        horizontal: 0.15,
+                    }),
+                    auto_constrain: true,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        let black = out
+            .pixels()
+            .iter()
+            .filter(|p| **p == [0.0, 0.0, 0.0])
+            .count();
+        assert_eq!(black, 0, "constrain removes the keystone wedge");
+        assert!(
+            out.width() > 0 && out.height() > 0,
+            "the constrained result is non-degenerate"
+        );
+    }
+
+    #[test]
+    fn auto_constrain_composes_with_a_user_crop() {
+        // An explicit crop that lies fully inside the valid region is kept exactly
+        // (the constrain only intersects, never expands). A leveled image cropped
+        // to its central quarter must equal the same crop with the constrain off,
+        // since that quarter is already wedge-free.
+        let mut src = ImageBuf::new(60, 40);
+        for (i, p) in src.pixels_mut().iter_mut().enumerate() {
+            *p = [(i % 7) as f32 * 0.1, 0.5, 0.5];
+        }
+        let user_crop = Some(Crop {
+            x: 0.35,
+            y: 0.35,
+            width: 0.3,
+            height: 0.3,
+        });
+        let with = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    straighten_degrees: 8.0,
+                    crop: user_crop,
+                    auto_constrain: true,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        let without = render(
+            &src,
+            &Settings {
+                geometry: Geometry {
+                    straighten_degrees: 8.0,
+                    crop: user_crop,
+                    auto_constrain: false,
+                    ..Geometry::default()
+                },
+                ..Settings::default()
+            },
+            &TestBackend,
+        );
+        // A central crop is inside the valid interior, so the constrain is a no-op
+        // for it: identical output either way.
+        assert_eq!(with, without, "a wedge-free user crop is left untouched");
+    }
+
+    #[test]
+    fn compose_crop_intersects_or_falls_back() {
+        // No crop + full valid → no clip.
+        assert_eq!(compose_crop(None, NormRect::FULL), None);
+        // No crop + sub-region → the valid region becomes the crop.
+        let valid = NormRect::centered(0.6, 0.5);
+        let c = compose_crop(None, valid).expect("a sub-region clips");
+        assert!((c.width - 0.6).abs() < 1e-6 && (c.height - 0.5).abs() < 1e-6);
+        // A user crop + full valid → the user crop unchanged.
+        let user = Crop {
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.4,
+        };
+        assert_eq!(compose_crop(Some(user), NormRect::FULL), Some(user));
+        // Both → their intersection.
+        let both = compose_crop(Some(user), valid).expect("overlap");
+        assert!(both.x >= 0.1 - 1e-6 && both.x >= valid.x - 1e-6);
+        // A non-overlapping user crop falls back to the valid region, never empty.
+        let far = Crop {
+            x: 0.95,
+            y: 0.95,
+            width: 0.04,
+            height: 0.04,
+        };
+        let fallback = compose_crop(Some(far), valid).expect("fallback to valid");
+        assert!((fallback.width - 0.6).abs() < 1e-6);
     }
 }

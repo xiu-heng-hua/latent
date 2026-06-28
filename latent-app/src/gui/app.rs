@@ -178,6 +178,12 @@ pub(crate) struct Session {
     /// The last rendered preview image, stashed so the hover readout samples the
     /// pixel under the cursor without re-rendering.
     pub(crate) preview_rendered: Option<ImageBuf>,
+    /// The (possibly geometry-suppressed) settings the live preview texture was
+    /// last rendered from — see [`super::tools::preview_settings`]. A render is
+    /// spawned only when the desired preview settings differ from this, so a
+    /// geometry-tool drag (which only changes the *suppressed* field) leaves the
+    /// image stationary and never re-renders. `None` forces the first render.
+    pub(crate) preview_rendered_for: Option<Settings>,
     /// The current zoom intent (Fit, or a fixed percent).
     pub(crate) zoom: Zoom,
     /// The current pan offset (screen-space).
@@ -212,6 +218,17 @@ pub(crate) struct Session {
     pub(crate) tool: CanvasTool,
     /// The in-progress canvas drag.
     pub(crate) drag: Option<CanvasDrag>,
+    /// The straighten tool's reference line, as two normalized endpoints, when one
+    /// has been drawn this session. Persists after the drag so the endpoints stay
+    /// on-canvas as draggable handles for refinement; cleared when the tool is
+    /// re-entered fresh. `None` shows the draw prompt instead.
+    pub(crate) straighten_line: Option<([f32; 2], [f32; 2])>,
+    /// The normalized region `Fit` (and the zoom ladder) frames while a geometry
+    /// tool is active — the crop rect at the moment it was last fitted, **not**
+    /// recomputed live. Snapshotting it (on tool-enter and on a Fit) keeps the
+    /// image stationary while crop handles drag: the view does not re-scale every
+    /// frame as the crop changes. `None` fits the whole image.
+    pub(crate) fit_region: Option<egui::Rect>,
     /// Crop tool UI state.
     pub(crate) crop_aspect: AspectRatio,
     pub(crate) crop_aspect_locked: bool,
@@ -257,6 +274,7 @@ impl Session {
             texture: None,
             before_texture: None,
             preview_rendered: None,
+            preview_rendered_for: None,
             zoom: Zoom::default(),
             pan: egui::Vec2::ZERO,
             last_transform: None,
@@ -273,6 +291,8 @@ impl Session {
             curve_channel: 0,
             tool: CanvasTool::default(),
             drag: None,
+            straighten_line: None,
+            fit_region: None,
             crop_aspect: AspectRatio::default(),
             crop_aspect_locked: false,
             crop_thirds: true,
@@ -287,6 +307,51 @@ impl Session {
     /// The history of the variant currently being edited.
     pub(crate) fn active_history(&mut self) -> &mut History<Settings> {
         &mut self.variants[self.active]
+    }
+
+    /// Switch the active on-canvas tool, resetting the view to fit when a geometry
+    /// tool's edit changes what `Fit` should frame. Entering a geometry tool
+    /// frames the full (un-suppressed) image; leaving one frames the committed
+    /// result (the cropped/leveled/warped texture the next render produces).
+    /// Either way `Fit` + zero pan gives a clean frame, so the single owner of the
+    /// view state stays consistent across the transition. Routing every tool
+    /// change through here keeps that reset in one place.
+    pub(crate) fn set_tool(&mut self, tool: CanvasTool) {
+        let crosses_geometry = self.tool.is_geometry() != tool.is_geometry();
+        // Entering the straighten tool afresh starts from the default reference
+        // line rather than a stale one from an earlier edit this session.
+        if tool == CanvasTool::Straighten && self.tool != CanvasTool::Straighten {
+            self.straighten_line = None;
+        }
+        self.tool = tool;
+        if crosses_geometry {
+            self.zoom = Zoom::Fit;
+            self.pan = egui::Vec2::ZERO;
+            // Snapshot what `Fit` should frame for the new tool — the crop rect for
+            // the crop tool, else the whole image. Frozen here so a later handle
+            // drag does not re-scale the view every frame.
+            self.snapshot_fit_region();
+        }
+    }
+
+    /// The active variant's crop as a normalized rect, or `None` when there is no
+    /// crop (the full frame).
+    fn crop_rect(&self) -> Option<egui::Rect> {
+        let c = self.variants[self.active].current().geometry.crop?;
+        Some(egui::Rect::from_min_max(
+            egui::Pos2::new(c.x, c.y),
+            egui::Pos2::new(c.x + c.width, c.y + c.height),
+        ))
+    }
+
+    /// Freeze the region `Fit`/zoom should frame for the active geometry tool: the
+    /// crop rect under the crop tool, else the whole image (`None`). Called on
+    /// tool-enter and on an explicit Fit, so the view re-frames only at those
+    /// points and stays put while handles drag.
+    pub(crate) fn snapshot_fit_region(&mut self) {
+        self.fit_region = (self.tool == CanvasTool::Crop)
+            .then(|| self.crop_rect())
+            .flatten();
     }
 
     /// The displayed image aspect (`width / height`) of the shown texture, for the
@@ -437,6 +502,7 @@ pub fn run(
                 pending_backend: None,
                 clipboard: None,
                 preset_name_input: String::new(),
+                preview_spawned_for: None,
             };
             // Kick off the first file's develop on the worker (off the UI thread),
             // so the window paints immediately and the image arrives when ready.
@@ -525,6 +591,12 @@ pub struct App {
     /// The in-progress preset name being typed in the presets block. Held here so
     /// the field keeps its text across frames; cleared after a save.
     pub(crate) preset_name_input: String,
+    /// The (geometry-suppressed) settings the most recently spawned preview render
+    /// was spawned for, moved onto the session as `preview_rendered_for` once that
+    /// render lands. Lets the render gate skip a redundant re-render when nothing
+    /// the preview depends on changed (it is the in-flight render's target while
+    /// one runs). `None` before the first preview render.
+    pub(crate) preview_spawned_for: Option<Settings>,
 }
 
 impl App {
@@ -762,22 +834,59 @@ impl App {
         self.export_to(ctx, path);
     }
 
-    /// Request a preview re-render of the active variant on the worker. Coalesces
-    /// to one render at a time (latest-wins). No-op with no session.
+    /// The settings the live preview should render from for the active variant:
+    /// the current settings with the active geometry tool's in-progress edit
+    /// suppressed (so the image stays full and stationary while its handles move).
+    /// `None` with no session.
+    fn desired_preview_settings(&self) -> Option<Settings> {
+        let session = self.session.as_ref()?;
+        let current = session.variants[session.active].current();
+        Some(super::tools::preview_settings(current, session.tool).into_owned())
+    }
+
+    /// Request a preview re-render of the active variant on the worker, but only
+    /// when the desired (geometry-suppressed) preview settings actually differ
+    /// from what the current texture was rendered for. A geometry-tool drag that
+    /// only moves the *suppressed* field leaves those settings unchanged, so it
+    /// requests no render — the image stays stationary and the keystone CPU warp
+    /// never re-runs per frame. Coalesces to one render at a time (latest-wins).
+    /// No-op with no session.
     pub(crate) fn render_preview(&mut self, ctx: &egui::Context) {
-        if self.render.is_busy() {
-            self.render.pending = true;
+        let Some(desired) = self.desired_preview_settings() else {
+            return;
+        };
+        // The settings the visible (or in-flight) preview already targets: the
+        // in-flight render's target while one is running, else what the current
+        // texture was rendered for. Comparing against this means a no-op call
+        // (nothing the preview depends on changed — e.g. a crop/keystone handle
+        // drag that only moves the suppressed field) neither spawns a render nor
+        // queues a spurious pending one.
+        let already = if self.render.is_busy() {
+            self.preview_spawned_for.as_ref()
+        } else {
+            self.session
+                .as_ref()
+                .and_then(|s| s.preview_rendered_for.as_ref())
+        };
+        if already == Some(&desired) {
             return;
         }
         let Some(session) = &self.session else {
             return;
         };
+        if self.render.is_busy() {
+            self.render.pending = true;
+            return;
+        }
         let job = RenderJob {
             base: Arc::clone(&session.preview),
-            settings: session.variants[session.active].current().clone(),
+            settings: desired.clone(),
             backend: Arc::clone(&self.backend),
             kind: JobKind::Preview,
         };
+        // Remember what this render was spawned for; `poll_render` records it as
+        // the texture's `preview_rendered_for` when the image lands.
+        self.preview_spawned_for = Some(desired);
         self.spawn(ctx, job);
     }
 
@@ -809,10 +918,14 @@ impl App {
                 self.render.in_flight = None;
                 match out {
                     RenderOutput::Preview(img) => {
+                        let spawned_for = self.preview_spawned_for.take();
                         if let Some(session) = &mut self.session {
                             session.load_texture(ctx, &img);
                             session.ensure_before_texture(ctx, self.backend.as_ref());
                             session.preview_rendered = Some(img);
+                            // Record the settings this texture was rendered for, so
+                            // the render gate can skip a redundant re-render.
+                            session.preview_rendered_for = spawned_for;
                         }
                     }
                     RenderOutput::Export(result) => {
@@ -993,11 +1106,14 @@ impl App {
         }
     }
 
-    /// Snap the zoom to fit (and reset the pan, which is inert when fitted).
+    /// Snap the zoom to fit (and reset the pan, which is inert when fitted). While
+    /// a geometry tool is active this re-snapshots the fit region, so Fit frames
+    /// the *current* crop rect (the one acceptance the tool's region fit needs).
     pub(crate) fn zoom_fit(&mut self) {
         if let Some(session) = &mut self.session {
             session.zoom = Zoom::Fit;
             session.pan = egui::Vec2::ZERO;
+            session.snapshot_fit_region();
         }
     }
 
@@ -1136,11 +1252,12 @@ impl App {
     /// without a session.
     fn select_tool(&mut self, tool: CanvasTool) {
         if let Some(session) = &mut self.session {
-            session.tool = if session.tool == tool {
+            let next = if session.tool == tool {
                 CanvasTool::None
             } else {
                 tool
             };
+            session.set_tool(next);
         }
     }
 
@@ -1192,7 +1309,7 @@ impl App {
             WbAction::None => false,
             WbAction::PickGray => {
                 // Arm the eyedropper; the pick is consumed on the next canvas click.
-                session.tool = CanvasTool::WbPick;
+                session.set_tool(CanvasTool::WbPick);
                 false
             }
             WbAction::Auto => {
@@ -1570,10 +1687,16 @@ impl eframe::App for App {
         // Persist edits to the sidecar once a gesture completes.
         self.autosave();
 
-        // Re-render only when something changed (or on the first frame).
-        if dirty {
-            self.render_preview(ctx);
-        }
+        // Refresh the preview. `render_preview` is self-gating — it spawns only
+        // when the desired (geometry-suppressed) settings actually differ from
+        // what the texture (or the in-flight render) already targets — so this is
+        // safe to call every frame: a changed slider renders, a geometry-tool
+        // enter/exit renders (the suppression changes), and a geometry-tool drag
+        // that only moves the suppressed field renders nothing. The accumulated
+        // `dirty` is subsumed by that gate (a dirtying edit changes the desired
+        // settings); it is consumed here to keep the panel/shortcut plumbing.
+        let _ = dirty;
+        self.render_preview(ctx);
 
         // The central canvas (image + brush) is added last.
         canvas::show(self, ctx);
@@ -1608,6 +1731,7 @@ mod tests {
             pending_backend: None,
             clipboard: None,
             preset_name_input: String::new(),
+            preview_spawned_for: None,
         }
     }
 

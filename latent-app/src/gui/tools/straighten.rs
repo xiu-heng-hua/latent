@@ -3,10 +3,34 @@
 //! `geometry.straighten_degrees`. The straighten slider stays as numeric entry.
 
 use eframe::egui;
-use egui::{Color32, Pos2, Stroke};
+use egui::{Align2, Color32, FontId, Pos2, Stroke};
 
 use super::super::canvas::ViewTransform;
-use super::draw_handle;
+use super::{HANDLE_HIT_RADIUS, draw_handle, nearest_handle};
+
+/// Which end of the two-point reference line a drag controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineEnd {
+    From,
+    To,
+}
+
+/// The default reference line shown when the straighten tool is first entered: a
+/// horizontal line across the middle third of the image, so both endpoint handles
+/// are immediately visible and draggable rather than hidden behind a prompt.
+pub(crate) const DEFAULT_LINE: ([f32; 2], [f32; 2]) = ([0.2, 0.5], [0.8, 0.5]);
+
+/// Hit-test the two endpoint handles of the reference line; returns which end a
+/// press would grab, or `None` when the pointer is on neither.
+pub(crate) fn hit_test(
+    from: [f32; 2],
+    to: [f32; 2],
+    pointer: Pos2,
+    transform: &ViewTransform,
+) -> Option<LineEnd> {
+    nearest_handle(&[from, to], pointer, transform, HANDLE_HIT_RADIUS)
+        .map(|i| if i == 0 { LineEnd::From } else { LineEnd::To })
+}
 
 /// The angle (degrees) that levels a reference line drawn between two normalized
 /// points, given the displayed image aspect `image_w / image_h`.
@@ -47,8 +71,8 @@ pub(crate) fn level_angle(from: [f32; 2], to: [f32; 2], image_aspect: f32) -> f3
     deg.clamp(-45.0, 45.0)
 }
 
-/// Draw the in-progress horizon line and its two endpoint handles, in screen
-/// space via the transform.
+/// Draw the reference line and its two endpoint handles, in screen space via the
+/// transform. The line reads as the horizon/vertical the user is leveling.
 pub(crate) fn draw_line(
     painter: &egui::Painter,
     transform: &ViewTransform,
@@ -57,24 +81,70 @@ pub(crate) fn draw_line(
 ) {
     let a = transform.image_norm_to_screen(from);
     let b = transform.image_norm_to_screen(to);
-    painter.line_segment([a, b], Stroke::new(1.5, Color32::WHITE));
+    painter.line_segment([a, b], Stroke::new(2.0, Color32::WHITE));
     draw_handle(painter, transform, from);
     draw_handle(painter, transform, to);
 }
 
-/// Draw a faint center cross-hair prompt when no horizon is being drawn, so the
-/// user knows the canvas is in the straighten tool.
-pub(crate) fn draw_prompt(painter: &egui::Painter, transform: &ViewTransform) {
-    let c: Pos2 = transform.image_norm_to_screen([0.5, 0.5]);
-    let s = 8.0;
-    let faint = Stroke::new(1.0, Color32::from_white_alpha(90));
-    painter.line_segment([c - egui::vec2(s, 0.0), c + egui::vec2(s, 0.0)], faint);
-    painter.line_segment([c - egui::vec2(0.0, s), c + egui::vec2(0.0, s)], faint);
+/// Draw a one-line hint near the top of the image telling the user how the tool
+/// works (drag a line along a horizon or a vertical to level it). Shown whenever
+/// the straighten tool is active, above the reference line.
+pub(crate) fn draw_hint(painter: &egui::Painter, transform: &ViewTransform) {
+    let at: Pos2 = transform.image_norm_to_screen([0.5, 0.04]);
+    let text = "Drag the line along a horizon or a vertical to level it";
+    // A subtle shadow plate so the hint reads over any image content.
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(13.0),
+        Color32::from_white_alpha(230),
+    );
+    let rect = Align2::CENTER_TOP
+        .anchor_size(at, galley.size())
+        .expand2(egui::vec2(6.0, 3.0));
+    painter.rect_filled(rect, 4.0, Color32::from_black_alpha(140));
+    painter.galley(
+        rect.center_top() + egui::vec2(-galley.size().x / 2.0, 3.0),
+        galley,
+        Color32::WHITE,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Rect, Vec2};
+
+    fn transform() -> ViewTransform {
+        ViewTransform::new(
+            Vec2::new(100.0, 100.0),
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 200.0)),
+            super::super::super::canvas::Zoom::Fit,
+            Vec2::ZERO,
+        )
+    }
+
+    #[test]
+    fn the_default_line_is_level() {
+        // The line the tool opens with is horizontal, so merely entering the tool
+        // (before any drag) implies no rotation.
+        let (from, to) = DEFAULT_LINE;
+        assert!(level_angle(from, to, 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn hit_test_grabs_the_nearer_endpoint() {
+        let t = transform();
+        let (from, to) = ([0.2, 0.5], [0.8, 0.5]);
+        // On the `from` endpoint.
+        let on_from = t.image_norm_to_screen(from);
+        assert_eq!(hit_test(from, to, on_from, &t), Some(LineEnd::From));
+        // On the `to` endpoint.
+        let on_to = t.image_norm_to_screen(to);
+        assert_eq!(hit_test(from, to, on_to, &t), Some(LineEnd::To));
+        // The middle of the line is on neither handle.
+        let mid = t.image_norm_to_screen([0.5, 0.5]);
+        assert_eq!(hit_test(from, to, mid, &t), None);
+    }
 
     #[test]
     fn a_level_line_needs_no_rotation() {

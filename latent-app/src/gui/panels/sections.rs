@@ -257,6 +257,14 @@ mod tests {
         assert_eq!(s.global.exposure, None, "Basic field cleared");
         assert!(s.global.tone.is_some(), "Tone untouched");
         assert!(s.geometry.crop.is_some(), "Geometry untouched");
+
+        // Resetting Geometry clears its crop/straighten/perspective but keeps the
+        // auto-constrain preference on — it is a setting, not a per-image edit.
+        s.geometry.straighten_degrees = 5.0;
+        SectionId::Geometry.reset(&mut s);
+        assert_eq!(s.geometry.crop, None, "crop cleared");
+        assert_eq!(s.geometry.straighten_degrees, 0.0, "straighten cleared");
+        assert!(s.geometry.auto_constrain, "auto-constrain preference kept");
     }
 
     #[test]

@@ -242,6 +242,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         d |= lens_block(s, ui);
                         crop_aspect_row(s, ui);
                         d |= widgets::crop_block(ui, &mut s.variants[s.active]);
+                        d |= auto_constrain_row(s, ui);
                         d
                     },
                 );
@@ -395,7 +396,7 @@ fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
                 .selectable_label(session.tool == CanvasTool::Brush, "Paint on canvas")
                 .clicked()
             {
-                session.tool = CanvasTool::Brush;
+                session.set_tool(CanvasTool::Brush);
             }
             ui.add(egui::Slider::new(&mut session.brush_radius, 0.01..=0.5).text("Size"))
                 .on_hover_text("Brush radius. 0.01 … 0.5; [ ] resize");
@@ -411,7 +412,7 @@ fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
                 .selectable_label(active_shape, "Edit shape on canvas")
                 .clicked()
             {
-                session.tool = CanvasTool::MaskShape;
+                session.set_tool(CanvasTool::MaskShape);
             }
         }
         _ => {}
@@ -549,24 +550,54 @@ fn lens_display_name(meta: &latent_raw::Metadata) -> String {
 }
 
 /// The geometry tool activators: selectable labels that switch the canvas to the
-/// crop / level / keystone tool so the handles appear.
+/// crop / level / keystone tool so the handles appear. The Crop label carries an
+/// accent dot whenever a non-full crop is set, a persistent "this image is
+/// cropped" signal even when the tool is inactive.
 fn geometry_tools(session: &mut Session, ui: &mut egui::Ui) {
-    use crate::gui::tools::CanvasTool;
+    use crate::gui::tools::{CanvasTool, crop};
+    // Whether the active variant carries a real (non-full) crop right now.
+    let has_crop = session.variants[session.active]
+        .current()
+        .geometry
+        .crop
+        .is_some_and(|c| !crop::is_full_frame(c));
     ui.horizontal(|ui| {
         for (tool, label) in [
             (CanvasTool::Crop, "Crop"),
             (CanvasTool::Straighten, "Level"),
             (CanvasTool::Keystone, "Keystone"),
         ] {
-            if ui.selectable_label(session.tool == tool, label).clicked() {
-                session.tool = if session.tool == tool {
-                    CanvasTool::None
-                } else {
-                    tool
-                };
+            let selected = session.tool == tool;
+            let resp = ui.selectable_label(selected, label);
+            // An accent dot trailing the Crop label marks an active crop.
+            if tool == CanvasTool::Crop && has_crop {
+                let dot = resp.rect.right_center() + egui::vec2(3.0, 0.0);
+                ui.painter().circle_filled(dot, 3.0, theme::ACCENT);
+            }
+            if resp.clicked() {
+                let next = if selected { CanvasTool::None } else { tool };
+                session.set_tool(next);
             }
         }
     });
+}
+
+/// The auto-constrain toggle: trim the straighten/keystone border wedges to the
+/// largest valid rectangle. On by default; toggling it is one undo step.
+fn auto_constrain_row(session: &mut Session, ui: &mut egui::Ui) -> bool {
+    let active = session.active;
+    let mut on = session.variants[active].current().geometry.auto_constrain;
+    let resp = ui
+        .checkbox(&mut on, "Auto-constrain")
+        .on_hover_text("Trim the black border wedges a straighten or keystone leaves");
+    if resp.changed() {
+        let history = &mut session.variants[active];
+        history.begin();
+        history.current_mut().geometry.auto_constrain = on;
+        history.commit();
+        return true;
+    }
+    false
 }
 
 /// The crop aspect-ratio presets + lock toggle.

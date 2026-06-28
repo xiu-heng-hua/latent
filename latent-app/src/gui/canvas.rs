@@ -90,9 +90,34 @@ pub(crate) struct ViewTransform {
 impl ViewTransform {
     /// Build the transform for an image of `image_size` pixels shown in `panel`,
     /// at the given `zoom` (`Zoom::Fit` ⇒ scale `1.0` over the fit) and `pan`
-    /// (screen-space offset, zero when fitted).
+    /// (screen-space offset, zero when fitted). Fits the whole image — the same as
+    /// [`Self::new_fit_region`] with no active region.
     pub(crate) fn new(image_size: Vec2, panel: Rect, zoom: Zoom, pan: Vec2) -> Self {
-        let fit_scale = Self::compute_fit_scale(image_size, panel.size());
+        Self::new_fit_region(image_size, panel, zoom, pan, None)
+    }
+
+    /// Like [`Self::new`], but `Fit` (and the zoom ladder, which is relative to
+    /// the fit scale) frames `region` — a normalized `[0, 1]²` sub-rectangle of
+    /// the image — instead of the whole image. The whole image still draws (it
+    /// spills beyond the panel and is pannable); only what `Fit` frames changes.
+    /// `None` fits the whole image, the same as [`Self::new`]. Used while a
+    /// geometry tool is active so `Fit` frames the crop rect / corrected quad.
+    pub(crate) fn new_fit_region(
+        image_size: Vec2,
+        panel: Rect,
+        zoom: Zoom,
+        pan: Vec2,
+        region: Option<Rect>,
+    ) -> Self {
+        // The region in pixels (the whole image when there's no active region),
+        // and its center as a fraction of the image. The fit scale frames the
+        // region; the displayed image is centered on the region's center.
+        let region = region.unwrap_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        let region_px = Vec2::new(
+            (image_size.x * region.width()).max(1.0),
+            (image_size.y * region.height()).max(1.0),
+        );
+        let fit_scale = Self::compute_fit_scale(region_px, panel.size());
         let zoom_mul = match zoom {
             Zoom::Fit => 1.0,
             // The displayed scale is the requested percent, expressed relative to
@@ -101,8 +126,12 @@ impl ViewTransform {
         };
         let displayed = fit_scale * zoom_mul;
         let drawn = image_size * displayed;
-        // Center the drawn image in the panel, then offset by the pan.
-        let offset = panel.center().to_vec2() - drawn / 2.0 + pan;
+        // Where the region's center sits within the drawn image, in screen pixels.
+        let region_center_in_drawn =
+            Vec2::new(region.center().x * drawn.x, region.center().y * drawn.y);
+        // Place the image so the region's center lands at the panel center, then
+        // offset by the pan.
+        let offset = panel.center().to_vec2() - region_center_in_drawn + pan;
         Self {
             image_size,
             fit_scale,
@@ -270,12 +299,29 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             // pointer events over the whole canvas.
             let resp = ui.allocate_rect(panel, egui::Sense::click_and_drag());
 
+            // While a geometry tool is active, `Fit` and the zoom ladder frame the
+            // tool's active region (the crop rect) rather than the whole un-cropped
+            // texture; the whole image still draws and stays pannable.
+            let region = active_region(session);
+
             // Pan and zoom run before the transform is built so this frame draws
             // at the updated view. Both only request a repaint — never a render.
             handle_pan(session, &resp);
-            handle_zoom(session, ui, &resp, tex_size, panel);
+            handle_zoom(session, ui, &resp, tex_size, panel, region);
 
-            let transform = ViewTransform::new(tex_size, panel, session.zoom, session.pan);
+            // `new` (whole-image fit) when no tool region is active, else the
+            // region-fit variant — the same value, but the common path stays the
+            // plain constructor.
+            let transform = match region {
+                None => ViewTransform::new(tex_size, panel, session.zoom, session.pan),
+                Some(_) => ViewTransform::new_fit_region(
+                    tex_size,
+                    panel,
+                    session.zoom,
+                    session.pan,
+                    region,
+                ),
+            };
             session.last_transform = Some(transform);
 
             // Paint the surround fill (the photo's neutral border) across the
@@ -347,16 +393,36 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     // the render request below can reborrow the app.
     let tool_active = session.tool != tools::CanvasTool::None;
 
-    // A tool gesture changed the settings after this frame's render; refresh the
-    // preview and repaint so the edit shows up.
+    // A tool gesture changed the settings after this frame's render; ask for a
+    // preview refresh and a repaint so the edit shows up. `render_preview`
+    // self-gates: a non-geometry edit (brush/mask) renders, while a geometry-tool
+    // handle drag — whose changed field is suppressed from the preview — only
+    // repaints (the handles/overlay move) and spawns no render, so the image
+    // stays stationary and the keystone warp never re-runs per frame. The actual
+    // geometry is applied on commit/exit, when the suppression lifts and the
+    // frame's `render_preview` in `update` renders once.
     if painted {
         app.render_preview(ctx);
         ctx.request_repaint();
     } else if tool_active {
         // A tool is active (drawing handles/cursor) — keep repainting so the
-        // overlay tracks the pointer even when nothing changed this frame.
+        // overlay tracks the pointer even when nothing changed this frame. A
+        // repaint is not a render.
         ctx.request_repaint();
     }
+}
+
+/// The region `Fit` and the zoom ladder frame while a geometry tool is active, as
+/// a normalized `[0, 1]²` rect over the (full, un-cropped) texture. This is the
+/// *snapshotted* fit region (frozen on tool-enter and on a Fit), not the live
+/// crop, so the view stays put while crop handles drag — only an explicit Fit (or
+/// zoom) re-frames. `None` (no geometry tool, or no crop) fits the whole texture.
+fn active_region(session: &Session) -> Option<Rect> {
+    session
+        .tool
+        .is_geometry()
+        .then_some(session.fit_region)
+        .flatten()
 }
 
 /// Whether a pan gesture is currently active: middle-mouse drag, or space held
@@ -391,6 +457,7 @@ fn handle_zoom(
     resp: &egui::Response,
     tex_size: Vec2,
     panel: Rect,
+    region: Option<Rect>,
 ) {
     if !resp.hovered() {
         return;
@@ -403,14 +470,16 @@ fn handle_zoom(
         return;
     };
     // Capture the normalized image point under the cursor before the zoom change.
-    let before = ViewTransform::new(tex_size, panel, session.zoom, session.pan);
+    let before = ViewTransform::new_fit_region(tex_size, panel, session.zoom, session.pan, region);
     let anchor = before.screen_to_image_norm(cursor);
-    let fit_scale = ViewTransform::compute_fit_scale(tex_size, panel.size());
+    // The ladder steps relative to the active region's fit scale, so a stop is the
+    // same percentage of the region whether or not a tool is active.
+    let fit_scale = before.fit_scale();
 
     let dir = if scroll_y > 0.0 { 1 } else { -1 };
     session.zoom = step_zoom(session.zoom, dir, fit_scale);
     // Re-anchor: set the pan so the same normalized point maps back to the cursor.
-    let after = ViewTransform::new(tex_size, panel, session.zoom, session.pan);
+    let after = ViewTransform::new_fit_region(tex_size, panel, session.zoom, session.pan, region);
     let landed = after.image_norm_to_screen(anchor);
     session.pan += cursor - landed;
     ui.ctx().request_repaint();
@@ -555,6 +624,48 @@ mod tests {
             (back - cursor).length() < 1e-2,
             "cursor anchor drifted: {back:?} vs {cursor:?}"
         );
+    }
+
+    #[test]
+    fn fit_to_region_frames_the_region_in_the_panel() {
+        // With an active region, `Fit` frames that region: the region's screen
+        // rect (mapped through the transform) fills the panel along its binding
+        // axis and is centered, while the whole image draws larger and spills.
+        let image = Vec2::new(200.0, 100.0);
+        let panel = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(400.0, 400.0));
+        // The central quarter of the image.
+        let region = Rect::from_min_max(Pos2::new(0.25, 0.25), Pos2::new(0.75, 0.75));
+        let t = ViewTransform::new_fit_region(image, panel, Zoom::Fit, Vec2::ZERO, Some(region));
+
+        // The region's corners on screen.
+        let tl = t.image_norm_to_screen([0.25, 0.25]);
+        let br = t.image_norm_to_screen([0.75, 0.75]);
+        let region_screen = Rect::from_min_max(tl, br);
+        // The region is 100×50 px; fitted to a 400×400 panel its scale is 4.0
+        // (width-bound), so the region spans 400×200 on screen, centered.
+        assert!(
+            (region_screen.width() - 400.0).abs() < 1e-2,
+            "{region_screen:?}"
+        );
+        assert!(
+            (region_screen.height() - 200.0).abs() < 1e-2,
+            "{region_screen:?}"
+        );
+        assert!(
+            (region_screen.center() - panel.center()).length() < 1e-2,
+            "the region is centered in the panel"
+        );
+        // The whole image is larger than the panel (it spills, pannable): the full
+        // image rect is 4× the image, i.e. 800×400, wider than the 400px panel.
+        let full = t.image_rect();
+        assert!(
+            full.width() > panel.width() + 1.0,
+            "image spills horizontally"
+        );
+
+        // No region reproduces the whole-image fit (a letterboxed fit inside).
+        let plain = ViewTransform::new_fit_region(image, panel, Zoom::Fit, Vec2::ZERO, None);
+        assert!(panel.contains_rect(plain.image_rect().shrink(0.01)));
     }
 
     #[test]

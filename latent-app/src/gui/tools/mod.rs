@@ -50,6 +50,63 @@ pub(crate) enum CanvasTool {
     WbPick,
 }
 
+impl CanvasTool {
+    /// Whether this is a geometry tool (crop, straighten, keystone) — the ones
+    /// whose in-progress edit is suppressed from the live preview so the image
+    /// stays full and stationary while the handles move (see
+    /// [`preview_settings`]).
+    pub(crate) fn is_geometry(self) -> bool {
+        matches!(
+            self,
+            CanvasTool::Crop | CanvasTool::Straighten | CanvasTool::Keystone
+        )
+    }
+}
+
+/// The settings the live preview should render from while `tool` is active.
+///
+/// For a geometry tool the *in-progress* geometry that tool edits is neutralized,
+/// so the underlying image is drawn full and stationary while the tool's handles
+/// and overlay (which read the real, un-suppressed values) move to show the
+/// pending crop/level/keystone. Geometry that the active tool does *not* edit is
+/// kept, so e.g. the crop tool still shows a previously-set straighten. The real
+/// geometry is applied only when the tool commits/exits and a normal preview
+/// renders. A non-geometry tool (or none) renders the settings unchanged.
+///
+/// - Crop active → drop `crop` (keep straighten/keystone/lens); the crop rect is
+///   drawn as an overlay with the outside dimmed, not clipped.
+/// - Straighten active → drop `straighten_degrees` *and* `crop`, so the original
+///   tilted full image shows under the 2-point horizon line.
+/// - Keystone active → drop `perspective` *and* `crop`, so the un-warped full
+///   image shows under the corner handles and the pending corrected quad.
+///
+/// Pure (clones only when it must change a field), so it is unit-testable.
+pub(crate) fn preview_settings(
+    settings: &latent_edit::Settings,
+    tool: CanvasTool,
+) -> std::borrow::Cow<'_, latent_edit::Settings> {
+    use std::borrow::Cow;
+    if !tool.is_geometry() {
+        return Cow::Borrowed(settings);
+    }
+    let mut s = settings.clone();
+    match tool {
+        CanvasTool::Crop => {
+            s.geometry.crop = None;
+        }
+        CanvasTool::Straighten => {
+            s.geometry.straighten_degrees = 0.0;
+            s.geometry.crop = None;
+        }
+        CanvasTool::Keystone => {
+            s.geometry.perspective = None;
+            s.geometry.crop = None;
+        }
+        _ => {}
+    }
+    Cow::Owned(s)
+}
+
 /// The active grab of an in-progress canvas drag, held across frames so a drag
 /// that starts on a handle keeps editing *that* handle even as the pointer moves
 /// off it. Each variant carries the start-of-gesture snapshot the tool needs to
@@ -64,9 +121,10 @@ pub(crate) enum CanvasDrag {
     Keystone(usize, latent_edit::Perspective),
     /// A mask-shape handle, with the shape at the grab.
     MaskShape(mask_shape::ShapeGrab, latent_edit::MaskShape),
-    /// The straighten horizon line, carrying its first endpoint; the second
-    /// endpoint follows the pointer.
-    Straighten([f32; 2]),
+    /// The straighten horizon line: which endpoint the drag controls (the other
+    /// stays put). Drawing a fresh line anchors endpoint 0 and drags endpoint 1;
+    /// re-grabbing an existing endpoint drags just that one to refine the level.
+    Straighten(straighten::LineEnd),
     /// A brush stroke in progress (no discrete handle).
     Brush,
 }
@@ -211,7 +269,7 @@ fn wb_pick_interact(
     history.current_mut().global.white_balance = wb_or_none(neutralized);
     history.commit();
     // One pick is enough; return to plain view so the next click doesn't re-pick.
-    session.tool = CanvasTool::None;
+    session.set_tool(CanvasTool::None);
     true
 }
 
@@ -257,7 +315,11 @@ fn crop_interact(
         session.drag = None;
     }
 
-    crop::draw_overlay(painter, transform, current, session.crop_thirds);
+    // Draw from the latest crop (re-read after a possible write this frame), so the
+    // rectangle and handles track the pointer with no lag now that the image stays
+    // stationary underneath.
+    let shown = crop::current_crop(session.variants[active].current());
+    crop::draw_overlay(painter, transform, shown, session.crop_thirds);
     changed
 }
 
@@ -270,19 +332,23 @@ fn keystone_interact(
     active: usize,
 ) -> bool {
     let mut changed = false;
+    let current = keystone::current(session.variants[active].current());
     if resp.drag_started()
         && let Some(pos) = resp.interact_pointer_pos()
-        && let Some(corner) = keystone::hit_test(pos, transform)
+        && let Some(corner) = keystone::hit_test(current, pos, transform)
     {
         session.variants[active].begin();
-        let start = keystone::current(session.variants[active].current());
-        session.drag = Some(CanvasDrag::Keystone(corner, start));
+        session.drag = Some(CanvasDrag::Keystone(corner, current));
     }
     if resp.dragged()
-        && let Some(CanvasDrag::Keystone(corner, start)) = session.drag
+        && let Some(CanvasDrag::Keystone(corner, _start)) = session.drag
         && let Some(p) = pointer_norm(resp, transform)
     {
-        let params = keystone::corner_to_params(corner, p, start);
+        // The handle is drawn at its params-displaced position, so the pointer's
+        // displacement from the corner *home* gives the absolute params directly
+        // (against a zero start) — the grabbed handle tracks the pointer 1:1 with
+        // no jump, and the other three handles follow from the same params.
+        let params = keystone::corner_to_params(corner, p, keystone::ZERO);
         keystone::write(&mut session.variants[active], params);
         changed = true;
     }
@@ -290,7 +356,10 @@ fn keystone_interact(
         session.variants[active].commit();
         session.drag = None;
     }
-    keystone::draw_overlay(painter, transform);
+    // Draw the overlay from the *latest* params (re-read after a possible write
+    // this frame), so the handles and pending quad track the pointer with no lag.
+    let shown = keystone::current(session.variants[active].current());
+    keystone::draw_overlay(painter, transform, shown);
     changed
 }
 
@@ -334,6 +403,12 @@ fn mask_interact(
 }
 
 /// The straighten-by-horizon tool gesture + overlay.
+///
+/// The image stays fixed (the in-progress rotation is suppressed from the
+/// preview); the user drags a two-point reference line and the level angle is
+/// derived from it. A press near an existing endpoint refines that endpoint; a
+/// press elsewhere draws a fresh line from the press point. The angle updates
+/// live and commits as one undo step on release.
 fn straighten_interact(
     session: &mut super::app::Session,
     resp: &egui::Response,
@@ -341,32 +416,57 @@ fn straighten_interact(
     transform: &ViewTransform,
     active: usize,
 ) -> bool {
+    use straighten::LineEnd;
     let mut changed = false;
+
+    // The reference line shown this frame: the stored one, or the default
+    // horizontal line so both handles are visible the moment the tool opens.
+    let (mut from, mut to) = session.straighten_line.unwrap_or(straighten::DEFAULT_LINE);
+
     if resp.drag_started()
         && let Some(p) = pointer_norm(resp, transform)
     {
+        // Grab an existing endpoint to refine it; otherwise start a fresh line
+        // anchored at the press, dragging its other end with the pointer.
+        let end = resp
+            .interact_pointer_pos()
+            .and_then(|pos| straighten::hit_test(from, to, pos, transform))
+            .unwrap_or_else(|| {
+                from = p;
+                to = p;
+                LineEnd::To
+            });
         session.variants[active].begin();
-        session.drag = Some(CanvasDrag::Straighten(p));
+        session.drag = Some(CanvasDrag::Straighten(end));
+        session.straighten_line = Some((from, to));
     }
-    if let Some(CanvasDrag::Straighten(from)) = session.drag {
-        if let Some(to) = pointer_norm(resp, transform) {
-            straighten::draw_line(painter, transform, from, to);
-            if resp.dragged() {
-                let angle = straighten::level_angle(from, to, session.displayed_aspect());
-                session.variants[active]
-                    .current_mut()
-                    .geometry
-                    .straighten_degrees = angle;
-                changed = true;
+
+    if let Some(CanvasDrag::Straighten(end)) = session.drag {
+        if resp.dragged()
+            && let Some(p) = pointer_norm(resp, transform)
+        {
+            let clamped = [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)];
+            match end {
+                LineEnd::From => from = clamped,
+                LineEnd::To => to = clamped,
             }
+            session.straighten_line = Some((from, to));
+            let angle = straighten::level_angle(from, to, session.displayed_aspect());
+            session.variants[active]
+                .current_mut()
+                .geometry
+                .straighten_degrees = angle;
+            changed = true;
         }
         if resp.drag_stopped() {
             session.variants[active].commit();
             session.drag = None;
         }
-    } else {
-        straighten::draw_prompt(painter, transform);
     }
+
+    // Always draw the hint and the current line with its draggable endpoints.
+    straighten::draw_hint(painter, transform);
+    straighten::draw_line(painter, transform, from, to);
     changed
 }
 
@@ -510,6 +610,130 @@ mod tests {
         );
         // An empty handle list never hits.
         assert_eq!(nearest_handle(&[], middle, &t, HANDLE_HIT_RADIUS), None);
+    }
+
+    #[test]
+    fn only_crop_straighten_keystone_are_geometry_tools() {
+        // The geometry predicate gates the preview suppression, the view-fit
+        // region, and the on-exit re-fit, so pin exactly which tools it covers.
+        assert!(CanvasTool::Crop.is_geometry());
+        assert!(CanvasTool::Straighten.is_geometry());
+        assert!(CanvasTool::Keystone.is_geometry());
+        assert!(!CanvasTool::None.is_geometry());
+        assert!(!CanvasTool::Brush.is_geometry());
+        assert!(!CanvasTool::MaskShape.is_geometry());
+        assert!(!CanvasTool::WbPick.is_geometry());
+    }
+
+    #[test]
+    fn preview_settings_neutralizes_only_the_active_tools_geometry() {
+        use latent_edit::{Crop, Geometry, Perspective, Settings};
+        let full = Settings {
+            geometry: Geometry {
+                crop: Some(Crop {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.5,
+                    height: 0.5,
+                }),
+                straighten_degrees: 4.0,
+                perspective: Some(Perspective {
+                    vertical: 0.2,
+                    horizontal: 0.0,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+
+        // No tool / non-geometry tool: the settings pass through unchanged (and
+        // borrow rather than clone).
+        assert_eq!(*preview_settings(&full, CanvasTool::None), full);
+        assert_eq!(*preview_settings(&full, CanvasTool::Brush), full);
+
+        // Crop active: only the crop is dropped; straighten and keystone stay.
+        let crop = preview_settings(&full, CanvasTool::Crop);
+        assert_eq!(crop.geometry.crop, None);
+        assert_eq!(crop.geometry.straighten_degrees, 4.0);
+        assert!(crop.geometry.perspective.is_some());
+
+        // Straighten active: the rotation and the crop are dropped (the tilted
+        // full image shows), keystone stays.
+        let level = preview_settings(&full, CanvasTool::Straighten);
+        assert_eq!(level.geometry.straighten_degrees, 0.0);
+        assert_eq!(level.geometry.crop, None);
+        assert!(level.geometry.perspective.is_some());
+
+        // Keystone active: the perspective and the crop are dropped, straighten
+        // stays.
+        let key = preview_settings(&full, CanvasTool::Keystone);
+        assert_eq!(key.geometry.perspective, None);
+        assert_eq!(key.geometry.crop, None);
+        assert_eq!(key.geometry.straighten_degrees, 4.0);
+    }
+
+    #[test]
+    fn a_geometry_handle_drag_does_not_change_the_preview_settings() {
+        // The render gate spawns a render only when the desired (suppressed)
+        // preview settings change. While the crop tool is active, moving the crop
+        // changes only the *suppressed* field, so the desired preview settings are
+        // identical before and after — proving no render is spawned per drag
+        // frame (the image stays stationary; the handles move). The same holds for
+        // straighten (the angle) and keystone (the perspective).
+        use latent_edit::{Crop, Geometry, Perspective, Settings};
+        let with_crop = |x: f32| Settings {
+            geometry: Geometry {
+                crop: Some(Crop {
+                    x,
+                    y: 0.1,
+                    width: 0.5,
+                    height: 0.5,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        // Two frames of a crop drag (the crop moved): same suppressed preview.
+        assert_eq!(
+            *preview_settings(&with_crop(0.1), CanvasTool::Crop),
+            *preview_settings(&with_crop(0.3), CanvasTool::Crop),
+        );
+
+        let with_angle = |deg: f32| Settings {
+            geometry: Geometry {
+                straighten_degrees: deg,
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(
+            *preview_settings(&with_angle(2.0), CanvasTool::Straighten),
+            *preview_settings(&with_angle(7.0), CanvasTool::Straighten),
+        );
+
+        let with_keystone = |v: f32| Settings {
+            geometry: Geometry {
+                perspective: Some(Perspective {
+                    vertical: v,
+                    horizontal: 0.0,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(
+            *preview_settings(&with_keystone(0.1), CanvasTool::Keystone),
+            *preview_settings(&with_keystone(0.4), CanvasTool::Keystone),
+        );
+
+        // A *develop* change while a geometry tool is active still changes the
+        // suppressed preview (so a render is correctly spawned).
+        let mut bright = with_crop(0.1);
+        bright.global.exposure = Some(1.0);
+        assert_ne!(
+            *preview_settings(&with_crop(0.1), CanvasTool::Crop),
+            *preview_settings(&bright, CanvasTool::Crop),
+        );
     }
 
     #[test]
