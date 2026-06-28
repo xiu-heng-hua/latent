@@ -339,10 +339,12 @@ impl Session {
         if crosses_geometry {
             self.zoom = Zoom::Fit;
             self.pan = egui::Vec2::ZERO;
-            // Snapshot what `Fit` should frame for the new tool — the crop rect for
-            // the crop tool, else the whole image. Frozen here so a later handle
-            // drag does not re-scale the view every frame.
-            self.snapshot_fit_region();
+            // Frame the whole image when entering a geometry tool, so the crop
+            // rectangle sits inside the view with margin to grab and drag its
+            // handles (framing the crop itself would jam the handles against the
+            // viewport edges, so a drag would hit the interior and just move the
+            // rect). The toolbar `Fit` reframes to the crop rectangle instead.
+            self.fit_region = None;
         }
     }
 
@@ -357,9 +359,9 @@ impl Session {
     }
 
     /// Freeze the region `Fit`/zoom should frame for the active geometry tool: the
-    /// crop rect under the crop tool, else the whole image (`None`). Called on
-    /// tool-enter and on an explicit Fit, so the view re-frames only at those
-    /// points and stays put while handles drag.
+    /// crop rect under the crop tool, else the whole image (`None`). Called on an
+    /// explicit Fit (not on tool-enter, which frames the whole image), so the view
+    /// re-frames only at that point and stays put while handles drag.
     pub(crate) fn snapshot_fit_region(&mut self) {
         self.fit_region = (self.tool == CanvasTool::Crop)
             .then(|| self.crop_rect())

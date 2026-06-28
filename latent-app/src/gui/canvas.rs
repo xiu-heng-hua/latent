@@ -426,9 +426,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
 
 /// The region `Fit` and the zoom ladder frame while a geometry tool is active, as
 /// a normalized `[0, 1]²` rect over the (full, un-cropped) texture. This is the
-/// *snapshotted* fit region (frozen on tool-enter and on a Fit), not the live
-/// crop, so the view stays put while crop handles drag — only an explicit Fit (or
-/// zoom) re-frames. `None` (no geometry tool, or no crop) fits the whole texture.
+/// *snapshotted* fit region (frozen on an explicit Fit), not the live crop, so the
+/// view stays put while crop handles drag — only a Fit (or zoom) re-frames.
+/// `None` (no geometry tool, no crop, or before a Fit) fits the whole texture, so
+/// entering the crop tool shows the whole image with the crop rect inside it.
 fn active_region(session: &Session) -> Option<Rect> {
     session
         .tool
