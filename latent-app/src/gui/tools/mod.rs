@@ -422,21 +422,13 @@ fn straighten_interact(
     let (mut from, mut to) = session.straighten_line.unwrap_or(straighten::DEFAULT_LINE);
 
     if resp.drag_started()
-        && let Some(p) = pointer_norm(resp, transform)
+        && let Some(pos) = resp.interact_pointer_pos()
     {
-        // Grab an existing endpoint to refine it; otherwise start a fresh line
-        // anchored at the press, dragging its other end with the pointer.
-        let end = resp
-            .interact_pointer_pos()
-            .and_then(|pos| straighten::hit_test(from, to, pos, transform))
-            .unwrap_or_else(|| {
-                from = p;
-                to = p;
-                LineEnd::To
-            });
+        // Grab the nearer endpoint and refine it. The line is persistent and never
+        // recreated, so a press can't make it disappear.
+        let end = straighten::nearest_end(from, to, pos, transform);
         session.variants[active].begin();
         session.drag = Some(CanvasDrag::Straighten(end));
-        session.straighten_line = Some((from, to));
     }
 
     if let Some(CanvasDrag::Straighten(end)) = session.drag {

@@ -6,7 +6,7 @@ use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Stroke};
 
 use super::super::canvas::ViewTransform;
-use super::{HANDLE_HIT_RADIUS, draw_handle, nearest_handle};
+use super::draw_handle;
 
 /// Which end of the two-point reference line a drag controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,16 +20,19 @@ pub(crate) enum LineEnd {
 /// are immediately visible and draggable rather than hidden behind a prompt.
 pub(crate) const DEFAULT_LINE: ([f32; 2], [f32; 2]) = ([0.2, 0.5], [0.8, 0.5]);
 
-/// Hit-test the two endpoint handles of the reference line; returns which end a
-/// press would grab, or `None` when the pointer is on neither.
-pub(crate) fn hit_test(
+/// The endpoint a press should grab: always the nearer of the two, so a drag can
+/// never miss. The reference line is persistent — it is only ever refined, never
+/// recreated — so a press always grabs an existing endpoint rather than spawning a
+/// new line.
+pub(crate) fn nearest_end(
     from: [f32; 2],
     to: [f32; 2],
     pointer: Pos2,
     transform: &ViewTransform,
-) -> Option<LineEnd> {
-    nearest_handle(&[from, to], pointer, transform, HANDLE_HIT_RADIUS)
-        .map(|i| if i == 0 { LineEnd::From } else { LineEnd::To })
+) -> LineEnd {
+    let df = transform.image_norm_to_screen(from).distance(pointer);
+    let dt = transform.image_norm_to_screen(to).distance(pointer);
+    if df <= dt { LineEnd::From } else { LineEnd::To }
 }
 
 /// The angle (degrees) that levels a reference line drawn between two normalized
@@ -132,18 +135,24 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_grabs_the_nearer_endpoint() {
+    fn nearest_end_picks_the_nearer_endpoint() {
         let t = transform();
         let (from, to) = ([0.2, 0.5], [0.8, 0.5]);
-        // On the `from` endpoint.
-        let on_from = t.image_norm_to_screen(from);
-        assert_eq!(hit_test(from, to, on_from, &t), Some(LineEnd::From));
-        // On the `to` endpoint.
-        let on_to = t.image_norm_to_screen(to);
-        assert_eq!(hit_test(from, to, on_to, &t), Some(LineEnd::To));
-        // The middle of the line is on neither handle.
-        let mid = t.image_norm_to_screen([0.5, 0.5]);
-        assert_eq!(hit_test(from, to, mid, &t), None);
+        // On (or near) each endpoint grabs that endpoint.
+        assert_eq!(
+            nearest_end(from, to, t.image_norm_to_screen(from), &t),
+            LineEnd::From
+        );
+        assert_eq!(
+            nearest_end(from, to, t.image_norm_to_screen(to), &t),
+            LineEnd::To
+        );
+        // A press left of centre grabs `from`, right of centre grabs `to` — there is
+        // no "miss" that would spawn a new line.
+        let left = t.image_norm_to_screen([0.4, 0.5]);
+        assert_eq!(nearest_end(from, to, left, &t), LineEnd::From);
+        let right = t.image_norm_to_screen([0.6, 0.5]);
+        assert_eq!(nearest_end(from, to, right, &t), LineEnd::To);
     }
 
     #[test]
