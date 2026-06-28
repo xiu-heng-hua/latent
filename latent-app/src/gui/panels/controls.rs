@@ -966,7 +966,17 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         set_crop_enabled,
         |session, ui| {
             crop_aspect_row(session, ui);
-            widgets::crop_block(ui, &mut session.variants[session.active])
+            // The crop is normalized over the displayed image, so the px conversion
+            // uses the full-resolution base's pixel dimensions.
+            let active = session.active;
+            let (w, h) = (session.full.width(), session.full.height());
+            widgets::crop_block(
+                ui,
+                &mut session.variants[active],
+                &mut session.crop_units,
+                w,
+                h,
+            )
         },
     );
 

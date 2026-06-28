@@ -82,6 +82,9 @@ pub(crate) const SIDE_PANEL_MAX_WIDTH: f32 = 520.0;
 /// Approximate width reserved for a slider's numeric entry, used to keep the
 /// neutral-marker tick over the slider track rather than under the entry.
 pub(crate) const SLIDER_NUMERIC_WIDTH: f32 = 56.0;
+/// Fixed width of a crop cell's px/% unit toggle button. Wide enough to fit both
+/// "px" and "%" so toggling the unit never shifts the surrounding layout.
+pub(crate) const CROP_UNIT_BUTTON_WIDTH: f32 = 26.0;
 /// The curve editor's drawing area (max width × fixed height).
 pub(crate) const CURVE_EDITOR_SIZE: egui::Vec2 = egui::vec2(220.0, 160.0);
 

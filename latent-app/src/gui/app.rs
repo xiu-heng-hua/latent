@@ -243,6 +243,11 @@ pub(crate) struct Session {
     /// (`AspectRatio::Free` leaves the rectangle unconstrained).
     pub(crate) crop_aspect: AspectRatio,
     pub(crate) crop_thirds: bool,
+    /// Display unit (pixels or percent) of each crop numeric field, in
+    /// Left/Top/Width/Height order. Pure UI state — the crop is always stored
+    /// normalized; this only chooses how each cell shows and edits that value.
+    /// Defaults to pixels.
+    pub(crate) crop_units: [crate::gui::widgets::CropUnit; 4],
     /// Whether each toggleable geometry transform's subsection is enabled in the
     /// panel. These are UI state, **not** develop history: a geometry transform's
     /// neutral value (crop full-frame, straighten `0°`, no perspective) reads as
@@ -335,6 +340,7 @@ impl Session {
             fit_region: None,
             crop_aspect: AspectRatio::default(),
             crop_thirds: true,
+            crop_units: [crate::gui::widgets::CropUnit::default(); 4],
             crop_enabled,
             straighten_enabled,
             keystone_enabled,

@@ -229,48 +229,39 @@ pub(crate) struct SliderSpec<'a> {
     pub(crate) help: &'a str,
 }
 
-/// Render the slider + numeric entry for `spec`, mutating `value`, and return the
-/// `(slider, drag, double_clicked)` outcome plus paint the tooltip, neutral
-/// marker, and modified dot. Shared by both flavors so the egui plumbing — the
-/// `Slider`, the `DragValue`, the markers — lives in one place; the flavors only
-/// differ in their `get`/`set` value mapping.
+/// Render the slider for `spec`, mutating `value`, and return the
+/// `(slider, double_clicked)` outcome plus paint the tooltip, neutral marker, and
+/// modified dot. Shared by both flavors so the egui plumbing — the `Slider` and
+/// the markers — lives in one place; the flavors only differ in their `get`/`set`
+/// value mapping. The slider's own value display is click-to-edit, so a precise
+/// value is typed there directly — no separate numeric field is rendered.
 fn paint_slider(
     ui: &mut egui::Ui,
     spec: &SliderSpec,
     value: &mut f32,
     modified: bool,
-) -> (egui::Response, egui::Response, bool) {
+) -> (egui::Response, bool) {
     let hint = help_text(spec.help, &spec.range, spec.neutral);
-    let (slider, drag) = ui
-        .horizontal(|ui| {
-            let slider = ui.add(
-                egui::Slider::new(value, spec.range.clone())
-                    .text(spec.label)
-                    .clamping(egui::SliderClamping::Always),
-            );
-            let drag = ui.add(
-                egui::DragValue::new(value)
-                    .range(spec.range.clone())
-                    .speed(drag_speed(&spec.range))
-                    .fixed_decimals(2),
-            );
-            (slider, drag)
-        })
-        .inner;
-    slider.union(drag.clone()).on_hover_text(&hint);
+    let slider = ui.add(
+        egui::Slider::new(value, spec.range.clone())
+            .text(spec.label)
+            .clamping(egui::SliderClamping::Always),
+    );
+    slider.clone().on_hover_text(&hint);
     neutral_marker(ui, slider.rect, &spec.range, spec.neutral);
     modified_marker(ui, slider.rect, modified);
     let reset = slider.double_clicked();
-    (slider, drag, reset)
+    (slider, reset)
 }
 
 /// A slider bound to an optional point adjustment, sharing one `scope` with the
 /// rest of its block (pass a fresh scope and call [`GestureScope::finish`] for a
 /// single-field control). The slider shows the spec's neutral when the field is
-/// `None`; any change sets it to `Some(value)` via `set`. A numeric entry beside
-/// it types a precise value, a double-click resets the field to `None`, and a tick
-/// marks the neutral position. The numeric entry, double-click, and drag all flow
-/// through `scope`, so each interaction is one undo step.
+/// `None`; any change sets it to `Some(value)` via `set`. The slider's own value
+/// display is click-to-edit, so a precise value is typed there; a double-click
+/// resets the field to `None`, and a tick marks the neutral position. The drag,
+/// the typed entry, and the double-click all flow through `scope`, so each
+/// interaction is one undo step.
 fn opt_adjust_slider(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
@@ -281,24 +272,23 @@ fn opt_adjust_slider(
 ) {
     let mut value = get(history.current()).unwrap_or(spec.neutral);
     let modified = opt_is_modified(get(history.current()));
-    let (slider, drag, reset) = paint_slider(ui, &spec, &mut value, modified);
+    let (slider, reset) = paint_slider(ui, &spec, &mut value, modified);
 
     scope.record(&slider);
-    scope.record(&drag);
 
     if reset {
         // Double-click resets the field to its default (None) as one undo step.
         scope.mark_discrete();
         set(history.current_mut(), opt_reset());
-    } else if slider.changed() || drag.changed() {
+    } else if slider.changed() {
         set(history.current_mut(), Some(value));
     }
 }
 
 /// A slider bound to a plain `f32` field, sharing one `scope` with its block (or
 /// a fresh scope for a single control). Mirrors [`opt_adjust_slider`] but for a
-/// non-optional value: double-click resets to the spec's default, the numeric
-/// entry types a precise value, and the marker sits at the default.
+/// non-optional value: double-click resets to the spec's default, the slider's
+/// own value display types a precise value, and the marker sits at the default.
 fn adjust_slider(
     ui: &mut egui::Ui,
     history: &mut History<Settings>,
@@ -309,25 +299,16 @@ fn adjust_slider(
 ) {
     let mut value = get(history.current());
     let modified = value_is_modified(value, spec.neutral);
-    let (slider, drag, reset) = paint_slider(ui, &spec, &mut value, modified);
+    let (slider, reset) = paint_slider(ui, &spec, &mut value, modified);
 
     scope.record(&slider);
-    scope.record(&drag);
 
     if reset {
         scope.mark_discrete();
         set(history.current_mut(), spec.neutral);
-    } else if slider.changed() || drag.changed() {
+    } else if slider.changed() {
         set(history.current_mut(), value);
     }
-}
-
-/// A per-step drag speed for the numeric entry: a small fraction of the range so
-/// dragging the `DragValue` is fine-grained, independent of the slider's own
-/// pixel-driven step. Holding the egui fine modifier slows both further.
-fn drag_speed(range: &std::ops::RangeInclusive<f32>) -> f64 {
-    let span = (*range.end() - *range.start()).abs().max(f32::EPSILON);
-    (span as f64) / 400.0
 }
 
 /// A single-field optional slider: the public entry point for a lone optional
@@ -1236,80 +1217,197 @@ fn perspective_or_none(p: Perspective) -> Option<Perspective> {
     (p.vertical != 0.0 || p.horizontal != 0.0).then_some(p)
 }
 
-/// Crop: four sliders for a normalized rectangle, editing one optional crop, all
-/// sharing one gesture scope. The full frame `{0, 0, 1, 1}` is shown when there is
-/// no crop.
-pub(crate) fn crop_block(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
-    let c = history.current().geometry.crop.unwrap_or(Crop {
+/// The display unit of one crop field. A crop is always stored normalized `[0, 1]`;
+/// this only chooses how a cell *shows and edits* that value. `Px` (the default)
+/// reads in image pixels, `Pct` in percent of the dimension. Pure UI state — it
+/// never changes the stored crop or the render — so it lives on the session, not
+/// in the edit history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CropUnit {
+    /// Image pixels along the field's dimension (width for Left/Width, height for
+    /// Top/Height).
+    #[default]
+    Px,
+    /// Percent of the field's dimension (`normalized × 100`).
+    Pct,
+}
+
+impl CropUnit {
+    /// The short button label naming this unit.
+    fn label(self) -> &'static str {
+        match self {
+            CropUnit::Px => "px",
+            CropUnit::Pct => "%",
+        }
+    }
+
+    /// The other unit, for the toggle button.
+    fn toggled(self) -> Self {
+        match self {
+            CropUnit::Px => CropUnit::Pct,
+            CropUnit::Pct => CropUnit::Px,
+        }
+    }
+}
+
+/// Convert a normalized `[0, 1]` crop value into pixels along a `dim`-pixel axis,
+/// rounded to a whole pixel (crop cells show integer pixels). Pure for testing.
+fn norm_to_px(norm: f32, dim: u32) -> f32 {
+    (norm * dim as f32).round()
+}
+
+/// Convert an entered pixel value along a `dim`-pixel axis back into a normalized
+/// `[0, 1]` value (`px / dim`), clamped to `[0, 1]`. A zero dimension maps to `0`.
+/// Pure for testing.
+fn px_to_norm(px: f32, dim: u32) -> f32 {
+    if dim == 0 {
+        return 0.0;
+    }
+    (px / dim as f32).clamp(0.0, 1.0)
+}
+
+/// Convert a normalized `[0, 1]` crop value into percent (`norm × 100`). Pure for
+/// testing.
+fn norm_to_pct(norm: f32) -> f32 {
+    norm * 100.0
+}
+
+/// Convert an entered percent back into a normalized `[0, 1]` value (`pct / 100`),
+/// clamped to `[0, 1]`. Pure for testing.
+fn pct_to_norm(pct: f32) -> f32 {
+    (pct / 100.0).clamp(0.0, 1.0)
+}
+
+/// One crop cell's static descriptor: its label, the normalized get/set on the
+/// [`Crop`], and the pixel length of its axis (image width for Left/Width, height
+/// for Top/Height). The grid lists four of these.
+type CropCell = (&'static str, fn(&Crop) -> f32, fn(&mut Crop, f32), u32);
+
+/// One crop cell: a label, a numeric [`egui::DragValue`] in the field's current
+/// unit, and a fixed-width px/% toggle button. Editing the number writes the same
+/// normalized `geometry.crop` the on-canvas crop tool writes (so dragging the
+/// rectangle and typing stay in sync), clamped through [`crop::clamp_crop`] to keep
+/// the minimum size and stay on-frame, and folds into `scope` so the cell is one
+/// undo step. The toggle flips only `*unit` (pure UI state, no history). `dim` is
+/// the pixel length of this field's axis (image width for Left/Width, height for
+/// Top/Height).
+#[allow(clippy::too_many_arguments)]
+fn crop_cell(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    scope: &mut GestureScope,
+    base: Crop,
+    label: &str,
+    unit: &mut CropUnit,
+    dim: u32,
+    getc: fn(&Crop) -> f32,
+    setc: fn(&mut Crop, f32),
+) {
+    use crate::gui::tools::crop;
+
+    let norm = getc(&history.current().geometry.crop.unwrap_or(base));
+    // The value shown/edited in this cell's current unit.
+    let mut shown = match *unit {
+        CropUnit::Px => norm_to_px(norm, dim),
+        CropUnit::Pct => norm_to_pct(norm),
+    };
+    ui.label(label);
+    // Range and precision follow the unit: whole pixels up to the dimension, or a
+    // single-decimal percent up to 100.
+    let drag = match *unit {
+        CropUnit::Px => ui.add(
+            egui::DragValue::new(&mut shown)
+                .range(0.0..=dim as f32)
+                .speed(1.0)
+                .fixed_decimals(0),
+        ),
+        CropUnit::Pct => ui.add(
+            egui::DragValue::new(&mut shown)
+                .range(0.0..=100.0)
+                .speed(0.25)
+                .fixed_decimals(1),
+        ),
+    };
+    // A fixed-width unit button so toggling "px"↔"%" never shifts the layout
+    // (FRONTEND.md: the UI must not move when a button is clicked).
+    if ui
+        .add(
+            egui::Button::new(unit.label())
+                .min_size(egui::vec2(theme::CROP_UNIT_BUTTON_WIDTH, 0.0)),
+        )
+        .on_hover_text("Toggle pixels / percent")
+        .clicked()
+    {
+        *unit = unit.toggled();
+    }
+
+    scope.record(&drag);
+    if drag.changed() {
+        let entered = match *unit {
+            CropUnit::Px => px_to_norm(shown, dim),
+            CropUnit::Pct => pct_to_norm(shown),
+        };
+        let mut now = history.current().geometry.crop.unwrap_or(base);
+        setc(&mut now, entered);
+        // Reuse the on-canvas crop invariants: keep the minimum size and stay
+        // on-frame, then normalize a full-frame rect back to `None`.
+        let clamped = crop::clamp_crop(now);
+        history.current_mut().geometry.crop = (!crop::is_full_frame(clamped)).then_some(clamped);
+    }
+}
+
+/// Crop: a 2×2 numeric grid for a normalized rectangle — Left/Top on the first
+/// row, Width/Height on the second — each cell a numeric entry with a per-field
+/// px/% unit toggle (no slider). People drag the rectangle on the canvas; the grid
+/// is for typing a precise value, which they think of in pixels (the default unit).
+/// All four cells share one gesture scope, so a typed edit is one undo step, and
+/// they write the same normalized `geometry.crop` the on-canvas tool writes. The
+/// full frame `{0, 0, 1, 1}` is shown when there is no crop. `units` is the
+/// per-field unit state (Left/Top/Width/Height); `image_w`/`image_h` size the px
+/// conversion. Returns whether the preview is dirty.
+pub(crate) fn crop_block(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    units: &mut [CropUnit; 4],
+    image_w: u32,
+    image_h: u32,
+) -> bool {
+    let base = history.current().geometry.crop.unwrap_or(Crop {
         x: 0.0,
         y: 0.0,
         width: 1.0,
         height: 1.0,
     });
     let mut scope = GestureScope::default();
-    for (label, help, default, getc, setc) in [
-        (
-            "Left",
-            "Crop left edge",
-            0.0_f32,
-            crop_get as fn(&Crop) -> f32,
-            crop_set_x as fn(&mut Crop, f32),
-        ),
-        ("Top", "Crop top edge", 0.0, crop_get_y, crop_set_y),
-        ("Width", "Crop width", 1.0, crop_get_w, crop_set_w),
-        ("Height", "Crop height", 1.0, crop_get_h, crop_set_h),
-    ] {
-        adjust_slider(
-            ui,
-            history,
-            &mut scope,
-            SliderSpec {
-                label,
-                range: 0.0..=1.0,
-                neutral: default,
-                help,
-            },
-            move |s| getc(&s.geometry.crop.unwrap_or(c)),
-            move |s, v| {
-                let mut now = s.geometry.crop.unwrap_or(c);
-                setc(&mut now, v);
-                s.geometry.crop = crop_or_none(now);
-            },
-        );
+    // The four cells, by `units` index. Left/Width measure along the image width;
+    // Top/Height along the height.
+    let cells: [CropCell; 4] = [
+        ("Left", |c| c.x, |c, v| c.x = v, image_w),
+        ("Top", |c| c.y, |c, v| c.y = v, image_h),
+        ("Width", |c| c.width, |c, v| c.width = v, image_w),
+        ("Height", |c| c.height, |c, v| c.height = v, image_h),
+    ];
+    // Two rows of two cells: Left|Top, then Width|Height.
+    for row in 0..2 {
+        ui.horizontal(|ui| {
+            for col in 0..2 {
+                let i = row * 2 + col;
+                let (label, getc, setc, dim) = cells[i];
+                crop_cell(
+                    ui,
+                    history,
+                    &mut scope,
+                    base,
+                    label,
+                    &mut units[i],
+                    dim,
+                    getc,
+                    setc,
+                );
+            }
+        });
     }
     scope.finish(history)
-}
-
-fn crop_get(c: &Crop) -> f32 {
-    c.x
-}
-fn crop_get_y(c: &Crop) -> f32 {
-    c.y
-}
-fn crop_get_w(c: &Crop) -> f32 {
-    c.width
-}
-fn crop_get_h(c: &Crop) -> f32 {
-    c.height
-}
-fn crop_set_x(c: &mut Crop, v: f32) {
-    c.x = v;
-}
-fn crop_set_y(c: &mut Crop, v: f32) {
-    c.y = v;
-}
-fn crop_set_w(c: &mut Crop, v: f32) {
-    c.width = v;
-}
-fn crop_set_h(c: &mut Crop, v: f32) {
-    c.height = v;
-}
-
-/// Drop a crop back to `None` when it spans the full frame, matching the original
-/// block's "no crop when full" behavior.
-fn crop_or_none(c: Crop) -> Option<Crop> {
-    let full = c.x == 0.0 && c.y == 0.0 && c.width == 1.0 && c.height == 1.0;
-    (!full).then_some(c)
 }
 
 /// The default mask shape for each "add shape" button, by kind. The first shape
@@ -2069,23 +2167,61 @@ mod tests {
             })
             .is_some()
         );
-        assert_eq!(
-            crop_or_none(Crop {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0
-            }),
-            None
-        );
-        assert!(
-            crop_or_none(Crop {
-                x: 0.1,
-                y: 0.0,
-                width: 0.9,
-                height: 1.0
-            })
-            .is_some()
-        );
+    }
+
+    #[test]
+    fn crop_px_round_trips_through_normalized() {
+        // A whole-pixel value survives the px → normalized → px round-trip exactly,
+        // for both axes (Left/Width use the width, Top/Height the height).
+        let (w, h) = (4000_u32, 3000_u32);
+        for (px, dim) in [(1000.0, w), (2500.0, h), (0.0, w), (4000.0, w)] {
+            let norm = px_to_norm(px, dim);
+            assert_eq!(
+                norm_to_px(norm, dim),
+                px,
+                "px {px} round-trips on dim {dim}"
+            );
+        }
+        // 25% of a 4000px width is pixel 1000; half of a 3000px height is 1500.
+        assert_eq!(norm_to_px(0.25, w), 1000.0);
+        assert_eq!(norm_to_px(0.5, h), 1500.0);
+    }
+
+    #[test]
+    fn crop_px_clamps_out_of_range_and_handles_zero_dim() {
+        let dim = 2000_u32;
+        // An entered pixel past the dimension clamps the normalized value to 1.0,
+        // and a negative entry clamps to 0.0.
+        assert_eq!(px_to_norm(5000.0, dim), 1.0);
+        assert_eq!(px_to_norm(-50.0, dim), 0.0);
+        // A degenerate zero-pixel dimension can't divide, so it maps to 0.
+        assert_eq!(px_to_norm(123.0, 0), 0.0);
+        assert_eq!(norm_to_px(0.5, 0), 0.0);
+    }
+
+    #[test]
+    fn crop_pct_round_trips_and_clamps() {
+        // A percent value survives the % → normalized → % round-trip exactly.
+        for pct in [0.0_f32, 12.5, 50.0, 100.0] {
+            let norm = pct_to_norm(pct);
+            assert!(
+                (norm_to_pct(norm) - pct).abs() < 1e-4,
+                "pct {pct} round-trips"
+            );
+        }
+        // normalized × 100 is the percent; editing past the ends clamps to [0, 1].
+        assert_eq!(norm_to_pct(0.25), 25.0);
+        assert_eq!(pct_to_norm(150.0), 1.0);
+        assert_eq!(pct_to_norm(-10.0), 0.0);
+    }
+
+    #[test]
+    fn crop_unit_toggles_between_px_and_pct() {
+        // The unit defaults to pixels and the toggle flips it back and forth.
+        assert_eq!(CropUnit::default(), CropUnit::Px);
+        assert_eq!(CropUnit::Px.toggled(), CropUnit::Pct);
+        assert_eq!(CropUnit::Pct.toggled(), CropUnit::Px);
+        assert_eq!(CropUnit::Px.label(), "px");
+        assert_eq!(CropUnit::Pct.label(), "%");
     }
 }
