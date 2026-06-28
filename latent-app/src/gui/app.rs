@@ -531,13 +531,15 @@ pub fn run(
         .window_size
         .map(|(w, h)| [w, h])
         .unwrap_or(theme::DEFAULT_WINDOW_SIZE);
-    // The lowercase application id matches the installed `latent.desktop` so the
-    // Wayland/X11 taskbar shows the bundled icon and name (the displayed title is
-    // the capitalized "Latent").
+    // The application id matches the installed `Latent.desktop` so the Wayland/X11
+    // taskbar shows the bundled icon and name. The id is also the taskbar's
+    // fall-back label before the desktop entry is matched (e.g. running
+    // uninstalled), so it carries the capitalized spelling rather than a lowercase
+    // stand-in.
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(size)
         .with_min_inner_size(theme::MIN_WINDOW_SIZE)
-        .with_app_id("latent")
+        .with_app_id("Latent")
         .with_title(&title);
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);

@@ -7,5 +7,5 @@ Exec=latent %f
 Icon=latent
 Terminal=false
 Categories=Graphics;Photography;
-StartupWMClass=latent
+StartupWMClass=Latent
 MimeType=image/x-dcraw;
