@@ -26,6 +26,7 @@ use super::canvas::{PixelReadout, ViewTransform, Zoom};
 use super::config::{self, Config};
 use super::dialogs::{self, ExportSettings};
 use super::panels;
+use super::scopes::Scopes;
 use super::state::{JobKind, RenderJob, RenderOutput, RenderState, SessionData};
 use super::theme;
 use super::tools::crop::AspectRatio;
@@ -136,6 +137,11 @@ pub(crate) struct Session {
     pub(crate) preview_gen: u64,
     /// The export format/depth/quality choices, defaulted from the source name.
     pub(crate) export: ExportSettings,
+    /// The cached image scopes (histogram, waveform, clipping overlay) plus the
+    /// chosen scope type and clip toggles. Recomputed once per preview in
+    /// [`Self::load_texture`] from the same display bytes the texture is built
+    /// from; the per-frame draw only paints the cached data.
+    pub(crate) scopes: Scopes,
 }
 
 impl Session {
@@ -177,6 +183,7 @@ impl Session {
             overlay_cache: OverlayCache::default(),
             preview_gen: 0,
             export,
+            scopes: Scopes::default(),
         }
     }
 
@@ -818,9 +825,18 @@ impl Session {
     }
 
     /// Upload a rendered preview image into the preview texture (creating it on
-    /// the first frame). The texture upload must run on the egui thread.
+    /// the first frame) and refresh the cached scopes from the **same** display
+    /// bytes. The texture upload must run on the egui thread.
+    ///
+    /// This is the single once-per-preview hook: the output transform
+    /// ([`latent_export::to_srgb8`]) runs **once** here, and the resulting bytes
+    /// feed both the texture and the scopes (histogram, waveform, clip overlay),
+    /// so the scopes match the texture and the file by construction and never
+    /// recompute on a per-frame paint.
     fn load_texture(&mut self, ctx: &egui::Context, img: &ImageBuf) {
-        let color = canvas::to_color_image(img);
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let bytes = latent_export::to_srgb8(img);
+        let color = canvas::color_image_from_srgb8(w, h, &bytes);
         match &mut self.texture {
             Some(tex) => tex.set(color, egui::TextureOptions::default()),
             None => {
@@ -828,6 +844,8 @@ impl Session {
                     Some(ctx.load_texture("preview", color, egui::TextureOptions::default()));
             }
         }
+        // Refresh the scopes from the same display bytes (not per frame).
+        self.scopes.recompute(ctx, &bytes, w, h);
     }
 
     /// Build the cached "before" texture once: the develop base rendered with

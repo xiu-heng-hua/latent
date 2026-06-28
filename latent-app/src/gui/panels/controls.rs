@@ -14,6 +14,7 @@ use latent_edit::{History, MaskShape, Settings};
 use crate::gui::app::{App, Session};
 use crate::gui::dialogs::ExportFormat;
 use crate::gui::panels::sections::SectionId;
+use crate::gui::scopes;
 use crate::gui::theme;
 use crate::gui::widgets;
 
@@ -47,6 +48,12 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
             let sections_open = &app.config.sections_open;
             let session = app.session.as_mut().expect("session present");
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // The scopes sit at the top of the panel, above the develop
+                // sections. They only paint the cached bins/overlay (computed once
+                // per preview), so this never re-renders.
+                scopes::scope_block(ui, &mut session.scopes);
+                ui.separator();
+
                 dirty |= section(
                     ui,
                     ctx,

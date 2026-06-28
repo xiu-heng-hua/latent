@@ -210,7 +210,19 @@ pub(crate) fn norm_to_pixel(norm: [f32; 2], w: u32, h: u32) -> (u32, u32) {
 /// matrix, highlight rolloff, sRGB OETF) so the preview matches the saved file.
 pub(crate) fn to_color_image(img: &ImageBuf) -> egui::ColorImage {
     let bytes = latent_export::to_srgb8(img);
-    egui::ColorImage::from_rgb([img.width() as usize, img.height() as usize], &bytes)
+    color_image_from_srgb8(img.width() as usize, img.height() as usize, &bytes)
+}
+
+/// Build the egui texture image from **already-computed** sRGB8 bytes (the
+/// `RGBRGB…` `to_srgb8` output). Split out so a caller that needs the same bytes
+/// for another purpose — the scopes bin them, the clip overlay reads them — runs
+/// the output transform once and feeds both the texture and the scopes from it.
+pub(crate) fn color_image_from_srgb8(
+    width: usize,
+    height: usize,
+    bytes: &[u8],
+) -> egui::ColorImage {
+    egui::ColorImage::from_rgb([width, height], bytes)
 }
 
 /// Show the central canvas. Until the first preview texture arrives, paints a
@@ -305,6 +317,11 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             // but under the tool handles, so the user sees the selection. Pure
             // paint — never baked into the texture.
             tools::overlay::draw(session, &painter, &transform, active, local_sel);
+
+            // The clipping overlay (blown highlights / crushed shadows), drawn
+            // through the same transform so the marks stay registered to the image
+            // under zoom and pan. View-only: toggling it never re-renders.
+            session.scopes.draw_clip_overlay(&painter, &transform);
 
             // Pixel readout: sample the rendered preview under the cursor when it
             // is over the image (not the gray surround). The shared pick-pixel

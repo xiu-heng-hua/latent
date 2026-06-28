@@ -9,6 +9,7 @@ mod config;
 mod dialogs;
 mod icons;
 mod panels;
+mod scopes;
 mod state;
 mod theme;
 mod tools;
