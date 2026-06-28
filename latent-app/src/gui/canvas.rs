@@ -222,6 +222,18 @@ pub(crate) fn step_zoom(zoom: Zoom, dir: i32, fit_scale: f32) -> Zoom {
     zoom.stepped(dir, fit_scale)
 }
 
+/// The smallest fraction of the image kept on each side of the before/after seam,
+/// so a drag can never push the divider fully off one edge (which would hide one
+/// of the two halves and look like a plain single image).
+const SPLIT_MARGIN: f32 = 0.02;
+
+/// Clamp a proposed normalized seam position into the valid `[SPLIT_MARGIN, 1 −
+/// SPLIT_MARGIN]` range, keeping a sliver of both halves visible. Pure so the
+/// clamp is unit-testable on its own.
+fn clamp_split(x: f32) -> f32 {
+    x.clamp(SPLIT_MARGIN, 1.0 - SPLIT_MARGIN)
+}
+
 /// Convert a normalized `[0, 1]` image coordinate to a pixel index in an image of
 /// `(w, h)` pixels, clamped to the last valid index. The shared
 /// normalized→pixel-index conversion the hover readout (and later the clipping
@@ -331,24 +343,18 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             let image_rect = transform.image_rect();
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
+            // Set when the before/after seam grabs the drag this frame, so the tool
+            // routing below doesn't also act on the same pointer.
+            let mut split_grabbed = false;
             match (session.before, before_id) {
-                // Split: clip the image rect down the middle and draw before on
-                // the left half, after on the right. Both go through the one
-                // transform, so a feature lines up across the seam.
+                // Split: draw before on the left of the seam, after on the right.
+                // Both go through the one transform with matching UVs, so a feature
+                // lines up across the seam wherever the user drags it.
                 (BeforeAfter::Split, Some(bid)) => {
-                    let mid = image_rect.center().x;
-                    let left = image_rect.intersect(Rect::everything_left_of(mid));
-                    let right = image_rect.intersect(Rect::everything_right_of(mid));
-                    let left_uv = Rect::from_min_max(uv.min, Pos2::new(0.5, 1.0));
-                    let right_uv = Rect::from_min_max(Pos2::new(0.5, 0.0), uv.max);
-                    painter.image(bid, left, left_uv, Color32::WHITE);
-                    painter.image(tex_id, right, right_uv, Color32::WHITE);
-                    // The divider line down the seam.
-                    painter.vline(
-                        mid,
-                        image_rect.y_range(),
-                        egui::Stroke::new(1.0, theme::ACCENT),
-                    );
+                    // The drag updates `split_x` for *this* frame's draw, so the seam
+                    // tracks the pointer with no lag.
+                    split_grabbed = split_interact(session, &resp, image_rect);
+                    draw_split(&painter, image_rect, session.split_x, bid, tex_id, uv);
                 }
                 // Toggle: draw the cached "before" in place of the live edit.
                 (BeforeAfter::Toggle, Some(bid)) => {
@@ -382,11 +388,17 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             // Route the pointer to the active tool: it draws its handles/guides
             // and consumes the drag when it grabs one, falling through to pan
             // otherwise. One undo step per drag (begin on grab, commit on
-            // release). `dirty` is set when the tool changed the settings.
-            let changed = tools::interact(
-                session, &resp, &painter, &transform, active, local_sel, shape_sel,
-            );
-            painted |= changed;
+            // release). `dirty` is set when the tool changed the settings. Skipped
+            // while the comparison seam owns the drag, so dragging the divider never
+            // also paints/edits underneath it.
+            if !split_grabbed {
+                let changed = tools::interact(
+                    session, &resp, &painter, &transform, active, local_sel, shape_sel,
+                );
+                painted |= changed;
+            } else {
+                resp.ctx.request_repaint();
+            }
         });
 
     // Whether a tool is active, captured before the session borrow is released so
@@ -483,6 +495,94 @@ fn handle_zoom(
     let landed = after.image_norm_to_screen(anchor);
     session.pan += cursor - landed;
     ui.ctx().request_repaint();
+}
+
+/// Screen-pixel half-width of the seam's grab zone: a drag (or a hover for the
+/// resize cursor) within this distance of the seam takes hold of the divider.
+const SPLIT_HIT_RADIUS: f32 = 10.0;
+
+/// Handle the before/after seam drag and hover for one frame. A left-drag that
+/// starts within [`SPLIT_HIT_RADIUS`] of the seam grabs it (a flag held on the
+/// session for the rest of the gesture), so the divider follows the pointer even
+/// past the grab zone, updating `session.split_x` (clamped so a sliver of both
+/// halves always shows). On hover near the seam it shows the horizontal-resize
+/// cursor as the drag affordance. Returns whether the seam owns the drag this
+/// frame, so the caller can skip the tool routing.
+///
+/// View-only: it moves the seam, never the texture or the settings — no render.
+fn split_interact(session: &mut Session, resp: &egui::Response, image_rect: Rect) -> bool {
+    let seam_x = image_rect.min.x + clamp_split(session.split_x) * image_rect.width();
+    // How far a screen x is from the seam, ignoring the vertical position so the
+    // whole seam height is grabbable.
+    let near_seam = |x: f32| (x - seam_x).abs() <= SPLIT_HIT_RADIUS;
+    // Map a pointer x to a clamped normalized seam position within the image rect.
+    let to_split =
+        |x: f32| clamp_split((x - image_rect.min.x) / image_rect.width().max(f32::EPSILON));
+
+    // Grab on a drag that begins over the seam; release on drag-stop. The held flag
+    // keeps the divider tracking the pointer for the whole gesture, even once the
+    // pointer outruns the moving seam's grab zone.
+    if resp.drag_started() {
+        session.split_dragging = resp.interact_pointer_pos().is_some_and(|p| near_seam(p.x));
+    }
+    // Release on drag-stop, and also whenever no drag is live — so a flag left set
+    // by a gesture that ended off this view (e.g. switching the before/after mode
+    // mid-drag) can't grab a later, unrelated drag.
+    if resp.drag_stopped() || !resp.dragged() {
+        session.split_dragging = false;
+    }
+
+    if session.split_dragging {
+        if let Some(p) = resp.interact_pointer_pos() {
+            session.split_x = to_split(p.x);
+        }
+        resp.ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        return true;
+    }
+
+    // Not dragging: show the resize cursor when hovering over the seam, as the
+    // affordance that it can be dragged.
+    if let Some(p) = resp.hover_pos()
+        && near_seam(p.x)
+    {
+        resp.ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    false
+}
+
+/// Draw the side-by-side comparison: the `before` texture left of the seam, the
+/// `after` (live) texture right of it, each sampled with the matching UV slice of
+/// the one transform so a feature stays registered across the seam, then the
+/// divider line with a center grip so it reads as draggable.
+fn draw_split(
+    painter: &egui::Painter,
+    image_rect: Rect,
+    split_x: f32,
+    before_id: egui::TextureId,
+    after_id: egui::TextureId,
+    uv: Rect,
+) {
+    let frac = clamp_split(split_x);
+    let seam = image_rect.min.x + frac * image_rect.width();
+    let left = image_rect.intersect(Rect::everything_left_of(seam));
+    let right = image_rect.intersect(Rect::everything_right_of(seam));
+    // The UV split matches the geometric split, so both halves show the same
+    // image region they cover — features line up across the seam.
+    let left_uv = Rect::from_min_max(uv.min, Pos2::new(frac, 1.0));
+    let right_uv = Rect::from_min_max(Pos2::new(frac, 0.0), uv.max);
+    painter.image(before_id, left, left_uv, Color32::WHITE);
+    painter.image(after_id, right, right_uv, Color32::WHITE);
+
+    // The divider line down the seam, plus a small grip at its vertical center so
+    // it reads as a draggable handle.
+    painter.vline(
+        seam,
+        image_rect.y_range(),
+        egui::Stroke::new(1.0, theme::ACCENT),
+    );
+    let grip = Pos2::new(seam, image_rect.center().y);
+    painter.circle_filled(grip, 5.0, theme::ACCENT);
+    painter.circle_stroke(grip, 5.0, egui::Stroke::new(1.5, Color32::WHITE));
 }
 
 /// Sample the rendered-preview pixel under `pos` (when over the image) into the
@@ -681,6 +781,29 @@ mod tests {
         assert_eq!(norm_to_pixel([2.0, -1.0], w, h), (w - 1, 0));
         // A 1×1 image never produces a nonzero index.
         assert_eq!(norm_to_pixel([0.9, 0.9], 1, 1), (0, 0));
+    }
+
+    #[test]
+    fn clamp_split_keeps_both_halves_visible() {
+        // The unclamped center passes through untouched.
+        assert!((clamp_split(0.5) - 0.5).abs() < 1e-6);
+        // A drag past either edge is pulled back to the margin, so neither the
+        // before nor the after half can vanish entirely.
+        assert_eq!(clamp_split(0.0), SPLIT_MARGIN);
+        assert_eq!(clamp_split(-3.0), SPLIT_MARGIN);
+        assert_eq!(clamp_split(1.0), 1.0 - SPLIT_MARGIN);
+        assert_eq!(clamp_split(42.0), 1.0 - SPLIT_MARGIN);
+        // A value just inside the margins is left alone.
+        let inside = 1.0 - SPLIT_MARGIN - 0.01;
+        assert!((clamp_split(inside) - inside).abs() < 1e-6);
+        // The result is always within the valid band.
+        for &x in &[-1.0, 0.0, 0.013, 0.5, 0.99, 2.0] {
+            let c = clamp_split(x);
+            assert!(
+                (SPLIT_MARGIN..=1.0 - SPLIT_MARGIN).contains(&c),
+                "{x} -> {c}"
+            );
+        }
     }
 
     #[test]

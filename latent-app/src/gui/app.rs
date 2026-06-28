@@ -192,6 +192,16 @@ pub(crate) struct Session {
     pub(crate) last_transform: Option<ViewTransform>,
     /// Which before/after view to draw.
     pub(crate) before: BeforeAfter,
+    /// The draggable seam position in the side-by-side comparison, as a fraction of
+    /// the image width in `[0, 1]` (0.5 is the center). Both halves sample the same
+    /// transform, so a feature stays registered across the seam; only which half
+    /// each side shows changes as this moves.
+    pub(crate) split_x: f32,
+    /// Whether a drag of the comparison seam is in progress. Set when a drag starts
+    /// on the divider and held for the rest of the gesture, so the seam keeps
+    /// following the pointer even past its grab zone and the gesture doesn't fall
+    /// through to the active tool.
+    pub(crate) split_dragging: bool,
     /// The pixel under the cursor this frame, or `None` off the image.
     pub(crate) pixel_readout: Option<PixelReadout>,
     /// Index of the local adjustment selected for editing in the panel.
@@ -279,6 +289,8 @@ impl Session {
             pan: egui::Vec2::ZERO,
             last_transform: None,
             before: BeforeAfter::default(),
+            split_x: 0.5,
+            split_dragging: false,
             pixel_readout: None,
             local_sel: 0,
             shape_sel: 0,
