@@ -30,7 +30,7 @@ pub(crate) struct SessionData {
     pub(crate) saved: Vec<Settings>,
     /// The variant names as loaded from disk (so a rename is detected as unsaved).
     pub(crate) saved_names: Vec<String>,
-    /// Window title (`<basename> — Latent`).
+    /// Window title (the file's basename).
     pub(crate) title: String,
     /// Full input path (shown on hover).
     pub(crate) path: String,

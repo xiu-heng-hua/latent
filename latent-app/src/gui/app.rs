@@ -164,7 +164,7 @@ pub(crate) struct Session {
     pub(crate) saved: Vec<Settings>,
     /// Last variant names written to the sidecar, so a rename autosaves.
     pub(crate) saved_names: Vec<String>,
-    /// Window title (`<filename> — Latent`).
+    /// Window title (the file's basename).
     pub(crate) title: String,
     /// Full input path, surfaced on hover (the title shows only the basename).
     pub(crate) path: String,
@@ -588,14 +588,14 @@ pub fn run(
     Ok(())
 }
 
-/// The window title for `input`: `<basename> — Latent`, falling back to the full
-/// path when there's no file name.
+/// The window title for `input`: just the file's basename, falling back to the
+/// full path when there's no file name. The application name is carried by the
+/// taskbar entry (the `latent` app id), so the title bar stays uncluttered.
 pub(crate) fn window_title(input: &Path) -> String {
-    let name = input
+    input
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| input.display().to_string());
-    format!("{name} — Latent")
+        .unwrap_or_else(|| input.display().to_string())
 }
 
 /// Decode the committed app icon into eframe's `IconData`. The PNG is decoded
@@ -1832,10 +1832,7 @@ mod tests {
 
     #[test]
     fn window_title_uses_the_basename() {
-        assert_eq!(
-            window_title(Path::new("/photos/sunset.nef")),
-            "sunset.nef — Latent"
-        );
+        assert_eq!(window_title(Path::new("/photos/sunset.nef")), "sunset.nef");
     }
 
     #[test]

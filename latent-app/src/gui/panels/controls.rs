@@ -891,7 +891,7 @@ fn lens_block(session: &mut Session, ui: &mut egui::Ui, vis: &mut VisCtx) -> boo
                 // Apply the cached profile on enable, clear it on disable, as one
                 // undo step.
                 let to_apply = if enabled {
-                    session.lens_lookup.as_ref().and_then(|o| o.clone())
+                    session.lens_lookup.flatten()
                 } else {
                     None
                 };
