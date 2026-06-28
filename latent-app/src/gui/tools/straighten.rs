@@ -42,10 +42,11 @@ pub(crate) fn nearest_end(
 /// scaled by the displayed width/height before the `atan2` — otherwise the
 /// horizon would not actually end up level on a non-square frame. The result is
 /// the rotation that brings the line to the nearer of horizontal or vertical
-/// (so dragging a near-vertical edge plumbs it), folded into `[-45, 45]`, with
-/// the sign matching the engine's counter-clockwise-positive convention: a line
-/// whose right end sits lower on screen (a clockwise visual tilt) returns a
-/// positive angle, which rotates the image counter-clockwise to level it.
+/// (so dragging a near-vertical edge plumbs it), folded into `[-45, 45]`. The
+/// engine rotates the image clockwise for a positive `straighten_degrees` (image
+/// coordinates have y pointing down), so a line whose right end sits lower on
+/// screen (a clockwise visual tilt) returns a negative angle, which rotates the
+/// image counter-clockwise to level it.
 ///
 /// Pure math — unit-tested without a window.
 pub(crate) fn level_angle(from: [f32; 2], to: [f32; 2], image_aspect: f32) -> f32 {
@@ -71,7 +72,9 @@ pub(crate) fn level_angle(from: [f32; 2], to: [f32; 2], image_aspect: f32) -> f3
     } else if deg < -45.0 {
         deg += 90.0;
     }
-    deg.clamp(-45.0, 45.0)
+    // The engine rotates clockwise for a positive angle (image y is down), so the
+    // leveling rotation is the negation of the line's measured screen tilt.
+    -deg.clamp(-45.0, 45.0)
 }
 
 /// Draw the reference line and its two endpoint handles, in screen space via the
@@ -161,14 +164,21 @@ mod tests {
     }
 
     #[test]
-    fn a_right_down_horizon_rotates_counter_clockwise() {
-        // The right end is lower on screen (a clockwise visual tilt) → positive
-        // angle (counter-clockwise rotation levels it).
+    fn a_right_down_horizon_levels_counter_clockwise() {
+        // The right end is lower on screen (a clockwise visual tilt). The engine
+        // rotates clockwise for a positive angle, so leveling it (a counter-
+        // clockwise rotation) is a negative angle.
         let a = level_angle([0.2, 0.4], [0.8, 0.5], 1.0);
-        assert!(a > 0.0, "expected a positive (CCW) angle, got {a}");
-        // A right-*up* horizon mirrors to a negative angle.
+        assert!(
+            a < 0.0,
+            "a right-down horizon levels with a negative angle, got {a}"
+        );
+        // A right-*up* horizon mirrors to a positive angle.
         let b = level_angle([0.2, 0.5], [0.8, 0.4], 1.0);
-        assert!(b < 0.0, "expected a negative angle, got {b}");
+        assert!(
+            b > 0.0,
+            "a right-up horizon levels with a positive angle, got {b}"
+        );
         assert!((a + b).abs() < 1e-4, "the mirror should negate the angle");
     }
 
