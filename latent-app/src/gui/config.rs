@@ -12,6 +12,7 @@
 //! Every field is `#[serde(default)]` so an older config that predates a field
 //! still loads — the missing field simply takes its default.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,10 @@ pub(crate) struct Config {
     pub(crate) gpu: bool,
     /// The window theme.
     pub(crate) theme: Theme,
+    /// Open/closed state of the controls-panel sections, keyed by a stable
+    /// section key (not the display label, so renaming a header never orphans
+    /// saved state). A missing key falls back to the section's own default-open.
+    pub(crate) sections_open: BTreeMap<String, bool>,
 }
 
 impl Config {
@@ -168,10 +173,32 @@ mod tests {
             last_open_dir: Some(PathBuf::from("/photos")),
             gpu: true,
             theme: Theme::Light,
+            sections_open: BTreeMap::from([
+                ("basic".to_owned(), true),
+                ("color".to_owned(), false),
+            ]),
         };
         let text = cfg.to_ron().expect("serialize");
         let back = Config::from_ron(&text).expect("parse");
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn section_state_round_trips() {
+        // A collapsed section persists through a serialize/reload, keyed by a
+        // stable section key (not the display label). An older config missing the
+        // field defaults to an empty map (each section then uses its own
+        // default-open), proving the forward-compatible default.
+        let mut cfg = Config::default();
+        cfg.sections_open.insert("color".to_owned(), false);
+        let text = cfg.to_ron().expect("serialize");
+        let back = Config::from_ron(&text).expect("parse");
+        assert_eq!(back.sections_open.get("color"), Some(&false));
+
+        // A config that predates the field still loads, with no remembered state.
+        let old = "(window_size: Some((800.0, 600.0)))";
+        let loaded = Config::from_ron(old).expect("old config should load");
+        assert!(loaded.sections_open.is_empty());
     }
 
     #[test]

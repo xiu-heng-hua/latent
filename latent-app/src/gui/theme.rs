@@ -35,6 +35,11 @@ const TEXT: Color32 = Color32::from_gray(220);
 /// Hairline separators / widget outlines.
 const HAIRLINE: Color32 = Color32::from_gray(70);
 
+/// The tick color marking a slider's neutral (unchanged) position on its track.
+/// A muted light gray, distinct from the accent so it reads as a reference mark
+/// rather than an active selection.
+pub(crate) const NEUTRAL_MARKER: Color32 = Color32::from_gray(150);
+
 /// The neutral mid-gray that surrounds the photo in the central panel. A RAW
 /// editor's working area must surround the image with a *color-neutral* gray:
 /// the channels are deliberately equal (R == G == B) so the surround pushes no
@@ -59,6 +64,14 @@ const ITEM_SPACING: egui::Vec2 = egui::vec2(8.0, 6.0);
 pub(crate) const PANEL_MARGIN: i8 = 8;
 /// Default width of the right-hand controls side panel.
 pub(crate) const SIDE_PANEL_WIDTH: f32 = 280.0;
+/// Minimum width the controls side panel can be dragged to — wide enough that the
+/// widest slider label plus its numeric entry stays readable rather than clipping.
+pub(crate) const SIDE_PANEL_MIN_WIDTH: f32 = 240.0;
+/// Maximum width the controls side panel can be dragged to.
+pub(crate) const SIDE_PANEL_MAX_WIDTH: f32 = 520.0;
+/// Approximate width reserved for a slider's numeric entry, used to keep the
+/// neutral-marker tick over the slider track rather than under the entry.
+pub(crate) const SLIDER_NUMERIC_WIDTH: f32 = 56.0;
 /// The curve editor's drawing area (max width × fixed height).
 pub(crate) const CURVE_EDITOR_SIZE: egui::Vec2 = egui::vec2(220.0, 160.0);
 

@@ -1,27 +1,35 @@
-//! The right-hand controls side panel: the full stack of develop sections
-//! (light, color, detail, geometry, local adjustments) plus the export row. Each
-//! section delegates to a builder in [`crate::gui::widgets`]; the panel only
-//! wires them to the active variant and folds their `dirty` flags. Shown only with
-//! an open session.
+//! The right-hand controls side panel: the develop sections (Basic / Tone /
+//! Color / Curves / Detail / Effects / Geometry / Masks) plus the export row,
+//! laid out as collapsible [`egui::collapsing_header::CollapsingState`] groups
+//! inside a [`egui::ScrollArea`]. Each section delegates to a builder in
+//! [`crate::gui::widgets`]; the panel wires them to the active variant, folds
+//! their `dirty` flags, and decorates each header with a per-section reset
+//! affordance and a modified indicator. Section open/closed state and the panel
+//! width persist through the app config. Shown only with an open session.
 
 use eframe::egui;
-use latent_edit::MaskShape;
+use egui::collapsing_header::CollapsingState;
+use latent_edit::{History, MaskShape, Settings};
 
 use crate::gui::app::{App, Session};
 use crate::gui::dialogs::ExportFormat;
+use crate::gui::panels::sections::SectionId;
 use crate::gui::theme;
 use crate::gui::widgets;
 
 /// Show the controls panel and return whether the preview needs a redraw.
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
-    // Nothing to show without an open image.
-    if app.session.is_none() {
+    // Nothing to show without an open image, or when the panel is hidden.
+    if app.session.is_none() || !app.panel_visible {
         return false;
     }
     let mut dirty = false;
     // Whether the user asked to export this frame (handled after the panel closure
     // so the session borrow is released first).
     let mut do_export = false;
+    // Section open-state toggles to persist after the panel closure (so the config
+    // write does not borrow `app` while the panel closure still does).
+    let mut toggles: Vec<(&'static str, bool)> = Vec::new();
 
     let frame = egui::Frame::side_top_panel(&ctx.style())
         .inner_margin(egui::Margin::same(theme::PANEL_MARGIN));
@@ -33,79 +41,174 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
     let panel = egui::SidePanel::right("controls")
         .resizable(true)
         .default_width(default_width)
+        .width_range(theme::SIDE_PANEL_MIN_WIDTH..=theme::SIDE_PANEL_MAX_WIDTH)
         .frame(frame)
         .show(ctx, |ui| {
+            let sections_open = &app.config.sections_open;
             let session = app.session.as_mut().expect("session present");
-            let active = session.active;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Light");
-                dirty |= widgets::opt_point_slider(
+                dirty |= section(
                     ui,
-                    &mut session.variants[active],
-                    "Exposure (EV)",
-                    -5.0..=5.0,
-                    0.0,
-                    |s| s.global.exposure,
-                    |s, v| s.global.exposure = v,
-                );
-                dirty |= widgets::tone_block(ui, &mut session.variants[active]);
-
-                ui.separator();
-                ui.heading("Color");
-                dirty |= widgets::white_balance_block(ui, &mut session.variants[active]);
-                dirty |= widgets::opt_point_slider(
-                    ui,
-                    &mut session.variants[active],
-                    "Saturation",
-                    0.0..=2.0,
-                    1.0,
-                    |s| s.global.saturation,
-                    |s, v| s.global.saturation = v,
-                );
-                dirty |= widgets::curves_block(
-                    ui,
-                    &mut session.variants[active],
-                    &mut session.curve_channel,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Basic,
+                    |ui, s| {
+                        let mut d = false;
+                        d |= widgets::opt_point_slider(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::SliderSpec {
+                                label: "Exposure (EV)",
+                                range: -5.0..=5.0,
+                                neutral: 0.0,
+                                help: "Brightness in stops",
+                            },
+                            |st| st.global.exposure,
+                            |st, v| st.global.exposure = v,
+                        );
+                        d |= widgets::white_balance_block(ui, &mut s.variants[s.active]);
+                        d
+                    },
                 );
 
-                ui.separator();
-                ui.heading("Detail");
-                dirty |= widgets::sharpen_block(ui, &mut session.variants[active]);
-                dirty |= widgets::clarity_block(ui, &mut session.variants[active]);
-                dirty |= widgets::opt_point_slider(
+                dirty |= section(
                     ui,
-                    &mut session.variants[active],
-                    "Dehaze",
-                    0.0..=1.0,
-                    0.0,
-                    |s| s.global.dehaze,
-                    |s, v| s.global.dehaze = v,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Tone,
+                    |ui, s| widgets::tone_block(ui, &mut s.variants[s.active]),
                 );
-                dirty |= widgets::noise_reduction_block(ui, &mut session.variants[active]);
 
-                ui.separator();
-                ui.heading("Geometry");
-                geometry_tools(session, ui);
-                dirty |= widgets::straighten_slider(ui, &mut session.variants[active]);
-                dirty |= widgets::keystone_block(ui, &mut session.variants[active]);
-                crop_aspect_row(session, ui);
-                dirty |= widgets::crop_block(ui, &mut session.variants[active]);
-                dirty |= widgets::vignette_slider(ui, &mut session.variants[active]);
-
-                ui.separator();
-                ui.heading("Local Adjustments");
-                dirty |= widgets::local_adjustments(
+                dirty |= section(
                     ui,
-                    &mut session.variants[active],
-                    &mut session.local_sel,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Color,
+                    |ui, s| {
+                        widgets::opt_point_slider(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::SliderSpec {
+                                label: "Saturation",
+                                range: 0.0..=2.0,
+                                neutral: 1.0,
+                                help: "Color intensity",
+                            },
+                            |st| st.global.saturation,
+                            |st, v| st.global.saturation = v,
+                        )
+                    },
                 );
-                local_tool_row(session, ui);
+
+                dirty |= section(
+                    ui,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Curves,
+                    |ui, s| {
+                        let active = s.active;
+                        widgets::curves_block(ui, &mut s.variants[active], &mut s.curve_channel)
+                    },
+                );
+
+                dirty |= section(
+                    ui,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Detail,
+                    |ui, s| {
+                        let mut d = false;
+                        d |= widgets::sharpen_block(ui, &mut s.variants[s.active]);
+                        d |= widgets::clarity_block(ui, &mut s.variants[s.active]);
+                        d |= widgets::opt_point_slider(
+                            ui,
+                            &mut s.variants[s.active],
+                            widgets::SliderSpec {
+                                label: "Dehaze",
+                                range: 0.0..=1.0,
+                                neutral: 0.0,
+                                help: "Cut atmospheric haze",
+                            },
+                            |st| st.global.dehaze,
+                            |st, v| st.global.dehaze = v,
+                        );
+                        d |= widgets::noise_reduction_block(ui, &mut s.variants[s.active]);
+                        d
+                    },
+                );
+
+                dirty |= section(
+                    ui,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Effects,
+                    |ui, s| widgets::vignette_slider(ui, &mut s.variants[s.active]),
+                );
+
+                dirty |= section(
+                    ui,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Geometry,
+                    |ui, s| {
+                        let mut d = false;
+                        geometry_tools(s, ui);
+                        d |= widgets::straighten_slider(ui, &mut s.variants[s.active]);
+                        d |= widgets::keystone_block(ui, &mut s.variants[s.active]);
+                        crop_aspect_row(s, ui);
+                        d |= widgets::crop_block(ui, &mut s.variants[s.active]);
+                        d
+                    },
+                );
+
+                dirty |= section(
+                    ui,
+                    ctx,
+                    session,
+                    sections_open,
+                    &mut toggles,
+                    SectionId::Masks,
+                    |ui, s| {
+                        let mut d = false;
+                        d |= widgets::local_adjustments(
+                            ui,
+                            &mut s.variants[s.active],
+                            &mut s.local_sel,
+                        );
+                        local_tool_row(s, ui);
+                        d
+                    },
+                );
 
                 ui.separator();
+                // → moves to a dialog in a later pass; left as-is for now.
                 ui.heading("Export");
                 export_section(session, ui, &mut do_export);
             });
         });
+
+    // Persist any section open/closed toggles the user made this frame.
+    for (key, open) in toggles {
+        let changed = app.config.sections_open.get(key) != Some(&open);
+        if changed {
+            app.config.sections_open.insert(key.to_owned(), open);
+            app.save_config();
+        }
+    }
 
     // Persist the panel width when the user resizes it (debounced to ±1px so a
     // resize drag doesn't write the config every frame).
@@ -126,6 +229,79 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
     dirty
 }
 
+/// Render one collapsible section: a custom header carrying the section label, a
+/// modified indicator, and a per-section reset button, then the section body. The
+/// open/closed state is seeded from the persisted config (falling back to the
+/// section's own default-open) and any toggle this frame is recorded in `toggles`
+/// for the caller to persist. Returns whether the body marked the preview dirty.
+fn section(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    session: &mut Session,
+    sections_open: &std::collections::BTreeMap<String, bool>,
+    toggles: &mut Vec<(&'static str, bool)>,
+    id: SectionId,
+    body: impl FnOnce(&mut egui::Ui, &mut Session) -> bool,
+) -> bool {
+    let default_open = sections_open
+        .get(id.key())
+        .copied()
+        .unwrap_or_else(|| id.default_open());
+    let modified = id.is_modified(session.variants[session.active].current());
+
+    let state_id = ui.make_persistent_id(("controls_section", id.key()));
+    let state = CollapsingState::load_with_default_open(ctx, state_id, default_open);
+    let was_open = state.is_open();
+
+    let mut dirty = false;
+    let (_toggle, _header, _body) = state
+        .show_header(ui, |ui| {
+            ui.label(egui::RichText::new(id.label()).heading())
+                .on_hover_text(id.help());
+            // Push the reset/indicator to the right edge of the header row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::gui::icons::icon_button(ui, modified, "undo", "Reset this section")
+                    .clicked()
+                {
+                    reset_section(&mut session.variants[session.active], id);
+                    dirty = true;
+                }
+                if modified {
+                    // A subtle dot on the header so a collapsed section still
+                    // shows it holds edits.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 3.0, theme::ACCENT);
+                }
+            });
+        })
+        .body(|ui| {
+            dirty |= body(ui, session);
+        });
+
+    // Record an open/closed change for the caller to persist (keyed by the stable
+    // section key, never the display label).
+    let now_open = CollapsingState::load(ctx, state_id)
+        .map(|s| s.is_open())
+        .unwrap_or(was_open);
+    if now_open != was_open {
+        toggles.push((id.key(), now_open));
+    }
+
+    dirty
+}
+
+/// Reset exactly the section's fields to default, as **one** undo step. The
+/// section owns the field set; one begin/commit brackets the whole reset, so it
+/// is a single step regardless of how many fields it touched, and a section
+/// already at default records nothing (the `prev != current` guard).
+fn reset_section(history: &mut History<Settings>, id: SectionId) {
+    history.begin();
+    id.reset(history.current_mut());
+    history.commit();
+}
+
 /// The local-adjustment tool row: the brush/shape activator and brush sliders that
 /// follow the selected local's first shape.
 fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
@@ -143,9 +319,12 @@ fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
             {
                 session.tool = CanvasTool::Brush;
             }
-            ui.add(egui::Slider::new(&mut session.brush_radius, 0.01..=0.5).text("Size"));
-            ui.add(egui::Slider::new(&mut session.brush_feather, 0.0..=0.5).text("Feather"));
-            ui.checkbox(&mut session.brush_erase, "Erase");
+            ui.add(egui::Slider::new(&mut session.brush_radius, 0.01..=0.5).text("Size"))
+                .on_hover_text("Brush radius. 0.01 … 0.5; [ ] resize");
+            ui.add(egui::Slider::new(&mut session.brush_feather, 0.0..=0.5).text("Feather"))
+                .on_hover_text("Brush edge softness. 0 … 0.5; Shift+[ ] resize");
+            ui.checkbox(&mut session.brush_erase, "Erase")
+                .on_hover_text("Subtract coverage instead of adding it");
             ui.label("Drag on the image to paint. [ ] resize, Shift for feather.");
         }
         Some(MaskShape::Gradient(_) | MaskShape::Radial(_)) => {

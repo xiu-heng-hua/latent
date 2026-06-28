@@ -262,6 +262,8 @@ pub fn run(
                 status: String::new(),
                 render: RenderState::default(),
                 pending_load: false,
+                panel_visible: true,
+                shortcuts_open: false,
             };
             // Kick off the first file's develop on the worker (off the UI thread),
             // so the window paints immediately and the image arrives when ready.
@@ -317,6 +319,11 @@ pub struct App {
     /// Whether the in-flight worker job is a file load (vs a preview/export), so
     /// the UI can show a loading state and gate re-entrant opens.
     pub(crate) pending_load: bool,
+    /// Whether the right-hand controls panel is shown (toggled with `Tab` for a
+    /// full-bleed canvas). Defaults to shown.
+    pub(crate) panel_visible: bool,
+    /// Whether the keyboard-shortcuts cheat-sheet modal is open (toggled with `?`).
+    pub(crate) shortcuts_open: bool,
 }
 
 impl App {
@@ -776,6 +783,32 @@ impl App {
             self.open_via_dialog(ctx);
         }
     }
+
+    /// `Tab` hides/shows the controls panel, `?` opens the shortcuts cheat-sheet.
+    /// Both are guarded against a focused text field: `Tab` is egui's focus-cycling
+    /// key and `?` would otherwise pop the modal while typing into the export path
+    /// or a numeric entry, so neither fires while any widget holds keyboard focus.
+    fn handle_panel_shortcuts(&mut self, ctx: &egui::Context) {
+        // A held keyboard focus (a text edit / DragValue being typed into) blocks
+        // both, so Tab still cycles focus and `?` types a literal character there.
+        if ctx.memory(|m| m.focused()).is_some() {
+            return;
+        }
+        let (mut toggle_panel, mut toggle_help) = (false, false);
+        ctx.input(|i| {
+            if i.modifiers.command {
+                return;
+            }
+            toggle_panel = i.key_pressed(egui::Key::Tab);
+            toggle_help = i.key_pressed(egui::Key::Questionmark);
+        });
+        if toggle_panel {
+            self.panel_visible = !self.panel_visible;
+        }
+        if toggle_help {
+            self.shortcuts_open = !self.shortcuts_open;
+        }
+    }
 }
 
 impl Session {
@@ -843,6 +876,10 @@ impl eframe::App for App {
 
         // With no open image, show the welcome state and skip the editor entirely.
         if self.session.is_none() {
+            // The shortcuts cheat-sheet is reachable from the welcome state too
+            // (`?` to open, Help ▸ Keyboard shortcuts to open).
+            self.handle_panel_shortcuts(ctx);
+            dialogs::show_shortcuts(ctx, &mut self.shortcuts_open);
             panels::menubar::show_minimal(self, ctx);
             panels::welcome::show(self, ctx);
             // While a file is developing, keep repainting so the editor appears the
@@ -880,6 +917,10 @@ impl eframe::App for App {
 
         self.handle_view_shortcuts(ctx);
         self.handle_brush_shortcuts(ctx);
+        self.handle_panel_shortcuts(ctx);
+
+        // The shortcuts cheat-sheet modal (opened with `?`), drawn over the chrome.
+        dialogs::show_shortcuts(ctx, &mut self.shortcuts_open);
 
         // Chrome, in panel order: menu bar, toolbar, status bar, controls — then
         // the central canvas last so it takes the remaining space.
@@ -926,6 +967,8 @@ mod tests {
             status: String::new(),
             render: RenderState::default(),
             pending_load: false,
+            panel_visible: true,
+            shortcuts_open: false,
         }
     }
 

@@ -95,13 +95,23 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context, do_undo: &mut bool, do_re
                 // Planned: scopes (histogram / clipping).
                 ui.add_enabled(false, egui::Button::new("Histogram"));
                 ui.separator();
-                // Planned: panel visibility toggles.
-                ui.add_enabled(false, egui::Button::new("Show controls panel"));
+                // Toggle the right-hand controls panel (also bound to Tab).
+                let panel_label = if app.panel_visible {
+                    "Hide controls panel"
+                } else {
+                    "Show controls panel"
+                };
+                if ui.button(panel_label).clicked() {
+                    app.panel_visible = !app.panel_visible;
+                    ui.close();
+                }
             });
 
             ui.menu_button("Help", |ui| {
-                // Planned: a keyboard-shortcut cheat sheet.
-                ui.add_enabled(false, egui::Button::new("Keyboard shortcuts"));
+                if ui.button("Keyboard shortcuts").clicked() {
+                    app.shortcuts_open = true;
+                    ui.close();
+                }
                 // Planned: an About dialog.
                 ui.add_enabled(false, egui::Button::new("About latent"));
             });
@@ -131,7 +141,10 @@ pub(crate) fn show_minimal(app: &mut App, ctx: &egui::Context) {
                 }
             });
             ui.menu_button("Help", |ui| {
-                ui.add_enabled(false, egui::Button::new("Keyboard shortcuts"));
+                if ui.button("Keyboard shortcuts").clicked() {
+                    app.shortcuts_open = true;
+                    ui.close();
+                }
                 ui.add_enabled(false, egui::Button::new("About latent"));
             });
         });
