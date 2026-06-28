@@ -79,7 +79,7 @@ pub(crate) enum Theme {
 /// The persisted application config. Flat and serde-derived; serialized as RON to
 /// match the edit sidecar's format. Every field defaults so a partial or older
 /// file still loads.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
     /// Last window inner size in logical points, re-applied on launch.
@@ -99,7 +99,26 @@ pub(crate) struct Config {
     /// Open/closed state of the controls-panel sections, keyed by a stable
     /// section key (not the display label, so renaming a header never orphans
     /// saved state). A missing key falls back to the section's own default-open.
+    /// Used when solo (accordion) mode is **off**, where sections open and close
+    /// independently. In solo mode the single open section is tracked by
+    /// [`Config::open_section`] instead.
     pub(crate) sections_open: BTreeMap<String, bool>,
+    /// Whether the controls panel runs in solo (accordion) mode: opening one
+    /// section collapses the others, so at most one is open at a time. On by
+    /// default. When off, sections open/close independently (the
+    /// [`Config::sections_open`] map). Forward-compatible: an older config without
+    /// it loads as solo-on.
+    #[serde(default = "default_solo_sections")]
+    pub(crate) solo_sections: bool,
+    /// In solo mode, the stable key of the single currently-open section, or
+    /// `None` when the user has collapsed them all. Keyed by the same stable
+    /// section key as [`Config::sections_open`] (never the display label), so it
+    /// stays an opaque string here. Ignored when solo mode is off. Defaults to the
+    /// section open on first run (see [`default_open_section`]); a config that
+    /// predates the field takes that same default, so a fresh and an older config
+    /// agree on which section greets the user.
+    #[serde(default = "default_open_section")]
+    pub(crate) open_section: Option<String>,
     /// Shown/hidden state of the toggleable subsections (Cropping, Straighten,
     /// Sharpen, HSL mixer, …), keyed by a stable subsection id (not the display
     /// label). This is purely a UI show/hide of the subsection body and is
@@ -114,6 +133,47 @@ pub(crate) struct Config {
     /// set `true` once it is dismissed or the first file opens. Forward-compatible:
     /// an older config without it loads as "not yet seen".
     pub(crate) seen_welcome_hint: bool,
+}
+
+/// The default for [`Config::solo_sections`]: solo (accordion) mode is **on** by
+/// default, so only one controls-panel section is open at a time. A standalone
+/// function so the same default seeds both `Config::default()` and a config that
+/// predates the field (the serde field-level default).
+fn default_solo_sections() -> bool {
+    true
+}
+
+/// The default for [`Config::open_section`]: the stable key of the section that
+/// greets the user on first run under solo mode (the develop sections' default-
+/// open one). A standalone function so a fresh config and a config that predates
+/// the field agree. Once the user collapses everything this becomes `None`
+/// (all-collapsed), which is preserved — only a never-set field takes this seed.
+fn default_open_section() -> Option<String> {
+    Some("light".to_owned())
+}
+
+impl Default for Config {
+    /// The default config. Every field is its type's default except
+    /// `solo_sections`, which defaults to **on** (see [`default_solo_sections`]),
+    /// matching the serde missing-field default so a fresh config and an older
+    /// config that predates the field agree.
+    fn default() -> Self {
+        Self {
+            window_size: None,
+            recent_files: Vec::new(),
+            side_panel_width: None,
+            last_export_dir: None,
+            last_open_dir: None,
+            gpu: false,
+            theme: Theme::default(),
+            sections_open: BTreeMap::new(),
+            solo_sections: default_solo_sections(),
+            open_section: default_open_section(),
+            subsections_shown: BTreeMap::new(),
+            presets: Vec::new(),
+            seen_welcome_hint: false,
+        }
+    }
 }
 
 impl Config {
@@ -233,9 +293,11 @@ mod tests {
             gpu: true,
             theme: Theme::Light,
             sections_open: BTreeMap::from([
-                ("basic".to_owned(), true),
+                ("light".to_owned(), true),
                 ("color".to_owned(), false),
             ]),
+            solo_sections: false,
+            open_section: Some("detail".to_owned()),
             subsections_shown: BTreeMap::from([
                 ("hsl_mixer".to_owned(), false),
                 ("sharpen".to_owned(), true),
@@ -331,6 +393,38 @@ mod tests {
         let old = "(window_size: Some((800.0, 600.0)))";
         let loaded = Config::from_ron(old).expect("old config should load");
         assert!(loaded.sections_open.is_empty());
+    }
+
+    #[test]
+    fn solo_pref_and_open_section_round_trip() {
+        // The solo (accordion) preference and the tracked single open section
+        // persist through a serialize/reload, keyed by a stable section key. An
+        // explicit all-collapsed (`None`) round-trips too, distinct from the seed.
+        for open in [Some("geometry".to_owned()), None] {
+            let cfg = Config {
+                solo_sections: false,
+                open_section: open.clone(),
+                ..Config::default()
+            };
+            let text = cfg.to_ron().expect("serialize");
+            let back = Config::from_ron(&text).expect("parse");
+            assert!(!back.solo_sections, "solo preference round-trips");
+            assert_eq!(back.open_section, open, "open section round-trips");
+        }
+
+        // A config that predates these fields loads solo-on and is seeded to the
+        // first-run section, so a fresh and an older config greet the user the same.
+        let old = "(window_size: Some((800.0, 600.0)))";
+        let loaded = Config::from_ron(old).expect("old config should load");
+        assert!(loaded.solo_sections, "solo defaults on for an older config");
+        assert_eq!(
+            loaded.open_section.as_deref(),
+            Some("light"),
+            "older config takes the first-run open-section seed"
+        );
+        // And a fresh default agrees with the missing-field default.
+        assert!(Config::default().solo_sections, "fresh default is solo-on");
+        assert_eq!(Config::default().open_section.as_deref(), Some("light"));
     }
 
     #[test]

@@ -7,6 +7,12 @@
 //! reset actions and the modified predicates are unit-testable without a window.
 //! The display-driven painting (the collapsing header, the dot) lives in the
 //! panel; this module is the truth it renders from.
+//!
+//! There are five top-level sections, each owning the union of its members'
+//! fields: Light (exposure, tone, curves), Color (white balance, saturation, HSL
+//! and channel mixers), Detail (sharpen, clarity, dehaze, noise reduction),
+//! Geometry (crop, straighten, keystone, lens, vignette), and Masks (the local
+//! adjustments).
 
 use latent_edit::Settings;
 
@@ -15,27 +21,21 @@ use latent_edit::Settings;
 /// orphans its saved open/closed state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SectionId {
-    Basic,
-    Tone,
+    Light,
     Color,
-    Curves,
     Detail,
-    Effects,
     Geometry,
     Masks,
 }
 
 impl SectionId {
-    /// Every section, in panel order. Used by the consistency tests; the panel
-    /// renders each section explicitly (so each owns its own `Settings` borrow).
-    #[cfg(test)]
-    pub(crate) const ALL: [SectionId; 8] = [
-        SectionId::Basic,
-        SectionId::Tone,
+    /// Every section, in panel order. Backs [`SectionId::key_from_str`] and the
+    /// consistency tests; the panel still renders each section explicitly (so each
+    /// owns its own `Settings` borrow).
+    pub(crate) const ALL: [SectionId; 5] = [
+        SectionId::Light,
         SectionId::Color,
-        SectionId::Curves,
         SectionId::Detail,
-        SectionId::Effects,
         SectionId::Geometry,
         SectionId::Masks,
     ];
@@ -44,27 +44,32 @@ impl SectionId {
     /// even if the display label does. This is what round-trips in the config.
     pub(crate) fn key(self) -> &'static str {
         match self {
-            SectionId::Basic => "basic",
-            SectionId::Tone => "tone",
+            SectionId::Light => "light",
             SectionId::Color => "color",
-            SectionId::Curves => "curves",
             SectionId::Detail => "detail",
-            SectionId::Effects => "effects",
             SectionId::Geometry => "geometry",
             SectionId::Masks => "masks",
         }
+    }
+
+    /// Resolve a persisted (opaque) section key string back to the matching
+    /// section's `'static` key, or `None` if it names no current section (e.g. an
+    /// old config that stored one of the pre-merge keys). Lets the panel drive the
+    /// solo open-state from a `'static` key without borrowing the config string.
+    pub(crate) fn key_from_str(s: &str) -> Option<&'static str> {
+        SectionId::ALL
+            .into_iter()
+            .map(SectionId::key)
+            .find(|&key| key == s)
     }
 
     /// The human label shown on the section header. Safe to change without
     /// affecting saved state (which is keyed by [`SectionId::key`]).
     pub(crate) fn label(self) -> &'static str {
         match self {
-            SectionId::Basic => "Basic",
-            SectionId::Tone => "Tone",
+            SectionId::Light => "Light",
             SectionId::Color => "Color",
-            SectionId::Curves => "Curves",
             SectionId::Detail => "Detail",
-            SectionId::Effects => "Effects",
             SectionId::Geometry => "Geometry",
             SectionId::Masks => "Masks",
         }
@@ -73,20 +78,19 @@ impl SectionId {
     /// A one-line "what this group does" tooltip for the section header.
     pub(crate) fn help(self) -> &'static str {
         match self {
-            SectionId::Basic => "Exposure and white balance",
-            SectionId::Tone => "Contrast, highlights, shadows, and blacks",
-            SectionId::Color => "Saturation and color grading",
-            SectionId::Curves => "Master and per-channel tone curves",
+            SectionId::Light => "Exposure, contrast, highlights, shadows, blacks, and tone curves",
+            SectionId::Color => "White balance, saturation, and color grading",
             SectionId::Detail => "Sharpening, clarity, dehaze, and noise reduction",
-            SectionId::Effects => "Vignette and creative effects",
-            SectionId::Geometry => "Crop, straighten, and perspective",
+            SectionId::Geometry => "Crop, straighten, perspective, lens correction, and vignette",
             SectionId::Masks => "Local, masked adjustments",
         }
     }
 
     /// Whether the section starts open the first time, before any saved state.
+    /// Only Light opens by default — with solo (accordion) mode on by default,
+    /// exactly one section is open at a time.
     pub(crate) fn default_open(self) -> bool {
-        matches!(self, SectionId::Basic | SectionId::Tone)
+        matches!(self, SectionId::Light)
     }
 
     /// Reset exactly this section's `Settings` fields to their default (neutral)
@@ -96,18 +100,16 @@ impl SectionId {
     /// records nothing.
     pub(crate) fn reset(self, s: &mut Settings) {
         match self {
-            SectionId::Basic => {
+            SectionId::Light => {
                 s.global.exposure = None;
-                s.global.white_balance = None;
-            }
-            SectionId::Tone => {
                 s.global.tone = None;
+                s.global.curves = None;
             }
             SectionId::Color => {
+                s.global.white_balance = None;
                 s.global.saturation = None;
-            }
-            SectionId::Curves => {
-                s.global.curves = None;
+                s.global.hsl = None;
+                s.global.channel_mixer = None;
             }
             SectionId::Detail => {
                 s.global.sharpen = None;
@@ -115,13 +117,12 @@ impl SectionId {
                 s.global.dehaze = None;
                 s.global.noise_reduction = None;
             }
-            SectionId::Effects => {
-                s.geometry.vignette = None;
-            }
             SectionId::Geometry => {
                 s.geometry.straighten_degrees = 0.0;
                 s.geometry.perspective = None;
                 s.geometry.crop = None;
+                s.geometry.lens = None;
+                s.geometry.vignette = None;
             }
             SectionId::Masks => {
                 s.locals.clear();
@@ -136,21 +137,25 @@ impl SectionId {
     pub(crate) fn is_modified(self, s: &Settings) -> bool {
         let g = &s.global;
         match self {
-            SectionId::Basic => g.exposure.is_some() || g.white_balance.is_some(),
-            SectionId::Tone => g.tone.is_some(),
-            SectionId::Color => g.saturation.is_some(),
-            SectionId::Curves => g.curves.is_some(),
+            SectionId::Light => g.exposure.is_some() || g.tone.is_some() || g.curves.is_some(),
+            SectionId::Color => {
+                g.white_balance.is_some()
+                    || g.saturation.is_some()
+                    || g.hsl.is_some()
+                    || g.channel_mixer.is_some()
+            }
             SectionId::Detail => {
                 g.sharpen.is_some()
                     || g.clarity.is_some()
                     || g.dehaze.is_some()
                     || g.noise_reduction.is_some()
             }
-            SectionId::Effects => s.geometry.vignette.is_some(),
             SectionId::Geometry => {
                 s.geometry.straighten_degrees != 0.0
                     || s.geometry.perspective.is_some()
                     || s.geometry.crop.is_some()
+                    || s.geometry.lens.is_some()
+                    || s.geometry.vignette.is_some()
             }
             SectionId::Masks => !s.locals.is_empty(),
         }
@@ -162,7 +167,7 @@ mod tests {
     use super::*;
     use latent_edit::{Crop, SelectiveTone};
 
-    /// A settings value with one field set in the Basic section and one in the
+    /// A settings value with one field set in the Light section and one in the
     /// Geometry section, for the cross-section isolation checks.
     fn populated() -> Settings {
         Settings {
@@ -194,31 +199,29 @@ mod tests {
         // fields are default, (b) the other section is untouched, (c) one undo
         // restores all of them at once — proving the whole reset was a single step,
         // not N.
-        use latent_edit::{History, WhiteBalance};
+        use latent_edit::History;
         let mut s = populated();
-        // Set a second Basic field so the reset clears more than one.
-        s.global.white_balance = Some(WhiteBalance {
-            temp: 0.3,
-            tint: -0.2,
-        });
+        // Set a second Light field so the reset clears more than one.
+        s.global.curves = Some(latent_edit::Curves::default());
         let mut h = History::new(s);
 
         h.begin();
-        SectionId::Basic.reset(h.current_mut());
+        SectionId::Light.reset(h.current_mut());
         h.commit();
 
-        // (a) the Basic fields are now default.
+        // (a) the Light fields are now default.
         assert_eq!(h.current().global.exposure, None);
-        assert_eq!(h.current().global.white_balance, None);
+        assert_eq!(h.current().global.tone, None);
+        assert_eq!(h.current().global.curves, None);
         // (b) other sections are untouched.
-        assert!(h.current().global.tone.is_some(), "Tone untouched");
         assert!(h.current().geometry.crop.is_some(), "Geometry untouched");
 
         // (c) a single undo restores every reset field at once.
         assert!(h.can_undo());
         assert!(h.undo());
         assert_eq!(h.current().global.exposure, Some(1.5));
-        assert!(h.current().global.white_balance.is_some());
+        assert!(h.current().global.tone.is_some());
+        assert!(h.current().global.curves.is_some());
         // And there is nothing further to undo — it was one step.
         assert!(!h.can_undo());
     }
@@ -249,22 +252,126 @@ mod tests {
     }
 
     #[test]
+    fn section_keys_are_the_new_five() {
+        // The five stable keys are exactly the merged set, in panel order.
+        let keys: Vec<&str> = SectionId::ALL.iter().map(|id| id.key()).collect();
+        assert_eq!(keys, ["light", "color", "detail", "geometry", "masks"]);
+    }
+
+    #[test]
+    fn key_from_str_resolves_current_keys_only() {
+        // A current key resolves to the matching `'static` key; a pre-merge or
+        // unknown key resolves to `None` (so the panel falls back to all-collapsed
+        // rather than opening a section that no longer exists).
+        for id in SectionId::ALL {
+            assert_eq!(SectionId::key_from_str(id.key()), Some(id.key()));
+        }
+        // Pre-merge keys that no longer name a section.
+        for old in ["basic", "tone", "curves", "effects", "nope"] {
+            assert_eq!(SectionId::key_from_str(old), None, "{old} is not a section");
+        }
+    }
+
+    #[test]
     fn section_reset_clears_only_its_fields() {
-        // Resetting Basic clears its fields but leaves the Geometry crop and the
-        // Tone block (other sections) untouched.
+        // Resetting Light clears its fields but leaves the Geometry crop (another
+        // section) untouched.
         let mut s = populated();
-        SectionId::Basic.reset(&mut s);
-        assert_eq!(s.global.exposure, None, "Basic field cleared");
-        assert!(s.global.tone.is_some(), "Tone untouched");
+        SectionId::Light.reset(&mut s);
+        assert_eq!(s.global.exposure, None, "Light exposure cleared");
+        assert_eq!(s.global.tone, None, "Light tone cleared");
         assert!(s.geometry.crop.is_some(), "Geometry untouched");
 
-        // Resetting Geometry clears its crop/straighten/perspective but keeps the
-        // auto-constrain preference on — it is a setting, not a per-image edit.
+        // Resetting Geometry clears its crop/straighten/perspective/lens/vignette
+        // but keeps the auto-constrain preference on — it is a setting, not a
+        // per-image edit.
         s.geometry.straighten_degrees = 5.0;
         SectionId::Geometry.reset(&mut s);
         assert_eq!(s.geometry.crop, None, "crop cleared");
         assert_eq!(s.geometry.straighten_degrees, 0.0, "straighten cleared");
         assert!(s.geometry.auto_constrain, "auto-constrain preference kept");
+    }
+
+    #[test]
+    fn each_owned_field_drives_exactly_its_section() {
+        // Field-ownership check: setting exactly one field flips exactly one
+        // section's modified predicate and is cleared by exactly that section's
+        // reset — proving each new section owns the union of its members' fields
+        // with no overlap.
+        use latent_edit::{
+            ChannelMixer, Clarity, Curves, Hsl, NoiseReduction, Perspective, SelectiveTone,
+            Sharpen, WhiteBalance,
+        };
+
+        // One case: a section paired with a closure that sets exactly one field
+        // that section owns.
+        type Case = (SectionId, fn(&mut Settings));
+        // (section, mutate-one-field, the field is owned by `section` alone)
+        let cases: Vec<Case> = vec![
+            (SectionId::Light, |s| s.global.exposure = Some(1.0)),
+            (SectionId::Light, |s| {
+                s.global.tone = Some(SelectiveTone::default())
+            }),
+            (SectionId::Light, |s| {
+                s.global.curves = Some(Curves::default())
+            }),
+            (SectionId::Color, |s| {
+                s.global.white_balance = Some(WhiteBalance {
+                    temp: 0.2,
+                    tint: 0.0,
+                })
+            }),
+            (SectionId::Color, |s| s.global.saturation = Some(1.2)),
+            (SectionId::Color, |s| s.global.hsl = Some(Hsl::default())),
+            (SectionId::Color, |s| {
+                s.global.channel_mixer = Some(ChannelMixer::default())
+            }),
+            (SectionId::Detail, |s| {
+                s.global.sharpen = Some(Sharpen::default())
+            }),
+            (SectionId::Detail, |s| {
+                s.global.clarity = Some(Clarity::default())
+            }),
+            (SectionId::Detail, |s| s.global.dehaze = Some(0.3)),
+            (SectionId::Detail, |s| {
+                s.global.noise_reduction = Some(NoiseReduction::default())
+            }),
+            (SectionId::Geometry, |s| s.geometry.straighten_degrees = 3.0),
+            (SectionId::Geometry, |s| {
+                s.geometry.perspective = Some(Perspective {
+                    vertical: 0.1,
+                    horizontal: 0.0,
+                })
+            }),
+            (SectionId::Geometry, |s| {
+                s.geometry.crop = Some(Crop {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                })
+            }),
+            (SectionId::Geometry, |s| s.geometry.vignette = Some(-0.3)),
+        ];
+
+        for (owner, mutate) in cases {
+            let mut s = Settings::default();
+            mutate(&mut s);
+            // Exactly the owner section reads modified; no other does.
+            for id in SectionId::ALL {
+                assert_eq!(
+                    id.is_modified(&s),
+                    id == owner,
+                    "{:?} modified should be {} after mutating a {:?} field",
+                    id,
+                    id == owner,
+                    owner
+                );
+            }
+            // The owner's reset returns everything to default.
+            owner.reset(&mut s);
+            assert_eq!(s, Settings::default(), "{:?} reset restores default", owner);
+        }
     }
 
     #[test]
@@ -286,9 +393,9 @@ mod tests {
             assert!(!id.is_modified(&default), "{:?} clean on default", id);
         }
         let s = populated();
-        assert!(SectionId::Basic.is_modified(&s), "Basic has exposure");
-        assert!(SectionId::Tone.is_modified(&s), "Tone has contrast");
+        assert!(SectionId::Light.is_modified(&s), "Light has exposure/tone");
         assert!(SectionId::Geometry.is_modified(&s), "Geometry has crop");
+        assert!(!SectionId::Color.is_modified(&s), "Color untouched");
         assert!(!SectionId::Detail.is_modified(&s), "Detail untouched");
         assert!(!SectionId::Masks.is_modified(&s), "Masks untouched");
     }

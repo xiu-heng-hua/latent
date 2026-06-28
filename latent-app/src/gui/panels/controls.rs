@@ -1,11 +1,18 @@
-//! The right-hand controls side panel: the develop sections (Basic / Tone /
-//! Color / Curves / Detail / Effects / Geometry / Masks) plus the export row,
-//! laid out as collapsible [`egui::collapsing_header::CollapsingState`] groups
-//! inside a [`egui::ScrollArea`]. Each section delegates to a builder in
+//! The right-hand controls side panel: the develop sections (Light / Color /
+//! Detail / Geometry / Masks) plus the export row, laid out as collapsible
+//! [`egui::collapsing_header::CollapsingState`] groups inside a
+//! [`egui::ScrollArea`]. Each section delegates to a builder in
 //! [`crate::gui::widgets`]; the panel wires them to the active variant, folds
 //! their `dirty` flags, and decorates each header with a per-section reset
 //! affordance and a modified indicator. Section open/closed state and the panel
 //! width persist through the app config. Shown only with an open session.
+//!
+//! A **solo (accordion) toggle** at the top of the panel controls whether opening
+//! one section collapses the others. When solo is on (the default), the single
+//! open section is tracked in [`crate::gui::config::Config::open_section`] and the
+//! collapsing headers are *driven* from it (so one click opens the chosen section
+//! and closes the rest in the same frame). When solo is off, sections open and
+//! close independently, persisted in `sections_open` as before.
 
 use eframe::egui;
 use egui::collapsing_header::CollapsingState;
@@ -29,8 +36,18 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
     // so the session borrow is released first).
     let mut do_export = false;
     // Section open-state toggles to persist after the panel closure (so the config
-    // write does not borrow `app` while the panel closure still does).
+    // write does not borrow `app` while the panel closure still does). Used when
+    // solo (accordion) mode is off, where sections open/close independently.
     let mut toggles: Vec<(&'static str, bool)> = Vec::new();
+    // In solo (accordion) mode, the single open-section change the user made this
+    // frame, applied after the panel closure: `Some(Some(key))` opened that
+    // section (closing the rest), `Some(None)` collapsed the open one, `None`
+    // means no change. Mirrors `toggles` so neither write borrows `app` while the
+    // closure still holds it.
+    let mut solo_change: Option<Option<&'static str>> = None;
+    // Whether the user flipped the Solo toggle this frame, persisted after the
+    // closure alongside the open-state writes.
+    let mut solo_pref_change: Option<bool> = None;
     // Subsection show/hide toggles to persist after the panel closure, collected
     // the same way as the section open-state toggles so neither write borrows
     // `app` while the closure still holds it.
@@ -70,14 +87,50 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     });
                 ui.separator();
 
+                // The Solo (accordion) toggle sits at the top of the develop
+                // sections. It reads `app.config` directly (no session borrow yet);
+                // a flip is recorded for the caller to persist after the closure.
+                let solo = app.config.solo_sections;
+                {
+                    let mut on = solo;
+                    if ui
+                        .checkbox(&mut on, "Solo")
+                        .on_hover_text(
+                            "Open one section at a time — opening a section collapses the others",
+                        )
+                        .changed()
+                    {
+                        solo_pref_change = Some(on);
+                    }
+                }
+                ui.separator();
+
                 // Capture the export-in-flight / busy facts before the session is
                 // borrowed, so the Export button can read as in-progress and stay
                 // disabled while a render/export runs.
                 let exporting = app.exporting;
                 let busy = app.render.is_busy();
                 let sections_open = &app.config.sections_open;
+                // The single tracked open section in solo mode, resolved from the
+                // persisted (opaque) string to a known static section key, or `None`
+                // for all-collapsed / an unrecognized key. Read before the session
+                // borrow; drives each section's open state when solo is on.
+                let open_section: Option<&'static str> = app
+                    .config
+                    .open_section
+                    .as_deref()
+                    .and_then(SectionId::key_from_str);
                 let subsections_shown = &app.config.subsections_shown;
                 let session = app.session.as_mut().expect("session present");
+                // The per-frame solo context threaded into each section: whether
+                // accordion mode is on, the single open key (updated in place when a
+                // header is clicked so later sections this frame already see the
+                // move), and the change to write back after the closure.
+                let mut solo_ctx = SoloCtx {
+                    enabled: solo,
+                    open: open_section,
+                    change: &mut solo_change,
+                };
                 // The per-frame visibility context threaded into each section body:
                 // the persisted show/hide map (read) and the toggles to write back.
                 let mut vis = VisCtx {
@@ -90,15 +143,19 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                 scopes::scope_block(ui, &mut session.scopes);
                 ui.separator();
 
+                // Light — exposure, then the tone block (contrast/highlights/
+                // shadows/blacks), then the master/per-channel tone curves.
                 dirty |= section(
                     ui,
                     ctx,
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut solo_ctx,
                     &mut vis,
-                    SectionId::Basic,
-                    |ui, s, _vis| {
+                    SectionId::Light,
+                    |ui, s, vis| {
+                        let access = widgets::GlobalAccess;
                         let mut d = false;
                         d |= widgets::opt_point_slider(
                             ui,
@@ -112,43 +169,47 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                             |st| st.global.exposure,
                             |st, v| st.global.exposure = v,
                         );
-                        let mut action = widgets::WbAction::None;
-                        d |= widgets::white_balance_block(
+                        d |= widgets::tone_block(ui, &mut s.variants[s.active], access);
+                        let channel = &mut s.curve_channel;
+                        let h = &mut s.variants[s.active];
+                        let curves_on = h.current().global.curves.is_some();
+                        d |= toggle_subsection(
                             ui,
-                            &mut s.variants[s.active],
-                            widgets::GlobalAccess,
-                            &mut action,
+                            vis,
+                            "curves",
+                            h,
+                            "Curves",
+                            curves_on,
+                            |h, on| widgets::set_curves_enabled(h, access, on),
+                            |ui, h| widgets::curves_body(ui, h, channel, access),
                         );
-                        s.wb_action = action;
                         d
                     },
                 );
 
+                // Color — white balance, saturation, then the HSL and channel
+                // mixers.
                 dirty |= section(
                     ui,
                     ctx,
                     session,
                     sections_open,
                     &mut toggles,
-                    &mut vis,
-                    SectionId::Tone,
-                    |ui, s, _vis| {
-                        widgets::tone_block(ui, &mut s.variants[s.active], widgets::GlobalAccess)
-                    },
-                );
-
-                dirty |= section(
-                    ui,
-                    ctx,
-                    session,
-                    sections_open,
-                    &mut toggles,
+                    &mut solo_ctx,
                     &mut vis,
                     SectionId::Color,
                     |ui, s, vis| {
                         let access = widgets::GlobalAccess;
-                        let h = &mut s.variants[s.active];
                         let mut d = false;
+                        let mut action = widgets::WbAction::None;
+                        d |= widgets::white_balance_block(
+                            ui,
+                            &mut s.variants[s.active],
+                            access,
+                            &mut action,
+                        );
+                        s.wb_action = action;
+                        let h = &mut s.variants[s.active];
                         // Saturation is an always-on continuous basic — a plain slider.
                         d |= widgets::opt_point_slider(
                             ui,
@@ -196,32 +257,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
-                    &mut vis,
-                    SectionId::Curves,
-                    |ui, s, vis| {
-                        let access = widgets::GlobalAccess;
-                        let channel = &mut s.curve_channel;
-                        let h = &mut s.variants[s.active];
-                        let curves_on = h.current().global.curves.is_some();
-                        toggle_subsection(
-                            ui,
-                            vis,
-                            "curves",
-                            h,
-                            "Curves",
-                            curves_on,
-                            |h, on| widgets::set_curves_enabled(h, access, on),
-                            |ui, h| widgets::curves_body(ui, h, channel, access),
-                        )
-                    },
-                );
-
-                dirty |= section(
-                    ui,
-                    ctx,
-                    session,
-                    sections_open,
-                    &mut toggles,
+                    &mut solo_ctx,
                     &mut vis,
                     SectionId::Detail,
                     |ui, s, vis| {
@@ -298,30 +334,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
-                    &mut vis,
-                    SectionId::Effects,
-                    |ui, s, vis| {
-                        let h = &mut s.variants[s.active];
-                        let vignette_on = h.current().geometry.vignette.is_some();
-                        toggle_subsection(
-                            ui,
-                            vis,
-                            "vignette",
-                            h,
-                            "Vignette",
-                            vignette_on,
-                            widgets::set_vignette_enabled,
-                            widgets::vignette_body,
-                        )
-                    },
-                );
-
-                dirty |= section(
-                    ui,
-                    ctx,
-                    session,
-                    sections_open,
-                    &mut toggles,
+                    &mut solo_ctx,
                     &mut vis,
                     SectionId::Geometry,
                     geometry_body,
@@ -333,6 +346,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut solo_ctx,
                     &mut vis,
                     SectionId::Masks,
                     |ui, s, _vis| {
@@ -360,11 +374,32 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
             });
         });
 
-    // Persist any section open/closed toggles the user made this frame.
+    // Persist any section open/closed toggles the user made this frame (solo off:
+    // sections open/close independently in `sections_open`).
     for (key, open) in toggles {
         let changed = app.config.sections_open.get(key) != Some(&open);
         if changed {
             app.config.sections_open.insert(key.to_owned(), open);
+            app.save_config();
+        }
+    }
+
+    // Apply the Solo (accordion) preference flip, if any. Flipping it never
+    // touches which section is open — the tracked open key is preserved, so
+    // turning solo on simply re-collapses to that single section next frame.
+    if let Some(on) = solo_pref_change
+        && app.config.solo_sections != on
+    {
+        app.config.solo_sections = on;
+        app.save_config();
+    }
+
+    // Apply the single open-section change made under solo mode (one click opens
+    // the chosen section and closes the rest, tracked by the stable section key).
+    if let Some(open) = solo_change {
+        let next = open.map(str::to_owned);
+        if app.config.open_section != next {
+            app.config.open_section = next;
             app.save_config();
         }
     }
@@ -399,11 +434,57 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
     dirty
 }
 
+/// The per-frame solo (accordion) context threaded into each section. When solo
+/// mode is on, each section's open state is *driven* from the single tracked open
+/// key (so a click opens the chosen section and closes the rest in the same
+/// frame), and a header toggle records a single change for the caller to persist —
+/// mirroring how the visibility context threads its write-back list. When solo is
+/// off this is inert and sections fall back to the independent `sections_open` map.
+struct SoloCtx<'a> {
+    /// Whether accordion mode is on this frame.
+    enabled: bool,
+    /// The stable key of the single open section, or `None` for all-collapsed.
+    /// Updated in place the moment a header is clicked so sections rendered later
+    /// in the same frame already reflect the move (no transient double-open).
+    open: Option<&'static str>,
+    /// The open-section change made this frame, for the caller to persist:
+    /// `Some(Some(key))` opened that section (closing the rest), `Some(None)`
+    /// collapsed the open one, `None` means no change.
+    change: &'a mut Option<Option<&'static str>>,
+}
+
+impl SoloCtx<'_> {
+    /// Whether section `id` should be open this frame under solo mode — exactly
+    /// when it is the single tracked open key.
+    fn is_open(&self, id: SectionId) -> bool {
+        self.open == Some(id.key())
+    }
+
+    /// Record the user opening section `id` (which collapses every other section),
+    /// updating the in-frame tracked key so later sections close immediately.
+    fn record_open(&mut self, id: SectionId) {
+        self.open = Some(id.key());
+        *self.change = Some(Some(id.key()));
+    }
+
+    /// Record the user collapsing the currently-open section (none left open).
+    fn record_collapse(&mut self) {
+        self.open = None;
+        *self.change = Some(None);
+    }
+}
+
 /// Render one collapsible section: a custom header carrying the section label, a
-/// modified indicator, and a per-section reset button, then the section body. The
-/// open/closed state is seeded from the persisted config (falling back to the
-/// section's own default-open) and any toggle this frame is recorded in `toggles`
-/// for the caller to persist. Returns whether the body marked the preview dirty.
+/// modified indicator, and a per-section reset button, then the section body.
+///
+/// Open/closed state comes from one of two sources. In solo (accordion) mode the
+/// `CollapsingState` is *driven* from the single tracked open key, so a header
+/// click that opens this section is recorded as "open me, close the rest" (and a
+/// click that closes it as "none open") for the caller to apply in one frame —
+/// the state is never allowed to drift from the tracked value. With solo off the
+/// state is seeded from the persisted `sections_open` map (falling back to the
+/// section's own default-open) and a toggle is recorded in `toggles`. Returns
+/// whether the body marked the preview dirty.
 #[allow(clippy::too_many_arguments)]
 fn section(
     ui: &mut egui::Ui,
@@ -411,18 +492,33 @@ fn section(
     session: &mut Session,
     sections_open: &std::collections::BTreeMap<String, bool>,
     toggles: &mut Vec<(&'static str, bool)>,
+    solo: &mut SoloCtx,
     vis: &mut VisCtx,
     id: SectionId,
     body: impl FnOnce(&mut egui::Ui, &mut Session, &mut VisCtx) -> bool,
 ) -> bool {
-    let default_open = sections_open
-        .get(id.key())
-        .copied()
-        .unwrap_or_else(|| id.default_open());
     let modified = id.is_modified(session.variants[session.active].current());
 
     let state_id = ui.make_persistent_id(("controls_section", id.key()));
-    let state = CollapsingState::load_with_default_open(ctx, state_id, default_open);
+    // The open state this section should paint with. In solo mode it is the
+    // tracked open key (so the header can't drift from it); with solo off it is
+    // the persisted independent state, falling back to the section's default-open.
+    let want_open = if solo.enabled {
+        solo.is_open(id)
+    } else {
+        sections_open
+            .get(id.key())
+            .copied()
+            .unwrap_or_else(|| id.default_open())
+    };
+
+    let mut state = CollapsingState::load_with_default_open(ctx, state_id, want_open);
+    // In solo mode, force the persisted egui state to the tracked value every
+    // frame so opening another section collapses this one without fighting the
+    // user — the tracked key is the single source of truth.
+    if solo.enabled {
+        state.set_open(want_open);
+    }
     let was_open = state.is_open();
 
     let mut dirty = false;
@@ -447,13 +543,24 @@ fn section(
             dirty |= body(ui, session, vis);
         });
 
-    // Record an open/closed change for the caller to persist (keyed by the stable
-    // section key, never the display label).
+    // Whether the header toggle flipped this section's open state this frame.
     let now_open = CollapsingState::load(ctx, state_id)
         .map(|s| s.is_open())
         .unwrap_or(was_open);
     if now_open != was_open {
-        toggles.push((id.key(), now_open));
+        if solo.enabled {
+            // Record the accordion move: opening this section closes the others;
+            // closing it leaves none open. The caller applies it after the closure.
+            if now_open {
+                solo.record_open(id);
+            } else {
+                solo.record_collapse();
+            }
+        } else {
+            // Independent mode: persist this section's own open/closed state,
+            // keyed by the stable section key (never the display label).
+            toggles.push((id.key(), now_open));
+        }
     }
 
     dirty
@@ -834,10 +941,11 @@ fn lens_display_name(meta: &latent_raw::Metadata) -> String {
 
 /// The Geometry section body, grouped into per-purpose subsections — Cropping,
 /// Straighten, Keystone, and Lens — each carrying the on-canvas tool that edits it
-/// at its header. Aspect ratio lives in Cropping (it constrains the crop). The
-/// shared auto-constrain toggle, which trims the wedges either a straighten or a
-/// keystone leaves, sits at the foot of the section since it spans both. Returns
-/// whether any control marked the preview dirty.
+/// at its header, followed by the Vignette subsection. Aspect ratio lives in
+/// Cropping (it constrains the crop). The shared auto-constrain toggle, which trims
+/// the wedges either a straighten or a keystone leaves, sits between the warp
+/// transforms and the vignette since it spans both. Returns whether any control
+/// marked the preview dirty.
 fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> bool {
     use crate::gui::tools::CanvasTool;
     let mut d = false;
@@ -897,8 +1005,26 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
     d |= lens_block(session, ui, vis);
 
     // The auto-constrain toggle spans straighten and keystone, so it stays a
-    // section-level control rather than living in either subsection.
+    // section-level control rather than living in either subsection. It is placed
+    // before the vignette subsection so it stays adjacent to the warp transforms
+    // (straighten/keystone/lens) it acts on.
     d |= auto_constrain_row(session, ui);
+
+    // Vignette — a creative corner darken/lighten applied after crop (OUTPUT
+    // space). It lives with the geometry transforms since it operates on the
+    // cropped frame; a header checkbox enable with the eye visibility button.
+    let h = &mut session.variants[session.active];
+    let vignette_on = h.current().geometry.vignette.is_some();
+    d |= toggle_subsection(
+        ui,
+        vis,
+        "vignette",
+        h,
+        "Vignette",
+        vignette_on,
+        widgets::set_vignette_enabled,
+        widgets::vignette_body,
+    );
     d
 }
 
