@@ -8,11 +8,19 @@ use egui::{Color32, Pos2, Rect, Stroke};
 use latent_edit::{Crop, History, Settings};
 
 use super::super::canvas::ViewTransform;
-use super::{HANDLE_HIT_RADIUS, draw_handle, nearest_handle};
+use super::draw_handle;
 
 /// The smallest a crop edge may shrink to (normalized), so the rectangle stays
 /// grabbable and never collapses to a zero-area sliver.
 const MIN_SIZE: f32 = 0.02;
+
+/// How close (screen px) a pointer must be to a crop *corner* to grab it. Generous
+/// so a corner is easy to catch even when aimed at roughly.
+const CORNER_HIT_RADIUS: f32 = 14.0;
+
+/// How close (screen px) a pointer must be to a crop *edge* line — anywhere along
+/// its span, not just a midpoint handle — to grab that edge.
+const EDGE_HIT_RADIUS: f32 = 8.0;
 
 /// An aspect-ratio constraint for the crop. The numeric ratios are *visual*
 /// width:height; `Free` is unconstrained and `Original` matches the displayed
@@ -70,25 +78,6 @@ pub(crate) enum CropGrab {
     Interior,
 }
 
-impl CropGrab {
-    /// The eight handle grabs in the order their normalized anchors are listed by
-    /// [`handle_anchors`], so a hit-test index maps straight to a grab.
-    const HANDLES: [CropGrab; 8] = [
-        CropGrab::TopLeft,
-        CropGrab::Top,
-        CropGrab::TopRight,
-        CropGrab::Right,
-        CropGrab::BottomRight,
-        CropGrab::Bottom,
-        CropGrab::BottomLeft,
-        CropGrab::Left,
-    ];
-
-    fn from_index(i: usize) -> CropGrab {
-        Self::HANDLES[i.min(7)]
-    }
-}
-
 /// The current crop rectangle as a normalized `Crop` — the stored crop, or the
 /// full frame when there is none.
 pub(crate) fn current_crop(settings: &Settings) -> Crop {
@@ -100,8 +89,8 @@ pub(crate) fn current_crop(settings: &Settings) -> Crop {
     })
 }
 
-/// The eight handle anchors (normalized) for a crop rectangle, in
-/// [`CropGrab::HANDLES`] order: TL, T, TR, R, BR, B, BL, L.
+/// The eight handle anchors (normalized) for a crop rectangle, in draw order:
+/// TL, T, TR, R, BR, B, BL, L.
 pub(crate) fn handle_anchors(c: Crop) -> [[f32; 2]; 8] {
     let (x0, y0) = (c.x, c.y);
     let (x1, y1) = (c.x + c.width, c.y + c.height);
@@ -286,14 +275,53 @@ pub(crate) fn refit_to_ratio(c: Crop, ratio: f32, image_aspect: f32) -> Crop {
     })
 }
 
-/// Hit-test the crop handles (and the interior) for a pointer. Returns the grab a
-/// press would start: a handle within tolerance, else `Interior` when the pointer
-/// is inside the rectangle, else `None`.
+/// Hit-test the crop border for a pointer, in screen space. The whole border is
+/// grabbable, not just eight handle dots: a press within [`CORNER_HIT_RADIUS`] of a
+/// corner grabs that corner; otherwise a press within [`EDGE_HIT_RADIUS`] of an
+/// edge line (anywhere along its span) grabs that edge; otherwise a press inside
+/// the rectangle moves it; otherwise nothing. Corners win over edges (they sit at
+/// the ends of two), so a corner is always resizable in both axes.
 pub(crate) fn hit_test(c: Crop, pointer: Pos2, transform: &ViewTransform) -> Option<CropGrab> {
-    let anchors = handle_anchors(c);
-    if let Some(i) = nearest_handle(&anchors, pointer, transform, HANDLE_HIT_RADIUS) {
-        return Some(CropGrab::from_index(i));
+    let rect = crop_screen_rect(transform, c);
+
+    // Corners first — the nearest within the (generous) corner tolerance.
+    let corners = [
+        (CropGrab::TopLeft, rect.left_top()),
+        (CropGrab::TopRight, rect.right_top()),
+        (CropGrab::BottomRight, rect.right_bottom()),
+        (CropGrab::BottomLeft, rect.left_bottom()),
+    ];
+    let mut best: Option<(CropGrab, f32)> = None;
+    for (g, p) in corners {
+        let d = p.distance(pointer);
+        if d <= CORNER_HIT_RADIUS && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((g, d));
+        }
     }
+    if let Some((g, _)) = best {
+        return Some(g);
+    }
+
+    // Edges: near an edge line and within its span (with a little overhang past the
+    // corners so the whole side is catchable).
+    let span_x =
+        pointer.x >= rect.left() - EDGE_HIT_RADIUS && pointer.x <= rect.right() + EDGE_HIT_RADIUS;
+    let span_y =
+        pointer.y >= rect.top() - EDGE_HIT_RADIUS && pointer.y <= rect.bottom() + EDGE_HIT_RADIUS;
+    if span_y && (pointer.x - rect.left()).abs() <= EDGE_HIT_RADIUS {
+        return Some(CropGrab::Left);
+    }
+    if span_y && (pointer.x - rect.right()).abs() <= EDGE_HIT_RADIUS {
+        return Some(CropGrab::Right);
+    }
+    if span_x && (pointer.y - rect.top()).abs() <= EDGE_HIT_RADIUS {
+        return Some(CropGrab::Top);
+    }
+    if span_x && (pointer.y - rect.bottom()).abs() <= EDGE_HIT_RADIUS {
+        return Some(CropGrab::Bottom);
+    }
+
+    // Interior.
     let n = transform.screen_to_image_norm(pointer);
     let inside = n[0] >= c.x && n[0] <= c.x + c.width && n[1] >= c.y && n[1] <= c.y + c.height;
     inside.then_some(CropGrab::Interior)
@@ -527,13 +555,48 @@ mod tests {
         assert!(c.x >= -1e-6 && c.y >= -1e-6 && c.x + c.width <= 1.0 + 1e-6);
     }
 
+    fn test_transform() -> ViewTransform {
+        use super::super::super::canvas::Zoom;
+        // A 1000×800 image fit into a 500×400 panel at the origin: image_rect is
+        // (0,0)–(500,400), so a normalized point maps to screen at scale 500×400.
+        ViewTransform::new(
+            egui::Vec2::new(1000.0, 800.0),
+            Rect::from_min_size(Pos2::ZERO, egui::Vec2::new(500.0, 400.0)),
+            Zoom::Fit,
+            egui::Vec2::ZERO,
+        )
+    }
+
     #[test]
-    fn from_index_maps_handle_order() {
-        // The hit-test index order matches the handle-anchor order: index 0 is the
-        // top-left corner, 4 the bottom-right.
-        assert_eq!(CropGrab::from_index(0), CropGrab::TopLeft);
-        assert_eq!(CropGrab::from_index(4), CropGrab::BottomRight);
-        assert_eq!(CropGrab::from_index(7), CropGrab::Left);
+    fn hit_test_grabs_corners_and_edges_generously() {
+        let t = test_transform();
+        // A centered sub-rect crop with margin around it.
+        let c = Crop {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
+        let rect = crop_screen_rect(&t, c);
+
+        // A press a few px inside a corner still grabs that corner (not the
+        // interior) — the symptom of the old eight-dots-only hit-test was a corner
+        // aim landing on the interior and moving the rectangle.
+        let near_tl = rect.left_top() + egui::Vec2::new(6.0, 6.0);
+        assert_eq!(hit_test(c, near_tl, &t), Some(CropGrab::TopLeft));
+        let near_br = rect.right_bottom() - egui::Vec2::new(5.0, 5.0);
+        assert_eq!(hit_test(c, near_br, &t), Some(CropGrab::BottomRight));
+
+        // A press anywhere along an edge (not just its midpoint) grabs that edge.
+        let on_left_edge = Pos2::new(rect.left(), rect.top() + rect.height() * 0.2);
+        assert_eq!(hit_test(c, on_left_edge, &t), Some(CropGrab::Left));
+        let on_bottom_edge = Pos2::new(rect.left() + rect.width() * 0.8, rect.bottom());
+        assert_eq!(hit_test(c, on_bottom_edge, &t), Some(CropGrab::Bottom));
+
+        // Well inside moves the rectangle; well outside grabs nothing.
+        assert_eq!(hit_test(c, rect.center(), &t), Some(CropGrab::Interior));
+        let outside = rect.left_top() - egui::Vec2::new(40.0, 40.0);
+        assert_eq!(hit_test(c, outside, &t), None);
     }
 
     #[test]
