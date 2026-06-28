@@ -59,6 +59,11 @@ pub(crate) const NEUTRAL_MARKER: Color32 = Color32::from_gray(150);
 /// `canvas_surround_is_neutral_gray` guards exactly that.
 pub(crate) const CANVAS_SURROUND: Color32 = Color32::from_gray(118);
 
+/// Extra inset (screen px) when fitting the image while a geometry tool is active,
+/// so the crop/keystone handles at the image edges sit inside the canvas rather
+/// than being clipped at its border.
+pub(crate) const GEOMETRY_TOOL_MARGIN: f32 = 18.0;
+
 // ---------------------------------------------------------------------------
 // Shape / spacing tokens.
 // ---------------------------------------------------------------------------

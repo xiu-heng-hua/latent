@@ -273,7 +273,12 @@ pub(crate) fn color_image_from_srgb8(
 /// changes only the area *around* the photo — the texture bytes are drawn
 /// unaltered.
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
-    let surround = egui::Frame::central_panel(&ctx.style()).fill(theme::CANVAS_SURROUND);
+    // No inner margin: the surround fills the canvas edge-to-edge, and the content
+    // is clipped to the full panel (not an inset rect that would cut handles drawn
+    // at the image edge in half).
+    let surround = egui::Frame::central_panel(&ctx.style())
+        .fill(theme::CANVAS_SURROUND)
+        .inner_margin(egui::Margin::ZERO);
 
     // The canvas runs only with an open session (the welcome state owns the
     // central panel otherwise).
@@ -316,19 +321,30 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             // texture; the whole image still draws and stays pannable.
             let region = active_region(session);
 
+            // While a geometry tool is active, fit into an inset region so the
+            // crop/keystone handles at the image edges sit inside the canvas rather
+            // than clipped at its border. The surround still fills the whole panel,
+            // and the content is clipped to the whole panel, so the handles in the
+            // margin are visible.
+            let fit_panel = if session.tool.is_geometry() {
+                panel.shrink(theme::GEOMETRY_TOOL_MARGIN)
+            } else {
+                panel
+            };
+
             // Pan and zoom run before the transform is built so this frame draws
             // at the updated view. Both only request a repaint — never a render.
             handle_pan(session, &resp);
-            handle_zoom(session, ui, &resp, tex_size, panel, region);
+            handle_zoom(session, ui, &resp, tex_size, fit_panel, region);
 
             // `new` (whole-image fit) when no tool region is active, else the
             // region-fit variant — the same value, but the common path stays the
             // plain constructor.
             let transform = match region {
-                None => ViewTransform::new(tex_size, panel, session.zoom, session.pan),
+                None => ViewTransform::new(tex_size, fit_panel, session.zoom, session.pan),
                 Some(_) => ViewTransform::new_fit_region(
                     tex_size,
-                    panel,
+                    fit_panel,
                     session.zoom,
                     session.pan,
                     region,
