@@ -206,10 +206,16 @@ fn constrain_ratio(start: Crop, grab: CropGrab, c: Crop, ratio: f32, image_aspec
     let _ = start;
 
     // A top/bottom edge drives the height; a left/right edge drives the width; a
-    // corner drives the width and derives the height. Whichever drives, derive the
-    // other from `norm_ratio`, then if that overruns the frame clamp it and
-    // re-derive the driver so the ratio stays exact.
-    let height_driven = matches!(grab, CropGrab::Top | CropGrab::Bottom);
+    // corner follows the pointer's dominant axis (the dragged free rect's aspect vs
+    // the target), so the corner tracks the cursor in both directions. Driving a
+    // corner from the width alone would leave a vertical drag — whose width barely
+    // changes — looking stuck. Whichever drives, derive the other from `norm_ratio`,
+    // then if that overruns the frame clamp it and re-derive so the ratio stays exact.
+    let height_driven = match grab {
+        CropGrab::Top | CropGrab::Bottom => true,
+        CropGrab::Left | CropGrab::Right => false,
+        _ => c.width / c.height <= norm_ratio,
+    };
     let (mut w, mut h) = if height_driven {
         (c.height * norm_ratio, c.height)
     } else {
@@ -452,6 +458,32 @@ mod tests {
             "normalized w:h must be 0.5 for a 1:1 visual on a 2:1 frame: {c:?}"
         );
         // Anchored at the top-left (the opposite corner) — it stays put.
+        assert!((c.x - 0.0).abs() < 1e-6 && (c.y - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn locked_corner_follows_a_vertical_drag() {
+        // With a 1:1 lock on a square frame, dragging the bottom-right corner mostly
+        // downward (height grows, width barely) must still resize the rectangle to
+        // follow the cursor — driving from width alone would leave it stuck.
+        let start = Crop {
+            x: 0.0,
+            y: 0.0,
+            width: 0.4,
+            height: 0.4,
+        };
+        let c = apply_drag(start, CropGrab::BottomRight, [0.45, 0.8], Some(1.0), 1.0);
+        // The free drag is taller than wide, so the height drives: the square grows
+        // to ~the dragged height, not the near-unchanged width.
+        assert!(
+            (c.width - c.height).abs() < 1e-4,
+            "ratio held (square): {c:?}"
+        );
+        assert!(
+            c.height > 0.7,
+            "the corner followed the vertical drag, not stuck near 0.4: {c:?}"
+        );
+        // Anchored at the top-left corner.
         assert!((c.x - 0.0).abs() < 1e-6 && (c.y - 0.0).abs() < 1e-6);
     }
 
