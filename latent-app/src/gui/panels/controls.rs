@@ -31,6 +31,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
     // Section open-state toggles to persist after the panel closure (so the config
     // write does not borrow `app` while the panel closure still does).
     let mut toggles: Vec<(&'static str, bool)> = Vec::new();
+    // Subsection show/hide toggles to persist after the panel closure, collected
+    // the same way as the section open-state toggles so neither write borrows
+    // `app` while the closure still holds it.
+    let mut vis_toggles: Vec<(&'static str, bool)> = Vec::new();
 
     let frame = egui::Frame::side_top_panel(&ctx.style())
         .inner_margin(egui::Margin::same(theme::PANEL_MARGIN));
@@ -72,7 +76,14 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                 let exporting = app.exporting;
                 let busy = app.render.is_busy();
                 let sections_open = &app.config.sections_open;
+                let subsections_shown = &app.config.subsections_shown;
                 let session = app.session.as_mut().expect("session present");
+                // The per-frame visibility context threaded into each section body:
+                // the persisted show/hide map (read) and the toggles to write back.
+                let mut vis = VisCtx {
+                    shown: subsections_shown,
+                    toggles: &mut vis_toggles,
+                };
                 // The scopes sit above the develop sections. They only paint the
                 // cached bins/overlay (computed once per preview), so this never
                 // re-renders.
@@ -85,8 +96,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Basic,
-                    |ui, s| {
+                    |ui, s, _vis| {
                         let mut d = false;
                         d |= widgets::opt_point_slider(
                             ui,
@@ -118,8 +130,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Tone,
-                    |ui, s| {
+                    |ui, s, _vis| {
                         widgets::tone_block(ui, &mut s.variants[s.active], widgets::GlobalAccess)
                     },
                 );
@@ -130,8 +143,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Color,
-                    |ui, s| {
+                    |ui, s, vis| {
                         let access = widgets::GlobalAccess;
                         let h = &mut s.variants[s.active];
                         let mut d = false;
@@ -154,6 +168,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         };
                         d |= toggle_subsection(
                             ui,
+                            vis,
+                            "hsl_mixer",
                             h,
                             "HSL mixer",
                             hsl_on,
@@ -162,6 +178,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         );
                         d |= toggle_subsection(
                             ui,
+                            vis,
+                            "channel_mixer",
                             h,
                             "Channel mixer",
                             mixer_on,
@@ -178,14 +196,17 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Curves,
-                    |ui, s| {
+                    |ui, s, vis| {
                         let access = widgets::GlobalAccess;
                         let channel = &mut s.curve_channel;
                         let h = &mut s.variants[s.active];
                         let curves_on = h.current().global.curves.is_some();
                         toggle_subsection(
                             ui,
+                            vis,
+                            "curves",
                             h,
                             "Curves",
                             curves_on,
@@ -201,8 +222,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Detail,
-                    |ui, s| {
+                    |ui, s, vis| {
                         let access = widgets::GlobalAccess;
                         let h = &mut s.variants[s.active];
                         let g = &h.current().global;
@@ -215,6 +237,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         let mut d = false;
                         d |= toggle_subsection(
                             ui,
+                            vis,
+                            "sharpen",
                             h,
                             "Sharpen",
                             sharpen_on,
@@ -223,6 +247,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         );
                         d |= toggle_subsection(
                             ui,
+                            vis,
+                            "clarity",
                             h,
                             "Clarity",
                             clarity_on,
@@ -231,6 +257,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         );
                         d |= toggle_subsection(
                             ui,
+                            vis,
+                            "dehaze",
                             h,
                             "Dehaze",
                             dehaze_on,
@@ -252,6 +280,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                         );
                         d |= toggle_subsection(
                             ui,
+                            vis,
+                            "noise_reduction",
                             h,
                             "Noise reduction",
                             nr_on,
@@ -268,12 +298,15 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Effects,
-                    |ui, s| {
+                    |ui, s, vis| {
                         let h = &mut s.variants[s.active];
                         let vignette_on = h.current().geometry.vignette.is_some();
                         toggle_subsection(
                             ui,
+                            vis,
+                            "vignette",
                             h,
                             "Vignette",
                             vignette_on,
@@ -289,6 +322,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Geometry,
                     geometry_body,
                 );
@@ -299,8 +333,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     session,
                     sections_open,
                     &mut toggles,
+                    &mut vis,
                     SectionId::Masks,
-                    |ui, s| {
+                    |ui, s, _vis| {
                         let mut d = false;
                         let mut action = widgets::WbAction::None;
                         d |= widgets::local_adjustments(
@@ -334,6 +369,17 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
         }
     }
 
+    // Persist any subsection show/hide toggles the user made this frame, keyed by
+    // the stable subsection id (never the display label) — the same shape as the
+    // section open-state persistence above.
+    for (key, shown) in vis_toggles {
+        let changed = app.config.subsections_shown.get(key) != Some(&shown);
+        if changed {
+            app.config.subsections_shown.insert(key.to_owned(), shown);
+            app.save_config();
+        }
+    }
+
     // Persist the panel width when the user resizes it (debounced to ±1px so a
     // resize drag doesn't write the config every frame).
     let width = panel.response.rect.width();
@@ -358,14 +404,16 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
 /// open/closed state is seeded from the persisted config (falling back to the
 /// section's own default-open) and any toggle this frame is recorded in `toggles`
 /// for the caller to persist. Returns whether the body marked the preview dirty.
+#[allow(clippy::too_many_arguments)]
 fn section(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     session: &mut Session,
     sections_open: &std::collections::BTreeMap<String, bool>,
     toggles: &mut Vec<(&'static str, bool)>,
+    vis: &mut VisCtx,
     id: SectionId,
-    body: impl FnOnce(&mut egui::Ui, &mut Session) -> bool,
+    body: impl FnOnce(&mut egui::Ui, &mut Session, &mut VisCtx) -> bool,
 ) -> bool {
     let default_open = sections_open
         .get(id.key())
@@ -401,7 +449,7 @@ fn section(
             });
         })
         .body(|ui| {
-            dirty |= body(ui, session);
+            dirty |= body(ui, session, vis);
         });
 
     // Record an open/closed change for the caller to persist (keyed by the stable
@@ -426,19 +474,63 @@ fn reset_section(history: &mut History<Settings>, id: SectionId) {
     history.commit();
 }
 
-/// A toggleable subgroup bound to one history: the header is `[checkbox] Label`,
-/// and the body (the controls) shows only while the box is checked. The checkbox
-/// owns the subsection's enable — flipping it calls `set_enabled(history, now)`,
-/// where the caller flips the underlying field as **one** undo step. The body
-/// (`body(ui, history)`) renders the controls and returns its own dirty flag; the
-/// whole call returns whether the body *or* the toggle dirtied the preview.
-/// Threading the single `history` through both closures (rather than letting each
-/// capture it) keeps the borrow checker happy — the same shape
-/// [`toggle_tool_subsection`] uses for the session. Collapsing the body to a lone
-/// checkbox header when disabled is the single-purpose "this is just an enable"
-/// layout.
+/// The per-frame visibility context threaded into each section body: the persisted
+/// subsection show/hide map (read-only) plus the list of changes to write back
+/// after the panel closure. Mirrors how the section open-state map and its toggle
+/// list are threaded, so neither persistence path borrows `app` while the panel
+/// closure still holds it.
+struct VisCtx<'a> {
+    /// The persisted show/hide state, keyed by a stable subsection id (never the
+    /// display label). A missing id means shown (the eye-open default).
+    shown: &'a std::collections::BTreeMap<String, bool>,
+    /// Show/hide changes made this frame, for the caller to persist.
+    toggles: &'a mut Vec<(&'static str, bool)>,
+}
+
+impl VisCtx<'_> {
+    /// Whether the subsection `id` is currently shown (eye open). Defaults to
+    /// shown when nothing is persisted yet.
+    fn is_shown(&self, id: &str) -> bool {
+        self.shown.get(id).copied().unwrap_or(true)
+    }
+
+    /// Render the eye / eye-off button at the right edge of a subsection header and
+    /// record any change for the caller to persist. `shown` is the current state;
+    /// returns the (possibly flipped) state to use this frame. Pure UI — toggling
+    /// it never touches the image. Styled like the per-section reset icon-button.
+    fn eye_button(&mut self, ui: &mut egui::Ui, id: &'static str, shown: bool) -> bool {
+        let (name, tip) = if shown {
+            ("eye", "Hide these controls")
+        } else {
+            ("eye_off", "Show these controls")
+        };
+        let mut now = shown;
+        if crate::gui::icons::icon_button(ui, true, name, tip).clicked() {
+            now = !shown;
+            self.toggles.push((id, now));
+        }
+        now
+    }
+}
+
+/// A toggleable subgroup bound to one history: the header is `[checkbox] Label`
+/// with an eye / eye-off button at the right that shows or hides the body. The
+/// checkbox owns the subsection's **enable** — flipping it calls
+/// `set_enabled(history, now)`, where the caller flips the underlying field as
+/// **one** undo step. The eye button owns the body's **visibility** — pure UI,
+/// no image effect — and is independent of the enable: the body is rendered
+/// whenever the subsection is shown, and when shown-but-disabled it is greyed and
+/// non-interactive (via [`egui::Ui::add_enabled_ui`]) so toggling the checkbox
+/// never changes the panel layout. The body (`body(ui, history)`) renders the
+/// controls and returns its own dirty flag; the whole call returns whether the
+/// body *or* the toggle dirtied the preview. Threading the single `history`
+/// through both closures (rather than letting each capture it) keeps the borrow
+/// checker happy — the same shape [`toggle_tool_subsection`] uses for the session.
+#[allow(clippy::too_many_arguments)]
 fn toggle_subsection(
     ui: &mut egui::Ui,
+    vis: &mut VisCtx,
+    id: &'static str,
     history: &mut History<Settings>,
     label: &str,
     enabled: bool,
@@ -448,27 +540,49 @@ fn toggle_subsection(
     ui.add_space(2.0);
     let mut on = enabled;
     let mut dirty = false;
-    if ui.checkbox(&mut on, label).changed() {
-        dirty |= set_enabled(history, on);
-    }
-    if on {
-        dirty |= ui.indent(label, |ui| body(ui, history)).inner;
+    let shown = vis.is_shown(id);
+    let shown = ui
+        .horizontal(|ui| {
+            if ui.checkbox(&mut on, label).changed() {
+                dirty |= set_enabled(history, on);
+            }
+            // The eye button sits at the right edge of the header row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                vis.eye_button(ui, id, shown)
+            })
+            .inner
+        })
+        .inner;
+    if shown {
+        dirty |= ui
+            .indent(label, |ui| {
+                // Disabled-but-shown reads as greyed and non-interactive; nothing
+                // in the layout moves when the enable checkbox is toggled.
+                ui.add_enabled_ui(on, |ui| body(ui, history)).inner
+            })
+            .inner;
     }
     dirty
 }
 
-/// A toggleable subgroup whose header also carries a canvas-tool activation icon:
-/// `[checkbox] Label …………… [tool icon]`. The checkbox owns the enable (flipping it
-/// calls `on_toggle(now)`, one undo step in the caller); the tool icon sits at the
-/// right edge of the same row and reuses the single tool-activation path
-/// ([`Session::set_tool`]) — clicking it switches to `tool`, clicking it while
+/// A toggleable subgroup whose header also carries a canvas-tool activation icon
+/// plus the eye / eye-off visibility button:
+/// `[checkbox] Label …………… [tool icon] [eye]`. The checkbox owns the **enable**
+/// (flipping it calls `on_toggle(now)`, one undo step in the caller); the tool icon
+/// sits at the right edge of the same row and reuses the single tool-activation
+/// path ([`Session::set_tool`]) — clicking it switches to `tool`, clicking it while
 /// already active toggles back to the plain view — with an in-effect accent dot
-/// trailing it when `mark` is set. The body (the controls) shows only while
-/// enabled. Returns whether the body or the toggle dirtied the preview.
+/// trailing it when `mark` is set. The eye button (rightmost) owns the body's
+/// **visibility** — pure UI, no image effect — independent of the enable: the body
+/// is rendered whenever the subsection is shown, and when shown-but-disabled it is
+/// greyed and non-interactive so toggling the checkbox never moves the layout.
+/// Returns whether the body or the toggle dirtied the preview.
 #[allow(clippy::too_many_arguments)]
 fn toggle_tool_subsection(
     session: &mut Session,
     ui: &mut egui::Ui,
+    vis: &mut VisCtx,
+    id: &'static str,
     label: &str,
     tool: crate::gui::tools::CanvasTool,
     icon: &str,
@@ -480,37 +594,51 @@ fn toggle_tool_subsection(
     ui.add_space(2.0);
     let mut on = enabled;
     let mut dirty = false;
-    ui.horizontal(|ui| {
-        if ui.checkbox(&mut on, label).changed() {
-            dirty |= on_toggle(session, on);
-        }
-        // Push the tool activator to the right edge of the header row.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let active = session.tool == tool;
-            // A trailing accent dot marks the control as in effect even when the
-            // tool is not currently selected. In a right-to-left layout the dot is
-            // laid out first so it lands to the right of the icon.
-            if mark {
-                let (dot_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(dot_rect.center(), 3.0, theme::ACCENT);
+    let shown = vis.is_shown(id);
+    let shown = ui
+        .horizontal(|ui| {
+            if ui.checkbox(&mut on, label).changed() {
+                dirty |= on_toggle(session, on);
             }
-            let resp =
-                crate::gui::icons::selectable_icon(ui, active, icon, "Edit this on the image");
-            if resp.clicked() {
-                // Re-clicking the active tool returns to the plain view.
-                let next = if active {
-                    crate::gui::tools::CanvasTool::None
-                } else {
-                    tool
-                };
-                session.set_tool(next);
-            }
-        });
-    });
-    if on {
-        dirty |= ui.indent(label, |ui| body(session, ui)).inner;
+            // Push the tool activator and eye button to the right edge of the row.
+            // In a right-to-left layout the eye is laid out first so it lands at the
+            // far right, next to the tool icon.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let now_shown = vis.eye_button(ui, id, shown);
+                let active = session.tool == tool;
+                // A trailing accent dot marks the control as in effect even when the
+                // tool is not currently selected. In a right-to-left layout the dot
+                // is laid out before the icon so it lands to the right of it.
+                if mark {
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot_rect.center(), 3.0, theme::ACCENT);
+                }
+                let resp =
+                    crate::gui::icons::selectable_icon(ui, active, icon, "Edit this on the image");
+                if resp.clicked() {
+                    // Re-clicking the active tool returns to the plain view.
+                    let next = if active {
+                        crate::gui::tools::CanvasTool::None
+                    } else {
+                        tool
+                    };
+                    session.set_tool(next);
+                }
+                now_shown
+            })
+            .inner
+        })
+        .inner;
+    if shown {
+        dirty |= ui
+            .indent(label, |ui| {
+                // Disabled-but-shown reads as greyed and non-interactive; nothing
+                // in the layout moves when the enable checkbox is toggled.
+                ui.add_enabled_ui(on, |ui| body(session, ui)).inner
+            })
+            .inner;
     }
     dirty
 }
@@ -630,62 +758,80 @@ fn export_section(
     }
 }
 
-/// The lens-correction subsection, collapsed to a **single** checkbox header
-/// `[checkbox] Lens correction` (the enable) — never a checkbox nested under a
-/// labeled subsection. `geometry.lens` is off by default. Enabling detects a
-/// profile from the RAW's EXIF on the main thread (the lensfun `Database` is not
-/// `Send`, so it never crosses the render worker) and applies it — or reports that
-/// none was found and leaves the checkbox off. Disabling clears the correction.
-/// The detected-lens name (or a "none found" note) shows as a small indented body
-/// label only while enabled. Returns whether the preview is now dirty.
-fn lens_block(session: &mut Session, ui: &mut egui::Ui) -> bool {
+/// The lens-correction subsection: a single checkbox header `[checkbox] Lens
+/// correction` (the enable) with the eye / eye-off visibility button at the right,
+/// styled like the section reset icon-button. `geometry.lens` is off by default.
+/// Enabling detects a profile from the RAW's EXIF on the main thread (the lensfun
+/// `Database` is not `Send`, so it never crosses the render worker) and applies it
+/// — or reports that none was found and leaves the checkbox off. Disabling clears
+/// the correction. The detected-lens name (or a "none found" note) shows as a small
+/// indented body label whenever the subsection is shown; while disabled it reads
+/// greyed and non-interactive so the layout does not move when the box is toggled.
+/// Returns whether the preview is now dirty.
+fn lens_block(session: &mut Session, ui: &mut egui::Ui, vis: &mut VisCtx) -> bool {
     let active = session.active;
     let mut dirty = false;
     let mut enabled = session.variants[active].current().geometry.lens.is_some();
     ui.add_space(2.0);
-    let changed = ui
-        .checkbox(&mut enabled, "Lens correction")
-        .on_hover_text("Correct lens distortion/vignetting from the lens profile")
-        .changed();
-    if changed {
-        if enabled {
-            // Detect synchronously on the main thread (a one-shot lookup, never a
-            // per-frame cost) and apply when a profile is found.
-            match crate::gui::state::auto_lens_profile(&session.meta) {
-                Some(profile) => {
+    let shown = vis.is_shown("lens");
+    let shown = ui
+        .horizontal(|ui| {
+            let changed = ui
+                .checkbox(&mut enabled, "Lens correction")
+                .on_hover_text("Correct lens distortion/vignetting from the lens profile")
+                .changed();
+            if changed {
+                if enabled {
+                    // Detect synchronously on the main thread (a one-shot lookup,
+                    // never a per-frame cost) and apply when a profile is found.
+                    match crate::gui::state::auto_lens_profile(&session.meta) {
+                        Some(profile) => {
+                            let history = &mut session.variants[active];
+                            history.begin();
+                            history.current_mut().geometry.lens = Some(profile);
+                            history.commit();
+                            session.lens_name = Some(lens_display_name(&session.meta));
+                            dirty = true;
+                        }
+                        None => {
+                            // No match: leave the lens off and report it.
+                            session.lens_name = None;
+                        }
+                    }
+                } else {
                     let history = &mut session.variants[active];
                     history.begin();
-                    history.current_mut().geometry.lens = Some(profile);
+                    history.current_mut().geometry.lens = None;
                     history.commit();
-                    session.lens_name = Some(lens_display_name(&session.meta));
+                    session.lens_name = None;
                     dirty = true;
                 }
-                None => {
-                    // No match: leave the lens off and report it.
-                    session.lens_name = None;
-                }
             }
-        } else {
-            let history = &mut session.variants[active];
-            history.begin();
-            history.current_mut().geometry.lens = None;
-            history.commit();
-            session.lens_name = None;
-            dirty = true;
-        }
-    }
+            // The eye button sits at the right edge of the header row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                vis.eye_button(ui, "lens", shown)
+            })
+            .inner
+        })
+        .inner;
 
-    // Show the detected-lens name (or a "none found" note) as the small body, only
-    // while the checkbox reads enabled — the single-purpose subsection's body.
-    if session.variants[active].current().geometry.lens.is_some() {
-        let name = session
-            .lens_name
-            .clone()
-            .unwrap_or_else(|| "Lens profile applied".to_owned());
-        ui.indent("lens", |ui| ui.label(name));
-    } else if enabled {
-        // The user ticked the box but nothing matched (the box reads back off).
-        ui.indent("lens", |ui| ui.label("No lens profile found"));
+    // Show the detected-lens name (or a "none found" note) as the small body
+    // whenever shown. When disabled it greys out, so toggling the box never moves
+    // the layout.
+    if shown {
+        let on = session.variants[active].current().geometry.lens.is_some();
+        let name = if on {
+            session
+                .lens_name
+                .clone()
+                .unwrap_or_else(|| "Lens profile applied".to_owned())
+        } else {
+            // No profile applied — the user has not enabled it, or nothing matched.
+            "No lens profile found".to_owned()
+        };
+        ui.indent("lens", |ui| {
+            ui.add_enabled_ui(on, |ui| ui.label(name));
+        });
     }
     dirty
 }
@@ -708,7 +854,7 @@ fn lens_display_name(meta: &latent_raw::Metadata) -> String {
 /// shared auto-constrain toggle, which trims the wedges either a straighten or a
 /// keystone leaves, sits at the foot of the section since it spans both. Returns
 /// whether any control marked the preview dirty.
-fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
+fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> bool {
     use crate::gui::tools::{CanvasTool, crop};
     let mut d = false;
 
@@ -725,6 +871,8 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
     d |= toggle_tool_subsection(
         session,
         ui,
+        vis,
+        "cropping",
         "Cropping",
         CanvasTool::Crop,
         "crop",
@@ -742,6 +890,8 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
     d |= toggle_tool_subsection(
         session,
         ui,
+        vis,
+        "straighten",
         "Straighten",
         CanvasTool::Straighten,
         "straighten",
@@ -756,6 +906,8 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
     d |= toggle_tool_subsection(
         session,
         ui,
+        vis,
+        "keystone",
         "Keystone",
         CanvasTool::Keystone,
         "keystone",
@@ -767,7 +919,7 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
 
     // Lens correction — a single-checkbox subsection (no nested enable): the header
     // checkbox is the enable, the detected-lens name shows as a small body label.
-    d |= lens_block(session, ui);
+    d |= lens_block(session, ui, vis);
 
     // The auto-constrain toggle spans straighten and keystone, so it stays a
     // section-level control rather than living in either subsection.

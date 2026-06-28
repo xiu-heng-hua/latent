@@ -100,6 +100,12 @@ pub(crate) struct Config {
     /// section key (not the display label, so renaming a header never orphans
     /// saved state). A missing key falls back to the section's own default-open.
     pub(crate) sections_open: BTreeMap<String, bool>,
+    /// Shown/hidden state of the toggleable subsections (Cropping, Straighten,
+    /// Sharpen, HSL mixer, …), keyed by a stable subsection id (not the display
+    /// label). This is purely a UI show/hide of the subsection body and is
+    /// independent of whether the effect is enabled. A missing key falls back to
+    /// shown (the eye-open default).
+    pub(crate) subsections_shown: BTreeMap<String, bool>,
     /// Named develop presets, global to the app and reusable across images. An old
     /// config with no presets loads with an empty list (`#[serde(default)]`).
     pub(crate) presets: Vec<Preset>,
@@ -230,6 +236,10 @@ mod tests {
                 ("basic".to_owned(), true),
                 ("color".to_owned(), false),
             ]),
+            subsections_shown: BTreeMap::from([
+                ("hsl_mixer".to_owned(), false),
+                ("sharpen".to_owned(), true),
+            ]),
             presets: vec![Preset::from_settings(
                 "Test".to_owned(),
                 &Settings::default(),
@@ -321,6 +331,25 @@ mod tests {
         let old = "(window_size: Some((800.0, 600.0)))";
         let loaded = Config::from_ron(old).expect("old config should load");
         assert!(loaded.sections_open.is_empty());
+    }
+
+    #[test]
+    fn subsection_visibility_round_trips() {
+        // A hidden subsection persists through a serialize/reload, keyed by a stable
+        // subsection id (not the display label). This is UI show/hide only, kept
+        // independent of the subsection's enable state. An older config missing the
+        // field defaults to an empty map (each subsection then shows by default),
+        // proving the forward-compatible default.
+        let mut cfg = Config::default();
+        cfg.subsections_shown.insert("hsl_mixer".to_owned(), false);
+        let text = cfg.to_ron().expect("serialize");
+        let back = Config::from_ron(&text).expect("parse");
+        assert_eq!(back.subsections_shown.get("hsl_mixer"), Some(&false));
+
+        // A config that predates the field still loads, with no remembered state.
+        let old = "(window_size: Some((800.0, 600.0)))";
+        let loaded = Config::from_ron(old).expect("old config should load");
+        assert!(loaded.subsections_shown.is_empty());
     }
 
     #[test]

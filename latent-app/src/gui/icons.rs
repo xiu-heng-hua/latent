@@ -37,6 +37,8 @@ pub(crate) fn icon(name: &str) -> char {
         "info" => '\u{e2ce}',       // info
         "image" => '\u{e2ca}',      // image
         "quit" => '\u{e42a}',       // sign-out
+        "eye" => '\u{e1fc}',        // eye
+        "eye_off" => '\u{e200}',    // eye-slash
         _ => '\u{e2ce}',            // info, as a visible fallback
     }
 }
@@ -68,6 +70,8 @@ const ICON_NAMES: &[&str] = &[
     "info",
     "image",
     "quit",
+    "eye",
+    "eye_off",
 ];
 
 /// Build a `RichText` for an icon glyph in the icon family at the icon size.
