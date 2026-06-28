@@ -186,33 +186,41 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     SectionId::Detail,
                     |ui, s| {
                         let mut d = false;
-                        d |= widgets::sharpen_block(
-                            ui,
-                            &mut s.variants[s.active],
-                            widgets::GlobalAccess,
-                        );
-                        d |= widgets::clarity_block(
-                            ui,
-                            &mut s.variants[s.active],
-                            widgets::GlobalAccess,
-                        );
-                        d |= widgets::opt_point_slider(
-                            ui,
-                            &mut s.variants[s.active],
-                            widgets::SliderSpec {
-                                label: "Dehaze",
-                                range: 0.0..=1.0,
-                                neutral: 0.0,
-                                help: "Cut atmospheric haze",
-                            },
-                            |st| st.global.dehaze,
-                            |st, v| st.global.dehaze = v,
-                        );
-                        d |= widgets::noise_reduction_block(
-                            ui,
-                            &mut s.variants[s.active],
-                            widgets::GlobalAccess,
-                        );
+                        d |= subsection(ui, "Sharpen", |ui| {
+                            widgets::sharpen_block(
+                                ui,
+                                &mut s.variants[s.active],
+                                widgets::GlobalAccess,
+                            )
+                        });
+                        d |= subsection(ui, "Clarity", |ui| {
+                            widgets::clarity_block(
+                                ui,
+                                &mut s.variants[s.active],
+                                widgets::GlobalAccess,
+                            )
+                        });
+                        d |= subsection(ui, "Dehaze", |ui| {
+                            widgets::opt_point_slider(
+                                ui,
+                                &mut s.variants[s.active],
+                                widgets::SliderSpec {
+                                    label: "Dehaze",
+                                    range: 0.0..=1.0,
+                                    neutral: 0.0,
+                                    help: "Cut atmospheric haze",
+                                },
+                                |st| st.global.dehaze,
+                                |st, v| st.global.dehaze = v,
+                            )
+                        });
+                        d |= subsection(ui, "Noise reduction", |ui| {
+                            widgets::noise_reduction_block(
+                                ui,
+                                &mut s.variants[s.active],
+                                widgets::GlobalAccess,
+                            )
+                        });
                         d
                     },
                 );
@@ -234,17 +242,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     sections_open,
                     &mut toggles,
                     SectionId::Geometry,
-                    |ui, s| {
-                        let mut d = false;
-                        geometry_tools(s, ui);
-                        d |= widgets::straighten_slider(ui, &mut s.variants[s.active]);
-                        d |= widgets::keystone_block(ui, &mut s.variants[s.active]);
-                        d |= lens_block(s, ui);
-                        crop_aspect_row(s, ui);
-                        d |= widgets::crop_block(ui, &mut s.variants[s.active]);
-                        d |= auto_constrain_row(s, ui);
-                        d
-                    },
+                    geometry_body,
                 );
 
                 dirty |= section(
@@ -378,6 +376,58 @@ fn reset_section(history: &mut History<Settings>, id: SectionId) {
     history.begin();
     id.reset(history.current_mut());
     history.commit();
+}
+
+/// A labeled subgroup within a section: a small heading and its indented body, so
+/// related controls read as one purpose rather than a flat stack. The body is
+/// nested under the heading via [`egui::Ui::indent`] (a light visual nest, not a
+/// new collapsible). Returns whatever the body returns (typically a dirty flag).
+fn subsection<R>(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new(label).strong());
+    ui.indent(label, body).inner
+}
+
+/// A labeled subgroup whose heading also carries a canvas-tool activation button,
+/// so a graphical tool launches from the subsection that owns its controls. The
+/// button reuses the single tool-activation path ([`Session::set_tool`]): clicking
+/// it switches to `tool`, and clicking it while already active toggles back to the
+/// plain view. The button reads as active (highlighted) while its tool is current,
+/// and an optional accent dot trails it when `mark` is set (a persistent "this is
+/// in effect" signal even when the tool is inactive). Returns the body's result.
+fn tool_subsection<R>(
+    session: &mut Session,
+    ui: &mut egui::Ui,
+    label: &str,
+    tool: crate::gui::tools::CanvasTool,
+    button: &str,
+    mark: bool,
+    body: impl FnOnce(&mut Session, &mut egui::Ui) -> R,
+) -> R {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).strong());
+        let active = session.tool == tool;
+        let resp = ui
+            .selectable_label(active, button)
+            .on_hover_text("Edit this on the image");
+        // A trailing accent dot marks the control as in effect even when the tool
+        // is not currently selected.
+        if mark {
+            let dot = resp.rect.right_center() + egui::vec2(3.0, 0.0);
+            ui.painter().circle_filled(dot, 3.0, theme::ACCENT);
+        }
+        if resp.clicked() {
+            // Re-clicking the active tool returns to the plain view.
+            let next = if active {
+                crate::gui::tools::CanvasTool::None
+            } else {
+                tool
+            };
+            session.set_tool(next);
+        }
+    });
+    ui.indent(label, |ui| body(session, ui)).inner
 }
 
 /// The local-adjustment tool row: the brush/shape activator and brush sliders that
@@ -549,37 +599,66 @@ fn lens_display_name(meta: &latent_raw::Metadata) -> String {
     }
 }
 
-/// The geometry tool activators: selectable labels that switch the canvas to the
-/// crop / level / keystone tool so the handles appear. The Crop label carries an
-/// accent dot whenever a non-full crop is set, a persistent "this image is
-/// cropped" signal even when the tool is inactive.
-fn geometry_tools(session: &mut Session, ui: &mut egui::Ui) {
+/// The Geometry section body, grouped into per-purpose subsections — Cropping,
+/// Straighten, Keystone, and Lens — each carrying the on-canvas tool that edits it
+/// at its header. Aspect ratio lives in Cropping (it constrains the crop). The
+/// shared auto-constrain toggle, which trims the wedges either a straighten or a
+/// keystone leaves, sits at the foot of the section since it spans both. Returns
+/// whether any control marked the preview dirty.
+fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
     use crate::gui::tools::{CanvasTool, crop};
-    // Whether the active variant carries a real (non-full) crop right now.
+    let mut d = false;
+
+    // Cropping — the crop tool, its aspect-ratio constraint, and the edge sliders.
+    // A non-full crop trails the tool button with an accent dot, a persistent
+    // "this image is cropped" signal even while the tool is inactive.
     let has_crop = session.variants[session.active]
         .current()
         .geometry
         .crop
         .is_some_and(|c| !crop::is_full_frame(c));
-    ui.horizontal(|ui| {
-        for (tool, label) in [
-            (CanvasTool::Crop, "Crop"),
-            (CanvasTool::Straighten, "Level"),
-            (CanvasTool::Keystone, "Keystone"),
-        ] {
-            let selected = session.tool == tool;
-            let resp = ui.selectable_label(selected, label);
-            // An accent dot trailing the Crop label marks an active crop.
-            if tool == CanvasTool::Crop && has_crop {
-                let dot = resp.rect.right_center() + egui::vec2(3.0, 0.0);
-                ui.painter().circle_filled(dot, 3.0, theme::ACCENT);
-            }
-            if resp.clicked() {
-                let next = if selected { CanvasTool::None } else { tool };
-                session.set_tool(next);
-            }
-        }
-    });
+    d |= tool_subsection(
+        session,
+        ui,
+        "Cropping",
+        CanvasTool::Crop,
+        "Crop",
+        has_crop,
+        |session, ui| {
+            crop_aspect_row(session, ui);
+            widgets::crop_block(ui, &mut session.variants[session.active])
+        },
+    );
+
+    // Straighten — the level tool and its angle.
+    d |= tool_subsection(
+        session,
+        ui,
+        "Straighten",
+        CanvasTool::Straighten,
+        "Level",
+        false,
+        |session, ui| widgets::straighten_slider(ui, &mut session.variants[session.active]),
+    );
+
+    // Keystone — the perspective tool and its two correction axes.
+    d |= tool_subsection(
+        session,
+        ui,
+        "Keystone",
+        CanvasTool::Keystone,
+        "Keystone",
+        false,
+        |session, ui| widgets::keystone_block(ui, &mut session.variants[session.active]),
+    );
+
+    // Lens — no on-canvas tool; a plain subgroup over the profile enable/label.
+    d |= subsection(ui, "Lens", |ui| lens_block(session, ui));
+
+    // The auto-constrain toggle spans straighten and keystone, so it stays a
+    // section-level control rather than living in either subsection.
+    d |= auto_constrain_row(session, ui);
+    d
 }
 
 /// The auto-constrain toggle: trim the straighten/keystone border wedges to the
