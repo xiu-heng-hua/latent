@@ -243,6 +243,25 @@ pub(crate) struct Session {
     /// (`AspectRatio::Free` leaves the rectangle unconstrained).
     pub(crate) crop_aspect: AspectRatio,
     pub(crate) crop_thirds: bool,
+    /// Whether each toggleable geometry transform's subsection is enabled in the
+    /// panel. These are UI state, **not** develop history: a geometry transform's
+    /// neutral value (crop full-frame, straighten `0°`, no perspective) reads as
+    /// "off" on the settings, so a plain `is_some`/`!= 0` test can't tell an
+    /// intentionally-enabled-at-neutral transform from a disabled one. The flags
+    /// hold that intent so the body (sliders + tool) stays visible at neutral, and
+    /// they are seeded from the loaded settings in [`Session::from_data`]. When a
+    /// flag is turned off, the transform's current value is stashed below and the
+    /// field cleared (so the render turns it off); turning it back on restores the
+    /// stash, making a toggle non-destructive within the session.
+    pub(crate) crop_enabled: bool,
+    pub(crate) straighten_enabled: bool,
+    pub(crate) keystone_enabled: bool,
+    /// The last non-off value of each toggleable geometry transform, stashed when
+    /// its subsection is disabled so re-enabling restores it (rather than starting
+    /// from neutral). `None` until a value has been stashed.
+    pub(crate) crop_stash: Option<latent_edit::Crop>,
+    pub(crate) straighten_stash: Option<f32>,
+    pub(crate) keystone_stash: Option<latent_edit::Perspective>,
     /// Mask-overlay visualization mode and its cached coverage texture.
     pub(crate) overlay_mode: OverlayMode,
     pub(crate) overlay_cache: OverlayCache,
@@ -267,6 +286,15 @@ impl Session {
             ExportSettings::for_path(Path::new(&data.output), ExportSettings::default().quality);
         let thumb_base = Arc::new(data.preview.downscaled(THUMB_MAX_DIM));
         let variant_count = data.variants.len();
+        // Seed each toggleable geometry transform's enable flag from the loaded
+        // settings of the variant that opens first (index 0): a transform present
+        // in the sidecar opens enabled, an absent one opens disabled. A sidecar
+        // never stores a full-frame crop or a `0°` straighten (those clear to off
+        // on edit), so the seed matches what the section actually shows.
+        let (crop_enabled, straighten_enabled, keystone_enabled) =
+            crate::gui::panels::controls::geometry_enabled_from(
+                &data.variants[0].current().geometry,
+            );
         Self {
             full: data.full,
             preview: data.preview,
@@ -307,6 +335,12 @@ impl Session {
             fit_region: None,
             crop_aspect: AspectRatio::default(),
             crop_thirds: true,
+            crop_enabled,
+            straighten_enabled,
+            keystone_enabled,
+            crop_stash: None,
+            straighten_stash: None,
+            keystone_stash: None,
             overlay_mode: OverlayMode::default(),
             overlay_cache: OverlayCache::default(),
             preview_gen: 0,
@@ -333,6 +367,17 @@ impl Session {
         // line rather than a stale one from an earlier edit this session.
         if tool == CanvasTool::Straighten && self.tool != CanvasTool::Straighten {
             self.straighten_line = None;
+        }
+        // Activating a toggleable geometry tool implies its subsection is enabled,
+        // so its header checkbox follows the tool: editing on the canvas can never
+        // leave the subsection reading as off. Only enabling here (the tool icon
+        // sits inside the subsection, so it makes no sense to reach it while
+        // disabled), never disabling — leaving a tool keeps the transform in effect.
+        match tool {
+            CanvasTool::Crop => self.crop_enabled = true,
+            CanvasTool::Straighten => self.straighten_enabled = true,
+            CanvasTool::Keystone => self.keystone_enabled = true,
+            _ => {}
         }
         self.tool = tool;
         if crosses_geometry {

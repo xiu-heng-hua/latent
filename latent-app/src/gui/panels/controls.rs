@@ -132,10 +132,13 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     &mut toggles,
                     SectionId::Color,
                     |ui, s| {
+                        let access = widgets::GlobalAccess;
+                        let h = &mut s.variants[s.active];
                         let mut d = false;
+                        // Saturation is an always-on continuous basic — a plain slider.
                         d |= widgets::opt_point_slider(
                             ui,
-                            &mut s.variants[s.active],
+                            h,
                             widgets::SliderSpec {
                                 label: "Saturation",
                                 range: 0.0..=2.0,
@@ -145,15 +148,25 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                             |st| st.global.saturation,
                             |st, v| st.global.saturation = v,
                         );
-                        d |= widgets::hsl_block(
+                        let (hsl_on, mixer_on) = {
+                            let g = &h.current().global;
+                            (g.hsl.is_some(), g.channel_mixer.is_some())
+                        };
+                        d |= toggle_subsection(
                             ui,
-                            &mut s.variants[s.active],
-                            widgets::GlobalAccess,
+                            h,
+                            "HSL mixer",
+                            hsl_on,
+                            |h, on| widgets::set_hsl_enabled(h, access, on),
+                            |ui, h| widgets::hsl_body(ui, h, access),
                         );
-                        d |= widgets::channel_mixer_block(
+                        d |= toggle_subsection(
                             ui,
-                            &mut s.variants[s.active],
-                            widgets::GlobalAccess,
+                            h,
+                            "Channel mixer",
+                            mixer_on,
+                            |h, on| widgets::set_channel_mixer_enabled(h, access, on),
+                            |ui, h| widgets::channel_mixer_body(ui, h, access),
                         );
                         d
                     },
@@ -167,12 +180,17 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     &mut toggles,
                     SectionId::Curves,
                     |ui, s| {
-                        let active = s.active;
-                        widgets::curves_block(
+                        let access = widgets::GlobalAccess;
+                        let channel = &mut s.curve_channel;
+                        let h = &mut s.variants[s.active];
+                        let curves_on = h.current().global.curves.is_some();
+                        toggle_subsection(
                             ui,
-                            &mut s.variants[active],
-                            &mut s.curve_channel,
-                            widgets::GlobalAccess,
+                            h,
+                            "Curves",
+                            curves_on,
+                            |h, on| widgets::set_curves_enabled(h, access, on),
+                            |ui, h| widgets::curves_body(ui, h, channel, access),
                         )
                     },
                 );
@@ -185,42 +203,61 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     &mut toggles,
                     SectionId::Detail,
                     |ui, s| {
+                        let access = widgets::GlobalAccess;
+                        let h = &mut s.variants[s.active];
+                        let g = &h.current().global;
+                        let (sharpen_on, clarity_on, dehaze_on, nr_on) = (
+                            g.sharpen.is_some(),
+                            g.clarity.is_some(),
+                            g.dehaze.is_some(),
+                            g.noise_reduction.is_some(),
+                        );
                         let mut d = false;
-                        d |= subsection(ui, "Sharpen", |ui| {
-                            widgets::sharpen_block(
-                                ui,
-                                &mut s.variants[s.active],
-                                widgets::GlobalAccess,
-                            )
-                        });
-                        d |= subsection(ui, "Clarity", |ui| {
-                            widgets::clarity_block(
-                                ui,
-                                &mut s.variants[s.active],
-                                widgets::GlobalAccess,
-                            )
-                        });
-                        d |= subsection(ui, "Dehaze", |ui| {
-                            widgets::opt_point_slider(
-                                ui,
-                                &mut s.variants[s.active],
-                                widgets::SliderSpec {
-                                    label: "Dehaze",
-                                    range: 0.0..=1.0,
-                                    neutral: 0.0,
-                                    help: "Cut atmospheric haze",
-                                },
-                                |st| st.global.dehaze,
-                                |st, v| st.global.dehaze = v,
-                            )
-                        });
-                        d |= subsection(ui, "Noise reduction", |ui| {
-                            widgets::noise_reduction_block(
-                                ui,
-                                &mut s.variants[s.active],
-                                widgets::GlobalAccess,
-                            )
-                        });
+                        d |= toggle_subsection(
+                            ui,
+                            h,
+                            "Sharpen",
+                            sharpen_on,
+                            |h, on| widgets::set_sharpen_enabled(h, access, on),
+                            |ui, h| widgets::sharpen_block(ui, h, access),
+                        );
+                        d |= toggle_subsection(
+                            ui,
+                            h,
+                            "Clarity",
+                            clarity_on,
+                            |h, on| widgets::set_clarity_enabled(h, access, on),
+                            |ui, h| widgets::clarity_block(ui, h, access),
+                        );
+                        d |= toggle_subsection(
+                            ui,
+                            h,
+                            "Dehaze",
+                            dehaze_on,
+                            |h, on| widgets::set_dehaze_enabled(h, access, on),
+                            |ui, h| {
+                                widgets::opt_point_slider(
+                                    ui,
+                                    h,
+                                    widgets::SliderSpec {
+                                        label: "Dehaze",
+                                        range: 0.0..=1.0,
+                                        neutral: 0.0,
+                                        help: "Cut atmospheric haze",
+                                    },
+                                    |st| st.global.dehaze,
+                                    |st, v| st.global.dehaze = v,
+                                )
+                            },
+                        );
+                        d |= toggle_subsection(
+                            ui,
+                            h,
+                            "Noise reduction",
+                            nr_on,
+                            |h, on| widgets::set_noise_reduction_enabled(h, access, on),
+                            |ui, h| widgets::noise_reduction_block(ui, h, access),
+                        );
                         d
                     },
                 );
@@ -232,7 +269,18 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
                     sections_open,
                     &mut toggles,
                     SectionId::Effects,
-                    |ui, s| widgets::vignette_slider(ui, &mut s.variants[s.active]),
+                    |ui, s| {
+                        let h = &mut s.variants[s.active];
+                        let vignette_on = h.current().geometry.vignette.is_some();
+                        toggle_subsection(
+                            ui,
+                            h,
+                            "Vignette",
+                            vignette_on,
+                            widgets::set_vignette_enabled,
+                            widgets::vignette_body,
+                        )
+                    },
                 );
 
                 dirty |= section(
@@ -378,37 +426,64 @@ fn reset_section(history: &mut History<Settings>, id: SectionId) {
     history.commit();
 }
 
-/// A labeled subgroup within a section: a small heading and its indented body, so
-/// related controls read as one purpose rather than a flat stack. The body is
-/// nested under the heading via [`egui::Ui::indent`] (a light visual nest, not a
-/// new collapsible). Returns whatever the body returns (typically a dirty flag).
-fn subsection<R>(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+/// A toggleable subgroup bound to one history: the header is `[checkbox] Label`,
+/// and the body (the controls) shows only while the box is checked. The checkbox
+/// owns the subsection's enable — flipping it calls `set_enabled(history, now)`,
+/// where the caller flips the underlying field as **one** undo step. The body
+/// (`body(ui, history)`) renders the controls and returns its own dirty flag; the
+/// whole call returns whether the body *or* the toggle dirtied the preview.
+/// Threading the single `history` through both closures (rather than letting each
+/// capture it) keeps the borrow checker happy — the same shape
+/// [`toggle_tool_subsection`] uses for the session. Collapsing the body to a lone
+/// checkbox header when disabled is the single-purpose "this is just an enable"
+/// layout.
+fn toggle_subsection(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    label: &str,
+    enabled: bool,
+    set_enabled: impl FnOnce(&mut History<Settings>, bool) -> bool,
+    body: impl FnOnce(&mut egui::Ui, &mut History<Settings>) -> bool,
+) -> bool {
     ui.add_space(2.0);
-    ui.label(egui::RichText::new(label).strong());
-    ui.indent(label, body).inner
+    let mut on = enabled;
+    let mut dirty = false;
+    if ui.checkbox(&mut on, label).changed() {
+        dirty |= set_enabled(history, on);
+    }
+    if on {
+        dirty |= ui.indent(label, |ui| body(ui, history)).inner;
+    }
+    dirty
 }
 
-/// A labeled subgroup whose heading also carries a canvas-tool activation button,
-/// so a graphical tool launches from the subsection that owns its controls. The
-/// heading reads left-to-right with the label, while the tool button is pushed to
-/// the right edge of the header row and shown as an icon (named by `icon`). The
-/// button reuses the single tool-activation path ([`Session::set_tool`]): clicking
-/// it switches to `tool`, and clicking it while already active toggles back to the
-/// plain view. The button reads as active (highlighted) while its tool is current,
-/// and an optional accent dot trails it when `mark` is set (a persistent "this is
-/// in effect" signal even when the tool is inactive). Returns the body's result.
-fn tool_subsection<R>(
+/// A toggleable subgroup whose header also carries a canvas-tool activation icon:
+/// `[checkbox] Label …………… [tool icon]`. The checkbox owns the enable (flipping it
+/// calls `on_toggle(now)`, one undo step in the caller); the tool icon sits at the
+/// right edge of the same row and reuses the single tool-activation path
+/// ([`Session::set_tool`]) — clicking it switches to `tool`, clicking it while
+/// already active toggles back to the plain view — with an in-effect accent dot
+/// trailing it when `mark` is set. The body (the controls) shows only while
+/// enabled. Returns whether the body or the toggle dirtied the preview.
+#[allow(clippy::too_many_arguments)]
+fn toggle_tool_subsection(
     session: &mut Session,
     ui: &mut egui::Ui,
     label: &str,
     tool: crate::gui::tools::CanvasTool,
     icon: &str,
     mark: bool,
-    body: impl FnOnce(&mut Session, &mut egui::Ui) -> R,
-) -> R {
+    enabled: bool,
+    on_toggle: impl FnOnce(&mut Session, bool) -> bool,
+    body: impl FnOnce(&mut Session, &mut egui::Ui) -> bool,
+) -> bool {
     ui.add_space(2.0);
+    let mut on = enabled;
+    let mut dirty = false;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).strong());
+        if ui.checkbox(&mut on, label).changed() {
+            dirty |= on_toggle(session, on);
+        }
         // Push the tool activator to the right edge of the header row.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let active = session.tool == tool;
@@ -434,7 +509,10 @@ fn tool_subsection<R>(
             }
         });
     });
-    ui.indent(label, |ui| body(session, ui)).inner
+    if on {
+        dirty |= ui.indent(label, |ui| body(session, ui)).inner;
+    }
+    dirty
 }
 
 /// The local-adjustment tool row: the brush/shape activator and brush sliders that
@@ -552,17 +630,21 @@ fn export_section(
     }
 }
 
-/// The lens-correction panel: an enable checkbox over `geometry.lens`, off by
-/// default. Enabling detects a profile from the RAW's EXIF on the main thread
-/// (the lensfun `Database` is not `Send`, so it never crosses the render worker)
-/// and applies it — or reports that none was found and leaves the checkbox off.
-/// Disabling clears the correction. Returns whether the preview is now dirty.
+/// The lens-correction subsection, collapsed to a **single** checkbox header
+/// `[checkbox] Lens correction` (the enable) — never a checkbox nested under a
+/// labeled subsection. `geometry.lens` is off by default. Enabling detects a
+/// profile from the RAW's EXIF on the main thread (the lensfun `Database` is not
+/// `Send`, so it never crosses the render worker) and applies it — or reports that
+/// none was found and leaves the checkbox off. Disabling clears the correction.
+/// The detected-lens name (or a "none found" note) shows as a small indented body
+/// label only while enabled. Returns whether the preview is now dirty.
 fn lens_block(session: &mut Session, ui: &mut egui::Ui) -> bool {
     let active = session.active;
     let mut dirty = false;
     let mut enabled = session.variants[active].current().geometry.lens.is_some();
+    ui.add_space(2.0);
     let changed = ui
-        .checkbox(&mut enabled, "Lens Corrections")
+        .checkbox(&mut enabled, "Lens correction")
         .on_hover_text("Correct lens distortion/vignetting from the lens profile")
         .changed();
     if changed {
@@ -593,15 +675,17 @@ fn lens_block(session: &mut Session, ui: &mut egui::Ui) -> bool {
         }
     }
 
+    // Show the detected-lens name (or a "none found" note) as the small body, only
+    // while the checkbox reads enabled — the single-purpose subsection's body.
     if session.variants[active].current().geometry.lens.is_some() {
         let name = session
             .lens_name
             .clone()
             .unwrap_or_else(|| "Lens profile applied".to_owned());
-        ui.label(name);
+        ui.indent("lens", |ui| ui.label(name));
     } else if enabled {
         // The user ticked the box but nothing matched (the box reads back off).
-        ui.label("No lens profile found");
+        ui.indent("lens", |ui| ui.label("No lens profile found"));
     }
     dirty
 }
@@ -628,21 +712,25 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
     use crate::gui::tools::{CanvasTool, crop};
     let mut d = false;
 
-    // Cropping — the crop tool, its aspect-ratio constraint, and the edge sliders.
-    // A non-full crop trails the tool button with an accent dot, a persistent
-    // "this image is cropped" signal even while the tool is inactive.
+    // Cropping — a header checkbox (with the crop tool icon), its aspect-ratio
+    // constraint, and the edge sliders. A non-full crop trails the tool icon with
+    // an accent dot, a persistent "this image is cropped" signal even while the
+    // tool is inactive.
     let has_crop = session.variants[session.active]
         .current()
         .geometry
         .crop
         .is_some_and(|c| !crop::is_full_frame(c));
-    d |= tool_subsection(
+    let crop_enabled = session.crop_enabled;
+    d |= toggle_tool_subsection(
         session,
         ui,
         "Cropping",
         CanvasTool::Crop,
         "crop",
         has_crop,
+        crop_enabled,
+        set_crop_enabled,
         |session, ui| {
             crop_aspect_row(session, ui);
             widgets::crop_block(ui, &mut session.variants[session.active])
@@ -650,34 +738,169 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
     );
 
     // Straighten — the level tool and its angle.
-    d |= tool_subsection(
+    let straighten_enabled = session.straighten_enabled;
+    d |= toggle_tool_subsection(
         session,
         ui,
         "Straighten",
         CanvasTool::Straighten,
         "straighten",
         false,
+        straighten_enabled,
+        set_straighten_enabled,
         |session, ui| widgets::straighten_slider(ui, &mut session.variants[session.active]),
     );
 
     // Keystone — the perspective tool and its two correction axes.
-    d |= tool_subsection(
+    let keystone_enabled = session.keystone_enabled;
+    d |= toggle_tool_subsection(
         session,
         ui,
         "Keystone",
         CanvasTool::Keystone,
         "keystone",
         false,
+        keystone_enabled,
+        set_keystone_enabled,
         |session, ui| widgets::keystone_block(ui, &mut session.variants[session.active]),
     );
 
-    // Lens — no on-canvas tool; a plain subgroup over the profile enable/label.
-    d |= subsection(ui, "Lens", |ui| lens_block(session, ui));
+    // Lens correction — a single-checkbox subsection (no nested enable): the header
+    // checkbox is the enable, the detected-lens name shows as a small body label.
+    d |= lens_block(session, ui);
 
     // The auto-constrain toggle spans straighten and keystone, so it stays a
     // section-level control rather than living in either subsection.
     d |= auto_constrain_row(session, ui);
     d
+}
+
+/// Enable/disable the crop subsection, keeping the [`Session::crop_enabled`] UI
+/// flag in sync with the develop history. The stash/restore round-trip lives in
+/// [`toggle_crop`]; this wrapper only mirrors the flag onto the session. Returns
+/// whether the preview is now dirty.
+fn set_crop_enabled(session: &mut Session, on: bool) -> bool {
+    session.crop_enabled = on;
+    let history = &mut session.variants[session.active];
+    toggle_crop(history, &mut session.crop_stash, on)
+}
+
+/// Enable/disable the straighten subsection, mirroring [`Session::straighten_enabled`].
+/// The stash/restore lives in [`toggle_straighten`]. Returns dirty.
+fn set_straighten_enabled(session: &mut Session, on: bool) -> bool {
+    session.straighten_enabled = on;
+    let history = &mut session.variants[session.active];
+    toggle_straighten(history, &mut session.straighten_stash, on)
+}
+
+/// Enable/disable the keystone subsection, mirroring [`Session::keystone_enabled`].
+/// The stash/restore lives in [`toggle_keystone`]. Returns dirty.
+fn set_keystone_enabled(session: &mut Session, on: bool) -> bool {
+    session.keystone_enabled = on;
+    let history = &mut session.variants[session.active];
+    toggle_keystone(history, &mut session.keystone_stash, on)
+}
+
+/// Toggle the crop field on/off as **one** undo step, stashing through `stash` so a
+/// toggle is non-destructive within the session. Disabling stashes the current
+/// crop and clears the field (the render then shows the full frame); enabling
+/// restores the stash (or leaves the full frame when nothing was stashed, so the
+/// edge sliders open at `{0,0,1,1}`). The stash is UI state, not history, so it is
+/// passed in rather than recorded in a step. Returns whether the field changed.
+fn toggle_crop(
+    history: &mut History<Settings>,
+    stash: &mut Option<latent_edit::Crop>,
+    on: bool,
+) -> bool {
+    if on {
+        match stash.take() {
+            Some(crop) => {
+                history.begin();
+                history.current_mut().geometry.crop = Some(crop);
+                history.commit();
+                true
+            }
+            None => false,
+        }
+    } else {
+        *stash = history.current().geometry.crop;
+        if stash.is_none() {
+            return false;
+        }
+        history.begin();
+        history.current_mut().geometry.crop = None;
+        history.commit();
+        true
+    }
+}
+
+/// Toggle the straighten angle on/off as one undo step, stashing through `stash`.
+/// Disabling stashes the angle and levels it to `0`; enabling restores the stashed
+/// angle (a `0` or absent stash is a no-op). Returns whether the angle changed.
+fn toggle_straighten(history: &mut History<Settings>, stash: &mut Option<f32>, on: bool) -> bool {
+    if on {
+        match stash.take() {
+            Some(deg) if deg != 0.0 => {
+                history.begin();
+                history.current_mut().geometry.straighten_degrees = deg;
+                history.commit();
+                true
+            }
+            _ => false,
+        }
+    } else {
+        let deg = history.current().geometry.straighten_degrees;
+        *stash = Some(deg);
+        if deg == 0.0 {
+            return false;
+        }
+        history.begin();
+        history.current_mut().geometry.straighten_degrees = 0.0;
+        history.commit();
+        true
+    }
+}
+
+/// Toggle the keystone perspective on/off as one undo step, stashing through
+/// `stash`. Disabling stashes the perspective and clears it; enabling restores the
+/// stash. Returns whether the field changed.
+fn toggle_keystone(
+    history: &mut History<Settings>,
+    stash: &mut Option<latent_edit::Perspective>,
+    on: bool,
+) -> bool {
+    if on {
+        match stash.take() {
+            Some(p) => {
+                history.begin();
+                history.current_mut().geometry.perspective = Some(p);
+                history.commit();
+                true
+            }
+            None => false,
+        }
+    } else {
+        *stash = history.current().geometry.perspective;
+        if stash.is_none() {
+            return false;
+        }
+        history.begin();
+        history.current_mut().geometry.perspective = None;
+        history.commit();
+        true
+    }
+}
+
+/// Seed each toggleable geometry transform's enable flag from the loaded settings:
+/// a transform present in the sidecar opens enabled, an absent one disabled. The
+/// single place the seeding rule lives, so [`Session::from_data`] and the test
+/// share one definition. Returns `(crop, straighten, keystone)` enabled flags.
+pub(crate) fn geometry_enabled_from(geometry: &latent_edit::Geometry) -> (bool, bool, bool) {
+    (
+        geometry.crop.is_some(),
+        geometry.straighten_degrees != 0.0,
+        geometry.perspective.is_some(),
+    )
 }
 
 /// The auto-constrain toggle: trim the straighten/keystone border wedges to the
@@ -724,4 +947,113 @@ fn crop_aspect_row(session: &mut Session, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use latent_edit::{Crop, Geometry, Perspective, Settings};
+
+    /// A settings value carrying every toggleable geometry transform at a non-off
+    /// value, for the seeding and stash/restore round-trip tests.
+    fn settings_with_all_geometry() -> Settings {
+        Settings {
+            geometry: Geometry {
+                crop: Some(Crop {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.8,
+                    height: 0.8,
+                }),
+                straighten_degrees: 5.0,
+                perspective: Some(Perspective {
+                    vertical: 0.2,
+                    horizontal: 0.0,
+                }),
+                ..Geometry::default()
+            },
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn geometry_flags_seed_from_loaded_settings() {
+        // A sidecar with all three transforms set opens with all three enabled.
+        let (c, s, k) = geometry_enabled_from(&settings_with_all_geometry().geometry);
+        assert!(c && s && k, "all present transforms seed enabled");
+        // A neutral (default) geometry opens with all three disabled.
+        let (c, s, k) = geometry_enabled_from(&Geometry::default());
+        assert!(!c && !s && !k, "absent transforms seed disabled");
+        // Each transform seeds independently of the others.
+        let only_crop = Geometry {
+            crop: Some(Crop {
+                x: 0.0,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0,
+            }),
+            ..Geometry::default()
+        };
+        assert_eq!(geometry_enabled_from(&only_crop), (true, false, false));
+    }
+
+    #[test]
+    fn toggle_crop_stash_restore_is_non_destructive() {
+        let mut h = History::new(settings_with_all_geometry());
+        let crop = h.current().geometry.crop;
+        let mut stash = None;
+        // Disabling stashes the crop and clears the field as one undo step.
+        assert!(toggle_crop(&mut h, &mut stash, false));
+        assert_eq!(h.current().geometry.crop, None, "field cleared");
+        assert_eq!(stash, crop, "value stashed");
+        assert_eq!(h.undo_len(), 1, "disabling is one undo step");
+        // Re-enabling restores the exact stashed value, also one step.
+        assert!(toggle_crop(&mut h, &mut stash, true));
+        assert_eq!(h.current().geometry.crop, crop, "value restored");
+        assert_eq!(stash, None, "stash consumed");
+        assert_eq!(h.undo_len(), 2, "enabling is a second undo step");
+    }
+
+    #[test]
+    fn toggle_straighten_stash_restore_round_trips() {
+        let mut h = History::new(settings_with_all_geometry());
+        let mut stash = None;
+        assert!(toggle_straighten(&mut h, &mut stash, false));
+        assert_eq!(h.current().geometry.straighten_degrees, 0.0, "leveled");
+        assert_eq!(stash, Some(5.0), "angle stashed");
+        assert!(toggle_straighten(&mut h, &mut stash, true));
+        assert_eq!(h.current().geometry.straighten_degrees, 5.0, "restored");
+        assert_eq!(stash, None);
+    }
+
+    #[test]
+    fn toggle_keystone_stash_restore_round_trips() {
+        let mut h = History::new(settings_with_all_geometry());
+        let p = h.current().geometry.perspective;
+        let mut stash = None;
+        assert!(toggle_keystone(&mut h, &mut stash, false));
+        assert_eq!(h.current().geometry.perspective, None, "cleared");
+        assert_eq!(stash, p, "stashed");
+        assert!(toggle_keystone(&mut h, &mut stash, true));
+        assert_eq!(h.current().geometry.perspective, p, "restored");
+        assert_eq!(stash, None);
+    }
+
+    #[test]
+    fn enabling_a_neutral_transform_records_no_step() {
+        // Enabling at a neutral value (an empty stash) shows the body but changes
+        // no settings, so it records no undo step — the flag alone (UI state) holds
+        // the intent. Disabling a neutral straighten likewise records nothing.
+        let mut h = History::new(Settings::default());
+        let mut crop_stash = None;
+        assert!(
+            !toggle_crop(&mut h, &mut crop_stash, true),
+            "no value to set"
+        );
+        assert_eq!(h.undo_len(), 0, "enabling at neutral records nothing");
+        let mut straight_stash = None;
+        assert!(!toggle_straighten(&mut h, &mut straight_stash, false));
+        assert_eq!(straight_stash, Some(0.0), "neutral angle stashed");
+        assert_eq!(h.undo_len(), 0, "disabling a level angle records nothing");
+    }
 }

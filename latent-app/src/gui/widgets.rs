@@ -15,9 +15,9 @@
 
 use eframe::egui;
 use latent_edit::{
-    Adjustments, Brush, ChannelMixer, ColorRange, Crop, Curves, Gradient, History, Hsl,
-    LocalAdjustment, LuminanceRange, Mask, MaskOp, MaskShape, Perspective, Radial, SelectiveTone,
-    Settings, WhiteBalance,
+    Adjustments, Brush, ChannelMixer, Clarity, ColorRange, Crop, Curves, Gradient, History, Hsl,
+    LocalAdjustment, LuminanceRange, Mask, MaskOp, MaskShape, NoiseReduction, Perspective, Radial,
+    SelectiveTone, Settings, Sharpen, WhiteBalance,
 };
 
 use super::state::clamp_selection;
@@ -391,11 +391,36 @@ pub(crate) fn curves_block(
         .on_hover_text("Master and per-channel tone curves; drag the five points")
         .changed()
     {
-        history.begin();
-        access.get_mut(history.current_mut()).curves = enabled.then(Curves::default);
-        history.commit();
-        dirty = true;
+        dirty |= set_curves_enabled(history, access, enabled);
     }
+    dirty | curves_body(ui, history, channel, access)
+}
+
+/// Flip `Adjustments.curves` on (a neutral identity [`Curves`]) or off (`None`) as
+/// **one** undo step. The single place the curves enable is written, shared by the
+/// inline checkbox (the local surface) and the controls-panel header toggle.
+pub(crate) fn set_curves_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).curves = enabled.then(Curves::default);
+    history.commit();
+    true
+}
+
+/// The curve editor controls only (channel picker + the draggable graph), assuming
+/// curves are enabled — a no-op when off. Split from [`curves_block`] so the
+/// controls-panel header can own the enable checkbox while the body renders the
+/// same editor.
+pub(crate) fn curves_body(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    channel: &mut usize,
+    access: impl AdjustAccess,
+) -> bool {
+    let mut dirty = false;
     if access.get(history.current()).curves.is_none() {
         return dirty;
     }
@@ -553,6 +578,60 @@ fn tone_fields(
         ("Shadows", "Open or deepen the darks", sg, ss),
         ("Blacks", "The darkest tones", bg, bs),
     ]
+}
+
+/// Flip `Adjustments.sharpen` on (a [`Sharpen`] default — amount `0`, a sensible
+/// radius, so it is a no-op until raised) or off (`None`) as **one** undo step.
+/// The single place the controls-panel header toggle writes the sharpen enable.
+pub(crate) fn set_sharpen_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).sharpen = enabled.then(Sharpen::default);
+    history.commit();
+    true
+}
+
+/// Flip `Adjustments.clarity` on (a [`Clarity`] default — amount `0`, a broad
+/// radius, a no-op until raised) or off (`None`) as **one** undo step.
+pub(crate) fn set_clarity_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).clarity = enabled.then(Clarity::default);
+    history.commit();
+    true
+}
+
+/// Flip `Adjustments.dehaze` on (`Some(0.0)`, a no-op until raised) or off (`None`)
+/// as **one** undo step.
+pub(crate) fn set_dehaze_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).dehaze = enabled.then_some(0.0);
+    history.commit();
+    true
+}
+
+/// Flip `Adjustments.noise_reduction` on (a [`NoiseReduction`] default — both
+/// strengths `0`, a small radius, a no-op until raised) or off (`None`) as **one**
+/// undo step.
+pub(crate) fn set_noise_reduction_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).noise_reduction = enabled.then(NoiseReduction::default);
+    history.commit();
+    true
 }
 
 /// Sharpening: amount/radius sliders editing one optional adjustment, sharing one
@@ -806,19 +885,40 @@ pub(crate) fn hsl_block(
         .on_hover_text("Per-hue-band hue/saturation/lightness")
         .changed()
     {
-        history.begin();
-        access.get_mut(history.current_mut()).hsl = enabled.then(Hsl::default);
-        history.commit();
-        dirty = true;
+        dirty |= set_hsl_enabled(history, access, enabled);
     }
+    dirty | hsl_body(ui, history, access)
+}
+
+/// Flip `Adjustments.hsl` on (a neutral all-zero [`Hsl`]) or off (`None`) as **one**
+/// undo step. The single place the HSL enable is written, shared by the inline
+/// checkbox (the local surface) and the controls-panel header toggle.
+pub(crate) fn set_hsl_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).hsl = enabled.then(Hsl::default);
+    history.commit();
+    true
+}
+
+/// The eight HSL band rows only, assuming HSL is enabled — a no-op when off. Split
+/// from [`hsl_block`] so the controls-panel header can own the enable checkbox.
+pub(crate) fn hsl_body(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
     if access.get(history.current()).hsl.is_none() {
-        return dirty;
+        return false;
     }
     let mut scope = GestureScope::default();
     for band in 0..8 {
         hsl_band_row(ui, history, &mut scope, access, band);
     }
-    dirty | scope.finish(history)
+    scope.finish(history)
 }
 
 /// The channel mixer: an enable checkbox over `Adjustments.channel_mixer`
@@ -840,11 +940,36 @@ pub(crate) fn channel_mixer_block(
         .on_hover_text("Mix each output channel from the input R/G/B")
         .changed()
     {
-        history.begin();
-        access.get_mut(history.current_mut()).channel_mixer = enabled.then(ChannelMixer::default);
-        history.commit();
-        dirty = true;
+        dirty |= set_channel_mixer_enabled(history, access, enabled);
     }
+    dirty | channel_mixer_body(ui, history, access)
+}
+
+/// Flip `Adjustments.channel_mixer` on (the identity [`ChannelMixer`], a no-op) or
+/// off (`None`) as **one** undo step. The single place the channel-mixer enable is
+/// written, shared by the inline checkbox (the local surface) and the
+/// controls-panel header toggle.
+pub(crate) fn set_channel_mixer_enabled(
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+    enabled: bool,
+) -> bool {
+    history.begin();
+    access.get_mut(history.current_mut()).channel_mixer = enabled.then(ChannelMixer::default);
+    history.commit();
+    true
+}
+
+/// The channel-mixer matrix controls only (the nine input-weight sliders plus the
+/// preserve-luminosity toggle), assuming the mixer is enabled — a no-op when off.
+/// Split from [`channel_mixer_block`] so the controls-panel header can own the
+/// enable checkbox.
+pub(crate) fn channel_mixer_body(
+    ui: &mut egui::Ui,
+    history: &mut History<Settings>,
+    access: impl AdjustAccess,
+) -> bool {
+    let mut dirty = false;
     let base = match access.get(history.current()).channel_mixer {
         Some(m) => m,
         None => return dirty,
@@ -1021,9 +1146,24 @@ pub(crate) fn straighten_slider(ui: &mut egui::Ui, history: &mut History<Setting
     )
 }
 
-/// Creative vignette applied after the crop: negative darkens the corners,
-/// positive lightens them. Zero clears it (back to `None`).
-pub(crate) fn vignette_slider(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
+/// Flip `geometry.vignette` on (`Some(0.0)`, a no-op until dragged) or off (`None`)
+/// as **one** undo step. The single place the controls-panel header toggle writes
+/// the vignette enable.
+pub(crate) fn set_vignette_enabled(history: &mut History<Settings>, enabled: bool) -> bool {
+    history.begin();
+    history.current_mut().geometry.vignette = enabled.then_some(0.0);
+    history.commit();
+    true
+}
+
+/// The vignette amount slider only, assuming the effect is enabled (the header
+/// checkbox owns the on/off). Negative darkens the corners, positive lightens
+/// them. The header owns `None`, so the slider keeps the value `Some` even at the
+/// neutral `0` rather than clearing it (which would fight the checkbox).
+pub(crate) fn vignette_body(ui: &mut egui::Ui, history: &mut History<Settings>) -> bool {
+    if history.current().geometry.vignette.is_none() {
+        return false;
+    }
     opt_point_slider(
         ui,
         history,
@@ -1034,7 +1174,10 @@ pub(crate) fn vignette_slider(ui: &mut egui::Ui, history: &mut History<Settings>
             help: "Darken or lighten the corners",
         },
         |s| s.geometry.vignette,
-        |s, v| s.geometry.vignette = v.filter(|&a| a != 0.0),
+        // A double-click resets the slider to None (off); a plain drag keeps it
+        // Some even at 0, so the header checkbox stays checked while dragging
+        // through neutral.
+        |s, v| s.geometry.vignette = v,
     )
 }
 
