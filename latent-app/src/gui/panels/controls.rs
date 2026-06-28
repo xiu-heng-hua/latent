@@ -601,13 +601,13 @@ impl VisCtx<'_> {
     /// returns the (possibly flipped) state to use this frame. Pure UI — toggling
     /// it never touches the image. Styled like the per-section reset icon-button.
     fn eye_button(&mut self, ui: &mut egui::Ui, id: &'static str, shown: bool) -> bool {
-        let (name, tip) = if shown {
-            ("eye", "Hide these controls")
+        let tip = if shown {
+            "Hide these controls"
         } else {
-            ("eye_off", "Show these controls")
+            "Show these controls"
         };
         let mut now = shown;
-        if crate::gui::icons::icon_button(ui, true, name, tip).clicked() {
+        if crate::gui::icons::eye_toggle(ui, shown, tip).clicked() {
             now = !shown;
             self.toggles.push((id, now));
         }

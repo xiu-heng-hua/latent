@@ -37,8 +37,6 @@ pub(crate) fn icon(name: &str) -> char {
         "info" => '\u{e2ce}',       // info
         "image" => '\u{e2ca}',      // image
         "quit" => '\u{e42a}',       // sign-out
-        "eye" => '\u{e1fc}',        // eye
-        "eye_off" => '\u{e200}',    // eye-slash
         _ => '\u{e2ce}',            // info, as a visible fallback
     }
 }
@@ -70,8 +68,6 @@ const ICON_NAMES: &[&str] = &[
     "info",
     "image",
     "quit",
-    "eye",
-    "eye_off",
 ];
 
 /// Build a `RichText` for an icon glyph in the icon family at the icon size.
@@ -108,6 +104,63 @@ pub(crate) fn icon_button(
 ) -> egui::Response {
     ui.add_enabled(enabled, egui::Button::new(icon_text(name)))
         .on_hover_text(tooltip)
+}
+
+/// A show/hide toggle drawn as an eye — an open eye (almond outline + pupil) when
+/// `shown`, a closed lid (a downward arc with a few lashes) when hidden. Painted
+/// directly rather than as a font glyph, so it reads clearly at this small size and
+/// the "hidden" state is an unmistakable closed eye. Fixed square size (the row
+/// height), so toggling never shifts the layout. Returns the `Response`; the caller
+/// flips the visibility on a click.
+pub(crate) fn eye_toggle(ui: &mut egui::Ui, shown: bool, tooltip: &str) -> egui::Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let resp = resp
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let vis = ui.style().interact(&resp);
+    let color = vis.fg_stroke.color;
+    let bg = vis.weak_bg_fill;
+    let radius = vis.corner_radius;
+    // A subtle background on hover so it reads as a button like its neighbours.
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, radius, bg);
+    }
+
+    let painter = ui.painter();
+    let c = rect.center();
+    let hw = theme::ICON_SIZE * 0.42;
+    let hh = theme::ICON_SIZE * 0.30;
+    let stroke = egui::Stroke::new(1.4, color);
+    const N: usize = 9;
+    if shown {
+        // Almond outline: the top arc left→right, then the bottom arc right→left,
+        // closed — plus a pupil in the middle.
+        let mut pts = Vec::with_capacity(N * 2);
+        for i in 0..N {
+            let t = -1.0 + 2.0 * i as f32 / (N - 1) as f32;
+            pts.push(egui::pos2(c.x + t * hw, c.y - hh * (1.0 - t * t)));
+        }
+        for i in 0..N {
+            let t = 1.0 - 2.0 * i as f32 / (N - 1) as f32;
+            pts.push(egui::pos2(c.x + t * hw, c.y + hh * (1.0 - t * t)));
+        }
+        painter.add(egui::Shape::closed_line(pts, stroke));
+        painter.circle_filled(c, hh * 0.5, color);
+    } else {
+        // Closed lid: a shallow downward arc with three short lashes below it.
+        let lid = |t: f32| egui::pos2(c.x + t * hw, c.y - hh * 0.25 + hh * 0.65 * (1.0 - t * t));
+        let pts: Vec<egui::Pos2> = (0..N)
+            .map(|i| lid(-1.0 + 2.0 * i as f32 / (N - 1) as f32))
+            .collect();
+        painter.add(egui::Shape::line(pts, stroke));
+        for &t in &[-0.55_f32, 0.0, 0.55] {
+            let base = lid(t);
+            painter.line_segment([base, base + egui::vec2(0.0, hh * 0.5)], stroke);
+        }
+    }
+    resp
 }
 
 #[cfg(test)]
