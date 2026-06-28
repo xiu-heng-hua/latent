@@ -149,6 +149,30 @@ impl<T: Clone + PartialEq> History<T> {
         self.undo.len()
     }
 
+    /// The stored value at timeline position `index` (`0..len()`), without moving
+    /// the current position. Position [`position`](Self::position) is the live
+    /// `current` value; lower indices are retained undo snapshots and higher ones
+    /// retained redo snapshots. Returns `None` for an out-of-range index. This lets
+    /// a read-only view (the history panel) compare adjacent steps to describe what
+    /// each one changed, with no extra stored state.
+    pub fn snapshot(&self, index: usize) -> Option<&T> {
+        let behind = self.undo.len();
+        if index < behind {
+            self.undo.get(index)
+        } else if index == behind {
+            Some(&self.current)
+        } else {
+            // The redo stack is ordered newest-last (its last element is the step
+            // just ahead of `current`), so ascending timeline indices map onto
+            // descending redo indices.
+            let ahead = index - behind; // 1..=redo.len() for a valid index
+            self.redo
+                .len()
+                .checked_sub(ahead)
+                .and_then(|i| self.redo.get(i))
+        }
+    }
+
     /// Navigate to `target` along the `0..len()` timeline, running as many `undo`s
     /// or `redo`s as needed to land there. Built purely on the existing single-step
     /// `undo`/`redo`, so the bounded-undo and redo-clear-on-commit invariants are
@@ -351,6 +375,34 @@ mod tests {
         assert!(h.jump_to(0));
         assert_eq!(h.position(), 0);
         assert_eq!(*h.current(), 0);
+    }
+
+    #[test]
+    fn snapshot_reads_each_timeline_position_without_moving() {
+        // Build a five-position timeline (states 0..=4 at positions 0..=4).
+        let mut h = History::new(0);
+        for v in 1..=4 {
+            edit(&mut h, v);
+        }
+        // At the newest position every index maps to its state value.
+        for i in 0..=4 {
+            assert_eq!(h.snapshot(i), Some(&(i as i32)), "position {i}");
+        }
+        assert_eq!(h.snapshot(5), None, "past the end is None");
+
+        // Undoing does not change the mapping — the forward states are retained on
+        // the redo side and snapshot() reaches them all the same.
+        assert!(h.undo());
+        assert!(h.undo());
+        assert_eq!(h.position(), 2);
+        for i in 0..=4 {
+            assert_eq!(h.snapshot(i), Some(&(i as i32)), "position {i} after undo");
+        }
+        assert_eq!(
+            h.snapshot(2),
+            Some(h.current()),
+            "current is at the position"
+        );
     }
 
     #[test]

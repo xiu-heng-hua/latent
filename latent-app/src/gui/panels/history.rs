@@ -11,9 +11,9 @@ use crate::gui::app::App;
 
 /// Show the history list. Returns whether a jump moved the position (so the caller
 /// re-renders the preview). The steps are full snapshots with no stored action
-/// name, so each is labelled positionally ("Step N"); the current position and the
-/// original ("Open") are marked. Planned: per-step labels would be an additive
-/// parallel list pushed on commit.
+/// name, so each step's label is derived by diffing it against the step before it
+/// (naming the tool and, for single-value controls, its value); the original is
+/// marked "Open". The current position is highlighted.
 pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) -> bool {
     let Some(session) = app.session.as_mut() else {
         return false;
@@ -27,11 +27,15 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) -> bool {
         .max_height(160.0)
         .show(ui, |ui| {
             for index in 0..len {
-                // Index 0 is the original state ("Open"); later indices are edits.
+                // Index 0 is the original state ("Open"); later indices are labelled
+                // by what changed from the step before them.
                 let label = if index == 0 {
                     "Open".to_owned()
                 } else {
-                    format!("Step {index}")
+                    match (history.snapshot(index - 1), history.snapshot(index)) {
+                        (Some(prev), Some(next)) => latent_edit::describe_change(prev, next),
+                        _ => format!("Step {index}"),
+                    }
                 };
                 if ui.selectable_label(index == position, label).clicked() {
                     target = Some(index);
