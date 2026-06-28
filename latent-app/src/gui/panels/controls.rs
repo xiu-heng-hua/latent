@@ -390,6 +390,8 @@ fn subsection<R>(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui
 
 /// A labeled subgroup whose heading also carries a canvas-tool activation button,
 /// so a graphical tool launches from the subsection that owns its controls. The
+/// heading reads left-to-right with the label, while the tool button is pushed to
+/// the right edge of the header row and shown as an icon (named by `icon`). The
 /// button reuses the single tool-activation path ([`Session::set_tool`]): clicking
 /// it switches to `tool`, and clicking it while already active toggles back to the
 /// plain view. The button reads as active (highlighted) while its tool is current,
@@ -400,32 +402,37 @@ fn tool_subsection<R>(
     ui: &mut egui::Ui,
     label: &str,
     tool: crate::gui::tools::CanvasTool,
-    button: &str,
+    icon: &str,
     mark: bool,
     body: impl FnOnce(&mut Session, &mut egui::Ui) -> R,
 ) -> R {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).strong());
-        let active = session.tool == tool;
-        let resp = ui
-            .selectable_label(active, button)
-            .on_hover_text("Edit this on the image");
-        // A trailing accent dot marks the control as in effect even when the tool
-        // is not currently selected.
-        if mark {
-            let dot = resp.rect.right_center() + egui::vec2(3.0, 0.0);
-            ui.painter().circle_filled(dot, 3.0, theme::ACCENT);
-        }
-        if resp.clicked() {
-            // Re-clicking the active tool returns to the plain view.
-            let next = if active {
-                crate::gui::tools::CanvasTool::None
-            } else {
-                tool
-            };
-            session.set_tool(next);
-        }
+        // Push the tool activator to the right edge of the header row.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let active = session.tool == tool;
+            // A trailing accent dot marks the control as in effect even when the
+            // tool is not currently selected. In a right-to-left layout the dot is
+            // laid out first so it lands to the right of the icon.
+            if mark {
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 3.0, theme::ACCENT);
+            }
+            let resp =
+                crate::gui::icons::selectable_icon(ui, active, icon, "Edit this on the image");
+            if resp.clicked() {
+                // Re-clicking the active tool returns to the plain view.
+                let next = if active {
+                    crate::gui::tools::CanvasTool::None
+                } else {
+                    tool
+                };
+                session.set_tool(next);
+            }
+        });
     });
     ui.indent(label, |ui| body(session, ui)).inner
 }
@@ -442,12 +449,18 @@ fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
         .and_then(|l| l.mask.shapes.get(shape_sel).cloned());
     match shape {
         Some(MaskShape::Brush(_)) => {
-            if ui
-                .selectable_label(session.tool == CanvasTool::Brush, "Paint on canvas")
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::gui::icons::selectable_icon(
+                    ui,
+                    session.tool == CanvasTool::Brush,
+                    "brush",
+                    "Paint on the image",
+                )
                 .clicked()
-            {
-                session.set_tool(CanvasTool::Brush);
-            }
+                {
+                    session.set_tool(CanvasTool::Brush);
+                }
+            });
             ui.add(egui::Slider::new(&mut session.brush_radius, 0.01..=0.5).text("Size"))
                 .on_hover_text("Brush radius. 0.01 … 0.5; [ ] resize");
             ui.add(egui::Slider::new(&mut session.brush_feather, 0.0..=0.5).text("Feather"))
@@ -458,12 +471,18 @@ fn local_tool_row(session: &mut Session, ui: &mut egui::Ui) {
         }
         Some(MaskShape::Gradient(_) | MaskShape::Radial(_)) => {
             let active_shape = session.tool == CanvasTool::MaskShape;
-            if ui
-                .selectable_label(active_shape, "Edit shape on canvas")
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::gui::icons::selectable_icon(
+                    ui,
+                    active_shape,
+                    "mask",
+                    "Edit the shape on the image",
+                )
                 .clicked()
-            {
-                session.set_tool(CanvasTool::MaskShape);
-            }
+                {
+                    session.set_tool(CanvasTool::MaskShape);
+                }
+            });
         }
         _ => {}
     }
@@ -622,7 +641,7 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
         ui,
         "Cropping",
         CanvasTool::Crop,
-        "Crop",
+        "crop",
         has_crop,
         |session, ui| {
             crop_aspect_row(session, ui);
@@ -636,7 +655,7 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
         ui,
         "Straighten",
         CanvasTool::Straighten,
-        "Level",
+        "straighten",
         false,
         |session, ui| widgets::straighten_slider(ui, &mut session.variants[session.active]),
     );
@@ -647,7 +666,7 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session) -> bool {
         ui,
         "Keystone",
         CanvasTool::Keystone,
-        "Keystone",
+        "keystone",
         false,
         |session, ui| widgets::keystone_block(ui, &mut session.variants[session.active]),
     );

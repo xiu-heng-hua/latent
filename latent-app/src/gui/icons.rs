@@ -28,6 +28,8 @@ pub(crate) fn icon(name: &str) -> char {
         "zoom_fit" => '\u{e0a2}',   // arrows-out
         "zoom_100" => '\u{e30c}',   // magnifying-glass
         "crop" => '\u{e1d4}',       // crop
+        "straighten" => '\u{e6b8}', // ruler
+        "keystone" => '\u{ebe6}',   // perspective
         "brush" => '\u{e6f0}',      // paint-brush
         "mask" => '\u{e9f4}',       // mask-happy
         "histogram" => '\u{e150}',  // chart-bar
@@ -57,6 +59,8 @@ const ICON_NAMES: &[&str] = &[
     "zoom_fit",
     "zoom_100",
     "crop",
+    "straighten",
+    "keystone",
     "brush",
     "mask",
     "histogram",
@@ -67,11 +71,26 @@ const ICON_NAMES: &[&str] = &[
 ];
 
 /// Build a `RichText` for an icon glyph in the icon family at the icon size.
-fn icon_text(name: &str) -> RichText {
+pub(crate) fn icon_text(name: &str) -> RichText {
     RichText::new(icon(name).to_string()).font(FontId::new(
         theme::ICON_SIZE,
         FontFamily::Name(theme::ICON_FAMILY.into()),
     ))
+}
+
+/// A selectable icon: the glyph rendered in the icon family as a toggle that reads
+/// as active (highlighted) when `selected`, with a hover tooltip. The icon variant
+/// of [`egui::Ui::selectable_label`] for activators that head a control group.
+/// Returns the `Response` so the caller wires its action and can place an accent
+/// mark relative to it.
+pub(crate) fn selectable_icon(
+    ui: &mut egui::Ui,
+    selected: bool,
+    name: &str,
+    tooltip: &str,
+) -> egui::Response {
+    ui.selectable_label(selected, icon_text(name))
+        .on_hover_text(tooltip)
 }
 
 /// An icon button: the glyph rendered in the icon family, with a hover tooltip
