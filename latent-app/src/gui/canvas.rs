@@ -273,12 +273,7 @@ pub(crate) fn color_image_from_srgb8(
 /// changes only the area *around* the photo — the texture bytes are drawn
 /// unaltered.
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
-    // No inner margin: the surround fills the canvas edge-to-edge, and the content
-    // is clipped to the full panel (not an inset rect that would cut handles drawn
-    // at the image edge in half).
-    let surround = egui::Frame::central_panel(&ctx.style())
-        .fill(theme::CANVAS_SURROUND)
-        .inner_margin(egui::Margin::ZERO);
+    let surround = egui::Frame::central_panel(&ctx.style()).fill(theme::CANVAS_SURROUND);
 
     // The canvas runs only with an open session (the welcome state owns the
     // central panel otherwise).
@@ -322,10 +317,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             let region = active_region(session);
 
             // While a geometry tool is active, fit into an inset region so the
-            // crop/keystone handles at the image edges sit inside the canvas rather
-            // than clipped at its border. The surround still fills the whole panel,
-            // and the content is clipped to the whole panel, so the handles in the
-            // margin are visible.
+            // crop/keystone handles at the image edges sit inside the content area,
+            // clear of the surround border, rather than being clipped at its edge.
             let fit_panel = if session.tool.is_geometry() {
                 panel.shrink(theme::GEOMETRY_TOOL_MARGIN)
             } else {
