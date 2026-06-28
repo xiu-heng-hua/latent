@@ -1334,7 +1334,7 @@ mod tests {
                     amount: 0.8,
                     radius: 2.0,
                 }),
-                // Exercise the Epic P tools too, so the GPU backend's CPU-fallback
+                // Exercise the detail tools too, so the GPU backend's CPU-fallback
                 // wiring for them (dehaze, denoise are CPU; clarity's base blur runs
                 // on the GPU) is regression-tested, not just compiled.
                 clarity: Some(Clarity {

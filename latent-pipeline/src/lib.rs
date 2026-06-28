@@ -320,7 +320,7 @@ impl Warp {
     /// focal-normalized frame). For the even models this solves `r_out = r_src·(1 +
     /// …)` for `r_src` by a few Newton steps — the radius is monotone over the
     /// image, so it converges to sub-pixel in two or three. PTLENS instead applies
-    /// the forward (`Dist`) multiply directly, the register's decision for it.
+    /// the forward (`Dist`) multiply directly, which is the chosen behavior for it.
     fn undistort_ratio(&self, r_out: f32) -> f32 {
         if r_out == 0.0 {
             return 1.0;
@@ -3791,7 +3791,7 @@ mod tests {
     fn ptlens_uses_the_direct_multiply() {
         // PTLENS keeps the direct radial multiply (no Newton): the source radius
         // is exactly r_d = r·(1 + c·r + b·r² + a·r³) evaluated at the output
-        // radius. This pins the register's decision to leave PTLENS direct.
+        // radius. This pins the chosen behavior of leaving PTLENS direct.
         let (cx, cy) = (100.0_f32, 100.0_f32);
         let inv_norm = 1.0 / 100.0;
         let radial = [0.02, -0.01, 0.005, 0.0];
