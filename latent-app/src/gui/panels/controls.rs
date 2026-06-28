@@ -432,19 +432,14 @@ fn section(
                 .on_hover_text(id.help());
             // Push the reset/indicator to the right edge of the header row.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The reset button is enabled only when the section differs from
+                // its defaults, so its enabled state is itself the "modified"
+                // indicator — no separate dot that would shift the header.
                 if crate::gui::icons::icon_button(ui, modified, "undo", "Reset this section")
                     .clicked()
                 {
                     reset_section(&mut session.variants[session.active], id);
                     dirty = true;
-                }
-                if modified {
-                    // A subtle dot on the header so a collapsed section still
-                    // shows it holds edits.
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(rect.center(), 3.0, theme::ACCENT);
                 }
             });
         })
@@ -571,8 +566,7 @@ fn toggle_subsection(
 /// (flipping it calls `on_toggle(now)`, one undo step in the caller); the tool icon
 /// sits at the right edge of the same row and reuses the single tool-activation
 /// path ([`Session::set_tool`]) — clicking it switches to `tool`, clicking it while
-/// already active toggles back to the plain view — with an in-effect accent dot
-/// trailing it when `mark` is set. The eye button (rightmost) owns the body's
+/// already active toggles back to the plain view. The eye button (rightmost) owns the body's
 /// **visibility** — pure UI, no image effect — independent of the enable: the body
 /// is rendered whenever the subsection is shown, and when shown-but-disabled it is
 /// greyed and non-interactive so toggling the checkbox never moves the layout.
@@ -586,7 +580,6 @@ fn toggle_tool_subsection(
     label: &str,
     tool: crate::gui::tools::CanvasTool,
     icon: &str,
-    mark: bool,
     enabled: bool,
     on_toggle: impl FnOnce(&mut Session, bool) -> bool,
     body: impl FnOnce(&mut Session, &mut egui::Ui) -> bool,
@@ -606,15 +599,6 @@ fn toggle_tool_subsection(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let now_shown = vis.eye_button(ui, id, shown);
                 let active = session.tool == tool;
-                // A trailing accent dot marks the control as in effect even when the
-                // tool is not currently selected. In a right-to-left layout the dot
-                // is laid out before the icon so it lands to the right of it.
-                if mark {
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot_rect.center(), 3.0, theme::ACCENT);
-                }
                 let resp =
                     crate::gui::icons::selectable_icon(ui, active, icon, "Edit this on the image");
                 if resp.clicked() {
@@ -855,18 +839,12 @@ fn lens_display_name(meta: &latent_raw::Metadata) -> String {
 /// keystone leaves, sits at the foot of the section since it spans both. Returns
 /// whether any control marked the preview dirty.
 fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> bool {
-    use crate::gui::tools::{CanvasTool, crop};
+    use crate::gui::tools::CanvasTool;
     let mut d = false;
 
     // Cropping — a header checkbox (with the crop tool icon), its aspect-ratio
-    // constraint, and the edge sliders. A non-full crop trails the tool icon with
-    // an accent dot, a persistent "this image is cropped" signal even while the
-    // tool is inactive.
-    let has_crop = session.variants[session.active]
-        .current()
-        .geometry
-        .crop
-        .is_some_and(|c| !crop::is_full_frame(c));
+    // constraint, and the edge sliders. The enable checkbox is itself the
+    // "this image is cropped" signal, so no separate indicator is needed.
     let crop_enabled = session.crop_enabled;
     d |= toggle_tool_subsection(
         session,
@@ -876,7 +854,6 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         "Cropping",
         CanvasTool::Crop,
         "crop",
-        has_crop,
         crop_enabled,
         set_crop_enabled,
         |session, ui| {
@@ -895,7 +872,6 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         "Straighten",
         CanvasTool::Straighten,
         "straighten",
-        false,
         straighten_enabled,
         set_straighten_enabled,
         |session, ui| widgets::straighten_slider(ui, &mut session.variants[session.active]),
@@ -911,7 +887,6 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         "Keystone",
         CanvasTool::Keystone,
         "keystone",
-        false,
         keystone_enabled,
         set_keystone_enabled,
         |session, ui| widgets::keystone_block(ui, &mut session.variants[session.active]),
