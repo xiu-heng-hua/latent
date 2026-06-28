@@ -302,10 +302,8 @@ fn crop_interact(
         && let Some(CanvasDrag::Crop(grab, start)) = session.drag
         && let Some(p) = pointer_norm(resp, transform)
     {
-        let ratio = session
-            .crop_aspect_locked
-            .then(|| session.crop_aspect.visual_ratio(session.displayed_aspect()))
-            .flatten();
+        // The selected aspect ratio is the constraint; `Free` yields `None`.
+        let ratio = session.crop_aspect.visual_ratio(session.displayed_aspect());
         let c = crop::apply_drag(start, grab, p, ratio, session.displayed_aspect());
         crop::write_crop(&mut session.variants[active], c);
         changed = true;

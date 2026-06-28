@@ -698,7 +698,8 @@ fn auto_constrain_row(session: &mut Session, ui: &mut egui::Ui) -> bool {
     false
 }
 
-/// The crop aspect-ratio presets + lock toggle.
+/// The crop aspect-ratio presets. The selected ratio constrains the rectangle
+/// directly; `Free` leaves it unconstrained (no separate lock).
 fn crop_aspect_row(session: &mut Session, ui: &mut egui::Ui) {
     use crate::gui::tools::crop;
     let active = session.active;
@@ -722,6 +723,5 @@ fn crop_aspect_row(session: &mut Session, ui: &mut egui::Ui) {
                 }
             }
         }
-        ui.checkbox(&mut session.crop_aspect_locked, "Lock");
     });
 }

@@ -239,9 +239,9 @@ pub(crate) struct Session {
     /// image stationary while crop handles drag: the view does not re-scale every
     /// frame as the crop changes. `None` fits the whole image.
     pub(crate) fit_region: Option<egui::Rect>,
-    /// Crop tool UI state.
+    /// Crop tool UI state. The selected aspect ratio is the constraint
+    /// (`AspectRatio::Free` leaves the rectangle unconstrained).
     pub(crate) crop_aspect: AspectRatio,
-    pub(crate) crop_aspect_locked: bool,
     pub(crate) crop_thirds: bool,
     /// Mask-overlay visualization mode and its cached coverage texture.
     pub(crate) overlay_mode: OverlayMode,
@@ -306,7 +306,6 @@ impl Session {
             straighten_line: None,
             fit_region: None,
             crop_aspect: AspectRatio::default(),
-            crop_aspect_locked: false,
             crop_thirds: true,
             overlay_mode: OverlayMode::default(),
             overlay_cache: OverlayCache::default(),
