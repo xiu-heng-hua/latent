@@ -85,6 +85,9 @@ pub(crate) const SLIDER_NUMERIC_WIDTH: f32 = 56.0;
 /// Fixed width of a crop cell's px/% unit toggle button. Wide enough to fit both
 /// "px" and "%" so toggling the unit never shifts the surrounding layout.
 pub(crate) const CROP_UNIT_BUTTON_WIDTH: f32 = 26.0;
+/// Fixed width of a crop cell's numeric entry, so the grid columns line up and
+/// don't shift as the digit count changes.
+pub(crate) const CROP_FIELD_WIDTH: f32 = 52.0;
 /// The curve editor's drawing area (max width × fixed height).
 pub(crate) const CURVE_EDITOR_SIZE: egui::Vec2 = egui::vec2(220.0, 160.0);
 

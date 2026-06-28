@@ -1313,21 +1313,20 @@ fn crop_cell(
     };
     ui.label(label);
     // Range and precision follow the unit: whole pixels up to the dimension, or a
-    // single-decimal percent up to 100.
-    let drag = match *unit {
-        CropUnit::Px => ui.add(
-            egui::DragValue::new(&mut shown)
-                .range(0.0..=dim as f32)
-                .speed(1.0)
-                .fixed_decimals(0),
-        ),
-        CropUnit::Pct => ui.add(
-            egui::DragValue::new(&mut shown)
-                .range(0.0..=100.0)
-                .speed(0.25)
-                .fixed_decimals(1),
-        ),
+    // single-decimal percent up to 100. A fixed-width field keeps the grid columns
+    // aligned and stops the number jittering as its digit count changes.
+    let dv = match *unit {
+        CropUnit::Px => egui::DragValue::new(&mut shown)
+            .range(0.0..=dim as f32)
+            .speed(1.0)
+            .fixed_decimals(0),
+        CropUnit::Pct => egui::DragValue::new(&mut shown)
+            .range(0.0..=100.0)
+            .speed(0.25)
+            .fixed_decimals(1),
     };
+    let field_size = egui::vec2(theme::CROP_FIELD_WIDTH, ui.spacing().interact_size.y);
+    let drag = ui.add_sized(field_size, dv);
     // A fixed-width unit button so toggling "px"↔"%" never shifts the layout
     // (FRONTEND.md: the UI must not move when a button is clicked).
     if ui
@@ -1387,26 +1386,34 @@ pub(crate) fn crop_block(
         ("Width", |c| c.width, |c, v| c.width = v, image_w),
         ("Height", |c| c.height, |c, v| c.height = v, image_h),
     ];
-    // Two rows of two cells: Left|Top, then Width|Height.
-    for row in 0..2 {
-        ui.horizontal(|ui| {
-            for col in 0..2 {
-                let i = row * 2 + col;
-                let (label, getc, setc, dim) = cells[i];
-                crop_cell(
-                    ui,
-                    history,
-                    &mut scope,
-                    base,
-                    label,
-                    &mut units[i],
-                    dim,
-                    getc,
-                    setc,
-                );
-            }
-        });
-    }
+    // A real grid (Left|Top on the first row, Width|Height on the second) so the
+    // label, number, and unit columns line up; centered in the panel. Each cell
+    // emits three widgets (label, number, unit) = six aligned columns.
+    ui.vertical_centered(|ui| {
+        egui::Grid::new("crop_grid")
+            .num_columns(6)
+            .spacing(egui::vec2(8.0, 4.0))
+            .show(ui, |ui| {
+                for row in 0..2 {
+                    for col in 0..2 {
+                        let i = row * 2 + col;
+                        let (label, getc, setc, dim) = cells[i];
+                        crop_cell(
+                            ui,
+                            history,
+                            &mut scope,
+                            base,
+                            label,
+                            &mut units[i],
+                            dim,
+                            getc,
+                            setc,
+                        );
+                    }
+                    ui.end_row();
+                }
+            });
+    });
     scope.finish(history)
 }
 
