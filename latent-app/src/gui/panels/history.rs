@@ -50,9 +50,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) -> bool {
                 // Index 0 is the original state ("Open"); later steps are titled by
                 // what changed from the step before them.
                 let summary = if index == 0 {
+                    // The baseline step: the image as first loaded. Its useful detail
+                    // is the source resolution, so the "Open" card reads like the rest.
                     ChangeSummary {
                         title: "Open".to_owned(),
-                        detail: String::new(),
+                        detail: format!("{} × {} px", session.full.width(), session.full.height()),
                     }
                 } else {
                     let h = &session.variants[active];
