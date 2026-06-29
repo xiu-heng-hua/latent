@@ -156,6 +156,12 @@ pub(crate) struct Session {
     /// Cached tiny thumbnail per variant, parallel to `variants`. `None` until
     /// rendered; invalidated (set back to `None`) when a variant's settings change.
     pub(crate) thumbs: Vec<Option<VariantThumb>>,
+    /// Cached tiny thumbnail per history step of the *active* variant, indexed by
+    /// timeline position. Each entry records the settings it was rendered for, so a
+    /// position whose content still matches is reused and one that changed (a new
+    /// commit, an eviction) is re-rendered on next access. Rendered lazily, only for
+    /// the steps actually visible in the history list.
+    pub(crate) step_thumbs: Vec<Option<VariantThumb>>,
     /// Index of the variant currently being edited and previewed.
     pub(crate) active: usize,
     /// Sidecar path (`<raw>.ron`) the document auto-saves to.
@@ -309,6 +315,7 @@ impl Session {
             variants: data.variants,
             names: data.names,
             thumbs: (0..variant_count).map(|_| None).collect(),
+            step_thumbs: Vec::new(),
             active: 0,
             sidecar: data.sidecar,
             saved: data.saved,
@@ -1637,6 +1644,52 @@ impl Session {
                 texture,
                 rendered_for: settings,
             });
+        }
+    }
+
+    /// Ensure history step `index` (of the active variant) has an up-to-date
+    /// thumbnail and return its texture id. Renders over the tiny [`thumb_base`]
+    /// through the **same** transform as the preview, only when the cached entry is
+    /// missing or its settings no longer match `settings` (a new commit or an
+    /// eviction shifted what sits at this index). Called only for steps visible in
+    /// the history list, so the work stays bounded regardless of history depth.
+    ///
+    /// [`thumb_base`]: Self::thumb_base
+    pub(crate) fn ensure_step_thumb(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+        settings: &Settings,
+        backend: &dyn Backend,
+    ) -> egui::TextureId {
+        if self.step_thumbs.len() <= index {
+            self.step_thumbs.resize_with(index + 1, || None);
+        }
+        let fresh = self.step_thumbs[index]
+            .as_ref()
+            .is_some_and(|t| &t.rendered_for == settings);
+        if !fresh {
+            let rendered = render(&self.thumb_base, settings, backend);
+            let color = canvas::to_color_image(&rendered);
+            let texture = ctx.load_texture(
+                format!("step_thumb_{index}"),
+                color,
+                egui::TextureOptions::default(),
+            );
+            self.step_thumbs[index] = Some(VariantThumb {
+                texture,
+                rendered_for: settings.clone(),
+            });
+        }
+        self.step_thumbs[index].as_ref().unwrap().texture.id()
+    }
+
+    /// Drop cached step thumbnails past `len` (the active variant's current history
+    /// length), so a shorter history after an undo-then-edit doesn't keep stale
+    /// previews around. Cheap; called once per history-panel frame.
+    pub(crate) fn trim_step_thumbs(&mut self, len: usize) {
+        if self.step_thumbs.len() > len {
+            self.step_thumbs.truncate(len);
         }
     }
 

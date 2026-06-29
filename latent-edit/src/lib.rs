@@ -7,8 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod describe;
-pub use describe::describe_change;
 pub mod history;
 pub use history::History;
 

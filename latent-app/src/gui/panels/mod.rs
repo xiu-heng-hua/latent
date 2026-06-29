@@ -4,6 +4,7 @@
 
 pub(crate) mod controls;
 pub(crate) mod history;
+pub(crate) mod history_summary;
 pub(crate) mod menubar;
 pub(crate) mod presets;
 pub(crate) mod sections;
