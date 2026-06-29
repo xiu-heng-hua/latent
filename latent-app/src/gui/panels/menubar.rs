@@ -81,29 +81,9 @@ pub(crate) fn show(
                     ui.close();
                 }
                 ui.separator();
-                // Copy the active variant's settings to the in-app clipboard;
-                // Paste applies the develop part (global + locals), keeping the
-                // target's geometry. Reset returns the develop to neutral, geometry
-                // kept. Each routes through the shared App methods the shortcuts use.
+                // Reset returns the develop to neutral, keeping geometry. Routes
+                // through the shared App method the shortcut uses.
                 let has_session = app.session().is_some();
-                if ui
-                    .add_enabled(has_session && can_edit, egui::Button::new("Copy settings"))
-                    .clicked()
-                {
-                    app.copy_settings();
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(
-                        app.can_paste() && can_edit,
-                        egui::Button::new("Paste settings"),
-                    )
-                    .on_hover_text("Apply the copied develop look (keeps this image's geometry)")
-                    .clicked()
-                {
-                    *dirty |= app.paste_settings();
-                    ui.close();
-                }
                 if ui
                     .add_enabled(
                         has_session && can_edit,

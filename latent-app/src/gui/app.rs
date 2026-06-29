@@ -700,7 +700,6 @@ pub fn run(
                 about_open: false,
                 show_hint,
                 pending_backend: None,
-                clipboard: None,
                 preset_name_input: String::new(),
                 preview_spawned_for: None,
             };
@@ -785,9 +784,6 @@ pub struct App {
     /// always finishes on the backend it started with. `None` when no switch is
     /// pending.
     pub(crate) pending_backend: Option<bool>,
-    /// The develop-settings clipboard: the last copied variant settings, applied by
-    /// Paste. Process-local UI state — not the OS clipboard, not persisted.
-    pub(crate) clipboard: Option<Settings>,
     /// The in-progress preset name being typed in the presets block. Held here so
     /// the field keeps its text across frames; cleared after a save.
     pub(crate) preset_name_input: String,
@@ -1391,11 +1387,6 @@ impl App {
             Action::Redo => self.session.as_mut().is_some_and(|s| s.redo()),
             Action::ApplyTool => self.session.as_mut().is_some_and(|s| s.exit_tool(true)),
             Action::CancelTool => self.session.as_mut().is_some_and(|s| s.exit_tool(false)),
-            Action::Copy => {
-                self.copy_settings();
-                false
-            }
-            Action::Paste => self.paste_settings(),
             Action::ResetAll => self.reset_all_develop(),
             Action::ZoomFit => {
                 self.zoom_fit();
@@ -1544,39 +1535,6 @@ impl App {
     /// Whether the GPU backend is currently the active one.
     pub(crate) fn gpu_active(&self) -> bool {
         self.backend_kind == BackendKind::Gpu
-    }
-
-    /// Copy the active variant's settings into the in-app clipboard. Process-local
-    /// UI state — not the OS clipboard, not persisted. A no-op with no session.
-    pub(crate) fn copy_settings(&mut self) {
-        if let Some(session) = &self.session {
-            self.clipboard = Some(session.variants[session.active].current().clone());
-        }
-    }
-
-    /// Whether a Paste is available (the clipboard holds settings and a session is
-    /// open).
-    pub(crate) fn can_paste(&self) -> bool {
-        self.clipboard.is_some() && self.session.is_some()
-    }
-
-    /// Apply the clipboard's **develop** settings onto the active variant, keeping
-    /// the target's geometry, as **one** undo step. Pasting settings identical to
-    /// the target records no step (the History `prev != current` guard). Returns
-    /// whether the preview is now dirty.
-    pub(crate) fn paste_settings(&mut self) -> bool {
-        let Some(clip) = self.clipboard.clone() else {
-            return false;
-        };
-        let Some(session) = &mut self.session else {
-            return false;
-        };
-        let history = &mut session.variants[session.active];
-        let merged = super::state::merge_develop(history.current(), &clip);
-        history.begin();
-        *history.current_mut() = merged;
-        history.commit();
-        true
     }
 
     /// Reset the active variant's develop settings to neutral, keeping its
@@ -1988,7 +1946,6 @@ mod tests {
             about_open: false,
             show_hint: false,
             pending_backend: None,
-            clipboard: None,
             preset_name_input: String::new(),
             preview_spawned_for: None,
         }

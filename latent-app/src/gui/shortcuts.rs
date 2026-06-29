@@ -24,8 +24,6 @@ pub(crate) enum Action {
     Export,
     Undo,
     Redo,
-    Copy,
-    Paste,
     ResetAll,
     ZoomFit,
     ZoomActual,
@@ -51,7 +49,7 @@ impl Action {
     pub(crate) fn blocked_during_tool(self) -> bool {
         matches!(
             self,
-            Action::Paste | Action::ResetAll | Action::NextVariant | Action::PrevVariant
+            Action::ResetAll | Action::NextVariant | Action::PrevVariant
         )
     }
 }
@@ -148,20 +146,6 @@ pub(crate) const SHORTCUTS: &[Shortcut] = &[
         mods: Mods::Command,
         keys: "",
         description: "",
-    },
-    Shortcut {
-        action: Action::Copy,
-        key: Key::C,
-        mods: Mods::Command,
-        keys: "Cmd/Ctrl + C",
-        description: "Copy develop settings",
-    },
-    Shortcut {
-        action: Action::Paste,
-        key: Key::V,
-        mods: Mods::Command,
-        keys: "Cmd/Ctrl + V",
-        description: "Paste develop settings",
     },
     Shortcut {
         action: Action::ResetAll,
@@ -392,7 +376,7 @@ mod tests {
                     s.action
                 );
             }
-            if matches!(s.action, Action::Undo | Action::Redo | Action::Copy) {
+            if matches!(s.action, Action::Undo | Action::Redo) {
                 assert!(
                     !is_suppressed(s.mods, true),
                     "{:?} (command) must stay live while typing",
@@ -406,12 +390,7 @@ mod tests {
     fn tool_sessions_block_edits_not_navigation() {
         // A tool sub-session locks develop edits and variant changes, but leaves
         // undo/redo, the tool-switch and apply/cancel, and the view actions live.
-        for a in [
-            Action::Paste,
-            Action::ResetAll,
-            Action::NextVariant,
-            Action::PrevVariant,
-        ] {
+        for a in [Action::ResetAll, Action::NextVariant, Action::PrevVariant] {
             assert!(a.blocked_during_tool(), "{a:?} should be locked in a tool");
         }
         for a in [
@@ -422,7 +401,6 @@ mod tests {
             Action::ToolCrop,
             Action::ToolBrush,
             Action::ZoomFit,
-            Action::Copy,
         ] {
             assert!(!a.blocked_during_tool(), "{a:?} should stay live in a tool");
         }

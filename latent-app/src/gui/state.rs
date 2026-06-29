@@ -216,8 +216,8 @@ pub(crate) fn clamp_selection(sel: &mut usize, len: usize) {
 /// adjustments; geometry (crop, orientation, straighten, keystone, lens,
 /// vignette, …) is image-specific — a crop or keystone tuned for one frame is
 /// wrong on another — so it is deliberately left as the target's. This is the
-/// shared mapping behind "Paste settings" (develop only) and "Apply preset". Pure,
-/// so the develop-vs-geometry split is unit-testable.
+/// mapping behind "Apply preset" (develop only). Pure, so the develop-vs-geometry
+/// split is unit-testable.
 pub(crate) fn merge_develop(target: &Settings, source: &Settings) -> Settings {
     Settings {
         global: source.global.clone(),
