@@ -1459,6 +1459,12 @@ impl App {
     /// without a session.
     fn select_tool(&mut self, tool: CanvasTool) {
         if let Some(session) = &mut self.session {
+            // While a tool sub-session runs, only toggling the active tool off (to
+            // apply and exit) is allowed from the keyboard; switching to a different
+            // tool is locked, mirroring the toolbar.
+            if session.in_tool_session() && session.tool != tool {
+                return;
+            }
             let next = if session.tool == tool {
                 CanvasTool::None
             } else {

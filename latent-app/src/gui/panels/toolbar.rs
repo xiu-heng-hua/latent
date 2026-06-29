@@ -158,18 +158,27 @@ fn tool_selector(session: &mut crate::gui::app::Session, ui: &mut egui::Ui) {
         (CanvasTool::MaskShape, "Mask"),
         (CanvasTool::Brush, "Brush"),
     ];
+    // While a tool sub-session runs, only the active tool stays clickable (clicking
+    // it applies and exits); switching to a different tool is locked, so a session
+    // can't be left mid-way by jumping to another tool.
+    let in_tool = session.in_tool_session();
+    let current = session.tool;
+    let mut clicked: Option<CanvasTool> = None;
     for (tool, label) in tools {
-        if ui.selectable_label(session.tool == tool, label).clicked() {
+        let active = current == tool;
+        let enabled = !in_tool || active;
+        if ui
+            .add_enabled(enabled, egui::Button::selectable(active, label))
+            .clicked()
+        {
             // Toggle off to View when re-clicking the active tool. Route through
-            // `set_tool` so the handle-tool gesture brackets (and the geometry view
-            // reset) apply the same as every other tool entry point.
-            let next = if session.tool == tool {
-                CanvasTool::None
-            } else {
-                tool
-            };
-            session.set_tool(next);
+            // `set_tool` so the sub-session and the geometry view reset apply the
+            // same as every other tool entry point.
+            clicked = Some(if active { CanvasTool::None } else { tool });
         }
+    }
+    if let Some(next) = clicked {
+        session.set_tool(next);
     }
 }
 
