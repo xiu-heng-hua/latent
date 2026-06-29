@@ -40,6 +40,8 @@ pub(crate) enum Action {
     PrevVariant,
     ToolCrop,
     ToolBrush,
+    ApplyTool,
+    CancelTool,
 }
 
 /// Whether a binding needs a key modifier, so a bare-letter binding can be
@@ -241,6 +243,20 @@ pub(crate) const SHORTCUTS: &[Shortcut] = &[
         mods: Mods::Bare,
         keys: "",
         description: "",
+    },
+    Shortcut {
+        action: Action::ApplyTool,
+        key: Key::Enter,
+        mods: Mods::Bare,
+        keys: "Enter",
+        description: "Apply the active tool",
+    },
+    Shortcut {
+        action: Action::CancelTool,
+        key: Key::Escape,
+        mods: Mods::Bare,
+        keys: "Esc",
+        description: "Cancel the active tool",
     },
     Shortcut {
         action: Action::TogglePanel,

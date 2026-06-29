@@ -234,6 +234,13 @@ pub(crate) struct Session {
     pub(crate) curve_channel: usize,
     /// The active on-canvas tool.
     pub(crate) tool: CanvasTool,
+    /// The active tool sub-session, when a session tool is in use: the history
+    /// depth ([`History::undo_len`]) of the active variant at the moment the tool
+    /// was entered. While `Some`, the tool runs as a self-contained sub-session —
+    /// each drag is one step, undo is clamped so it cannot reach below this floor,
+    /// and on exit the steps collapse to one (apply) or revert entirely (cancel).
+    /// `None` means no tool sub-session is active.
+    pub(crate) tool_floor: Option<usize>,
     /// The in-progress canvas drag.
     pub(crate) drag: Option<CanvasDrag>,
     /// The straighten tool's reference line, as two normalized endpoints, when one
@@ -344,6 +351,7 @@ impl Session {
             brush_erase: false,
             curve_channel: 0,
             tool: CanvasTool::default(),
+            tool_floor: None,
             drag: None,
             straighten_line: None,
             fit_region: None,
@@ -364,9 +372,35 @@ impl Session {
         }
     }
 
-    /// The history of the variant currently being edited.
-    pub(crate) fn active_history(&mut self) -> &mut History<Settings> {
-        &mut self.variants[self.active]
+    /// Undo one step. Inside a tool sub-session, undo is clamped to the session's
+    /// floor — it walks back the tool's own steps but never past them into edits
+    /// made before the tool was entered. Returns whether the position moved.
+    pub(crate) fn undo(&mut self) -> bool {
+        if !self.can_undo() {
+            return false;
+        }
+        self.variants[self.active].undo()
+    }
+
+    /// Redo one step. The redo branch only ever holds steps from the current
+    /// context (a tool sub-session clears it on entry), so this needs no clamp.
+    pub(crate) fn redo(&mut self) -> bool {
+        self.variants[self.active].redo()
+    }
+
+    /// Whether an undo is available — clamped to the active tool sub-session's floor
+    /// so the toolbar/menu Undo greys out at the session boundary.
+    pub(crate) fn can_undo(&self) -> bool {
+        let h = &self.variants[self.active];
+        match self.tool_floor {
+            Some(floor) => h.undo_len() > floor,
+            None => h.can_undo(),
+        }
+    }
+
+    /// Whether a redo is available.
+    pub(crate) fn can_redo(&self) -> bool {
+        self.variants[self.active].can_redo()
     }
 
     /// Switch the active on-canvas tool, resetting the view to fit when a geometry
@@ -381,11 +415,15 @@ impl Session {
         if old == tool {
             return;
         }
-        // A handle tool's whole session is one undo step: close the gesture left
-        // open by the tool we are leaving before switching.
-        if old.is_handle_tool() {
-            self.variants[self.active].commit();
-        }
+        // Leaving a tool sub-session applies it: its per-drag steps collapse into one
+        // (auto-apply on switch, as in Lightroom/Photoshop). Switching tools is
+        // always apply-then-enter, so sub-sessions never mix in the global history.
+        self.finish_tool_session(true);
+        // Re-sync the geometry subsection enable flags to the resulting geometry, so
+        // a cancelled or no-op session never leaves a subsection reading as enabled
+        // with nothing applied. (Runs before the enter-match below re-enables the
+        // newly-entered tool's own subsection.)
+        self.sync_geometry_flags();
         let crosses_geometry = self.tool.is_geometry() != tool.is_geometry();
         // Entering the straighten tool afresh starts from the default reference
         // line rather than a stale one from an earlier edit this session.
@@ -404,10 +442,13 @@ impl Session {
             _ => {}
         }
         self.tool = tool;
-        // Open the new tool's gesture so every drag in this session writes into the
-        // one undo step committed when the tool is left.
-        if tool.is_handle_tool() {
-            self.variants[self.active].begin();
+        // Open a sub-session for an editing tool: record the history depth as its
+        // floor and clear any redo branch so undo/redo inside the tool can't reach
+        // edits made before it.
+        if tool.is_session_tool() {
+            let h = &mut self.variants[self.active];
+            h.forget_redo();
+            self.tool_floor = Some(h.undo_len());
         }
         if crosses_geometry {
             self.zoom = Zoom::Fit;
@@ -421,21 +462,63 @@ impl Session {
         }
     }
 
-    /// Switch the active variant, carrying any open handle-tool gesture across: the
-    /// old variant's gesture is committed and a fresh one is opened on the new
-    /// variant, so a tool left active across a variant switch still commits as one
-    /// undo step per variant. A no-op when `i` is already active.
+    /// Whether an editing tool sub-session is currently active.
+    pub(crate) fn in_tool_session(&self) -> bool {
+        self.tool_floor.is_some()
+    }
+
+    /// Re-derive the crop/straighten/keystone subsection enable flags from the
+    /// active variant's current geometry, so the flags never drift from what the
+    /// settings actually carry (e.g. after a tool session is cancelled).
+    fn sync_geometry_flags(&mut self) {
+        let (crop, straighten, keystone) = crate::gui::panels::controls::geometry_enabled_from(
+            &self.variants[self.active].current().geometry,
+        );
+        self.crop_enabled = crop;
+        self.straighten_enabled = straighten;
+        self.keystone_enabled = keystone;
+    }
+
+    /// Close any active tool sub-session, folding its steps into the global history.
+    /// `apply` keeps the net edit as one undo step ([`History::collapse_to`]);
+    /// otherwise the whole session is reverted ([`History::cancel_to`]). A no-op when
+    /// no session is active. The caller updates the tool/view (e.g. via `set_tool`).
+    fn finish_tool_session(&mut self, apply: bool) {
+        if let Some(floor) = self.tool_floor.take() {
+            let h = &mut self.variants[self.active];
+            if apply {
+                h.collapse_to(floor);
+            } else {
+                h.cancel_to(floor);
+            }
+        }
+    }
+
+    /// Exit the active tool: apply its sub-session (Enter) or, with `apply == false`,
+    /// cancel it (Esc), then return to the pure-view tool. Returns whether anything
+    /// changed (so the caller re-renders). A no-op when no session is active.
+    pub(crate) fn exit_tool(&mut self, apply: bool) -> bool {
+        if !self.in_tool_session() {
+            return false;
+        }
+        self.finish_tool_session(apply);
+        // `set_tool` would itself apply a session, but it is already finished above,
+        // so this only resets the tool and view.
+        self.set_tool(CanvasTool::None);
+        true
+    }
+
+    /// Switch the active variant. Any active tool sub-session is applied to the
+    /// variant it ran on and the tool is left first — tool use never spans variants
+    /// (and the UI disables switching mid-session anyway). A no-op when `i` is
+    /// already active.
     pub(crate) fn select_variant(&mut self, i: usize) {
         if i == self.active || i >= self.variants.len() {
             return;
         }
-        if self.tool.is_handle_tool() {
-            self.variants[self.active].commit();
-        }
+        self.finish_tool_session(true);
+        self.tool = CanvasTool::None;
         self.active = i;
-        if self.tool.is_handle_tool() {
-            self.variants[self.active].begin();
-        }
     }
 
     /// The active variant's crop as a normalized rect, or `None` when there is no
@@ -500,13 +583,10 @@ impl Session {
     /// after it and selected. A UI-state mutation (not a `Settings` edit), so it
     /// does not go through `History`; it is persisted by autosave.
     pub(crate) fn duplicate_variant(&mut self, i: usize) {
-        // Close any open handle-tool gesture on the current active variant before it
-        // stops being active, then reopen one on the duplicate so the invariant
-        // "the active variant holds the open gesture while a handle tool is active"
-        // is preserved.
-        if self.tool.is_handle_tool() {
-            self.variants[self.active].commit();
-        }
+        // Applying any active tool sub-session first keeps the copied settings and
+        // the variant set consistent; the tool is then left.
+        self.finish_tool_session(true);
+        self.tool = CanvasTool::None;
         let copy = self.variants[i].current().clone();
         let base_name = self.variant_label(i);
         let new = (i + 1).min(self.variants.len());
@@ -514,9 +594,6 @@ impl Session {
         self.names.insert(new, format!("{base_name} copy"));
         self.thumbs.insert(new, None);
         self.active = new;
-        if self.tool.is_handle_tool() {
-            self.variants[self.active].begin();
-        }
     }
 
     /// Delete variant `i`, keeping at least one variant (deleting the last is
@@ -525,18 +602,13 @@ impl Session {
         if self.variants.len() <= 1 || i >= self.variants.len() {
             return false;
         }
-        // Flush any open handle-tool gesture before the active variant is removed or
-        // re-indexed, then reopen one on whatever variant ends up active.
-        if self.tool.is_handle_tool() {
-            self.variants[self.active].commit();
-        }
+        // End any active tool sub-session before the variant set changes.
+        self.finish_tool_session(true);
+        self.tool = CanvasTool::None;
         self.variants.remove(i);
         self.names.remove(i);
         self.thumbs.remove(i);
         super::state::clamp_selection(&mut self.active, self.variants.len());
-        if self.tool.is_handle_tool() {
-            self.variants[self.active].begin();
-        }
         true
     }
 
@@ -1190,15 +1262,11 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        // Block only while a gesture is genuinely mid-flight: an active canvas drag,
-        // or a panel gesture (a history pending with no handle-tool session to
-        // explain it). A handle tool keeps its one undo step open between drags —
-        // that must not stall autosave, since the live `current` is safe to persist
-        // and saving it keeps the sidecar crash-safe even before the tool is left.
-        let dragging = session.drag.is_some();
-        let panel_gesture =
-            !session.tool.is_handle_tool() && !session.variants[session.active].is_idle();
-        if dragging || panel_gesture {
+        // Don't save mid-gesture (a slider or tool drag holds a history pending);
+        // the next idle frame saves the settled state. A tool sub-session's
+        // committed per-drag steps leave the history idle between drags, so the live
+        // state is persisted as it goes — crash-safe even before the tool is left.
+        if !session.variants[session.active].is_idle() {
             return;
         }
         let current: Vec<Settings> = session
@@ -1312,14 +1380,10 @@ impl App {
                 self.export_via_dialog(ctx);
                 false
             }
-            Action::Undo => self
-                .session
-                .as_mut()
-                .is_some_and(|s| s.active_history().undo()),
-            Action::Redo => self
-                .session
-                .as_mut()
-                .is_some_and(|s| s.active_history().redo()),
+            Action::Undo => self.session.as_mut().is_some_and(|s| s.undo()),
+            Action::Redo => self.session.as_mut().is_some_and(|s| s.redo()),
+            Action::ApplyTool => self.session.as_mut().is_some_and(|s| s.exit_tool(true)),
+            Action::CancelTool => self.session.as_mut().is_some_and(|s| s.exit_tool(false)),
             Action::Copy => {
                 self.copy_settings();
                 false
@@ -1858,10 +1922,10 @@ impl eframe::App for App {
         dirty |= self.handle_wb_action();
 
         if let Some(session) = &mut self.session {
-            if do_undo && session.active_history().undo() {
+            if do_undo && session.undo() {
                 dirty = true;
             }
-            if do_redo && session.active_history().redo() {
+            if do_redo && session.redo() {
                 dirty = true;
             }
         }

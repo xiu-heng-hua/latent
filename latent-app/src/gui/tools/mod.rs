@@ -62,19 +62,21 @@ impl CanvasTool {
         )
     }
 
-    /// Whether this tool's whole on-canvas session collapses into a single undo
-    /// step: the handle/vertex tools (crop, straighten, keystone, mask shape),
-    /// where a session is a run of refining drags the user thinks of as one edit.
-    /// The gesture is opened on tool entry and committed on exit (see
-    /// [`super::app::Session::set_tool`]), so dragging a handle never adds an undo
-    /// step mid-session. The brush is excluded — each stroke is its own step.
-    pub(crate) fn is_handle_tool(self) -> bool {
+    /// Whether this tool runs as a self-contained editing sub-session: crop,
+    /// straighten, keystone, mask shape, and brush. Entering one opens a sub-session
+    /// (a history floor) that isolates its undo/redo from the rest of the timeline;
+    /// each drag (or brush stroke) is one step within it; exiting collapses those
+    /// steps into a single undo step (apply) or reverts them (cancel). See
+    /// [`super::app::Session::set_tool`]. The one-shot pick tools and the pure-view
+    /// tool are not sub-sessions.
+    pub(crate) fn is_session_tool(self) -> bool {
         matches!(
             self,
             CanvasTool::Crop
                 | CanvasTool::Straighten
                 | CanvasTool::Keystone
                 | CanvasTool::MaskShape
+                | CanvasTool::Brush
         )
     }
 }
@@ -311,8 +313,9 @@ fn crop_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(grab) = crop::hit_test(current, pos, transform)
     {
-        // No per-drag begin/commit: the whole crop session is one undo step,
-        // bracketed by tool entry/exit (see `Session::set_tool`).
+        // One sub-session step per drag (begin on grab, commit on release); the
+        // steps collapse to one global step when the tool is applied.
+        session.variants[active].begin();
         session.drag = Some(CanvasDrag::Crop(grab, current));
     }
     if resp.dragged()
@@ -326,6 +329,7 @@ fn crop_interact(
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::Crop(..))) {
+        session.variants[active].commit();
         session.drag = None;
     }
 
@@ -351,7 +355,8 @@ fn keystone_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(corner) = keystone::hit_test(current, pos, transform)
     {
-        // One undo step per keystone session, bracketed by tool entry/exit.
+        // One sub-session step per drag; the steps collapse on apply.
+        session.variants[active].begin();
         session.drag = Some(CanvasDrag::Keystone(corner, current));
     }
     if resp.dragged()
@@ -367,6 +372,7 @@ fn keystone_interact(
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::Keystone(..))) {
+        session.variants[active].commit();
         session.drag = None;
     }
     // Draw the overlay from the *latest* params (re-read after a possible write
@@ -396,7 +402,8 @@ fn mask_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(grab) = mask_shape::hit_test(&shape, pos, transform)
     {
-        // One undo step per mask-shape session, bracketed by tool entry/exit.
+        // One sub-session step per drag; the steps collapse on apply.
+        session.variants[active].begin();
         session.drag = Some(CanvasDrag::MaskShape(grab, shape.clone()));
     }
     if resp.dragged()
@@ -408,6 +415,7 @@ fn mask_interact(
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::MaskShape(..))) {
+        session.variants[active].commit();
         session.drag = None;
     }
     mask_shape::draw_overlay(painter, transform, &shape);
@@ -441,7 +449,8 @@ fn straighten_interact(
         // Grab the nearer endpoint and refine it. The line is persistent and never
         // recreated, so a press can't make it disappear.
         let end = straighten::nearest_end(from, to, pos, transform);
-        // One undo step per straighten session, bracketed by tool entry/exit.
+        // One sub-session step per drag; the steps collapse on apply.
+        session.variants[active].begin();
         session.drag = Some(CanvasDrag::Straighten(end));
     }
 
@@ -463,6 +472,7 @@ fn straighten_interact(
             changed = true;
         }
         if resp.drag_stopped() {
+            session.variants[active].commit();
             session.drag = None;
         }
     }
@@ -582,19 +592,20 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_are_the_vertex_tools() {
-        // The handle/vertex tools collapse a whole on-canvas session into one undo
-        // step; the brush (per-stroke) and the pure-view/pick tools do not.
+    fn session_tools_are_the_editing_tools() {
+        // The editing tools run as sub-sessions (crop/straighten/keystone/mask/
+        // brush); the one-shot pick and the pure-view tool do not.
         for t in [
             CanvasTool::Crop,
             CanvasTool::Straighten,
             CanvasTool::Keystone,
             CanvasTool::MaskShape,
+            CanvasTool::Brush,
         ] {
-            assert!(t.is_handle_tool(), "{t:?} should bracket as one step");
+            assert!(t.is_session_tool(), "{t:?} should be a sub-session");
         }
-        for t in [CanvasTool::None, CanvasTool::Brush, CanvasTool::WbPick] {
-            assert!(!t.is_handle_tool(), "{t:?} should not bracket");
+        for t in [CanvasTool::None, CanvasTool::WbPick] {
+            assert!(!t.is_session_tool(), "{t:?} should not be a sub-session");
         }
     }
 

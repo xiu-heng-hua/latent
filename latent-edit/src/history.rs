@@ -203,6 +203,45 @@ impl<T: Clone + PartialEq> History<T> {
     pub fn is_idle(&self) -> bool {
         self.pending.is_none()
     }
+
+    /// Discard the redo branch. A modal sub-session (a tool) clears it on entry so
+    /// a stale pre-session redo can't be reached from inside the sub-session.
+    pub fn forget_redo(&mut self) {
+        self.redo.clear();
+    }
+
+    /// Collapse every step recorded since position `floor` into a single undo step.
+    ///
+    /// A tool sub-session records one step per drag while it runs; on apply they
+    /// must read as **one** step from the outside. Keeping the snapshot that was
+    /// current at `floor` as the sole prior, and dropping the intermediate ones,
+    /// turns the whole run into a single `floor`-baseline → current step. The redo
+    /// branch (anything undone within the session) is discarded. A `floor` at or
+    /// past the current depth, or a session that netted no change, leaves a single
+    /// (or zero) step as appropriate.
+    pub fn collapse_to(&mut self, floor: usize) {
+        self.redo.clear();
+        // Keep the first `floor + 1` undo entries (… , the floor baseline); drop the
+        // intermediate per-drag snapshots so only one step spans the session.
+        if self.undo.len() > floor + 1 {
+            self.undo.truncate(floor + 1);
+        }
+    }
+
+    /// Revert every step recorded since position `floor`, discarding them — the
+    /// cancel path for a tool sub-session. Walks `current` back to the `floor`
+    /// baseline by popping the session's undo entries (without pushing them to redo)
+    /// and clears the redo branch, so the history is left exactly as it was when the
+    /// session began.
+    pub fn cancel_to(&mut self, floor: usize) {
+        while self.undo.len() > floor {
+            match self.undo.pop_back() {
+                Some(prev) => self.current = prev,
+                None => break,
+            }
+        }
+        self.redo.clear();
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +442,77 @@ mod tests {
             Some(h.current()),
             "current is at the position"
         );
+    }
+
+    #[test]
+    fn collapse_to_folds_a_sub_session_into_one_step() {
+        // Two pre-session edits, then a sub-session of three more.
+        let mut h = History::new(0);
+        edit(&mut h, 1);
+        edit(&mut h, 2);
+        let floor = h.undo_len(); // == 2
+        edit(&mut h, 3);
+        edit(&mut h, 4);
+        edit(&mut h, 5);
+        assert_eq!(h.undo_len(), 5);
+
+        h.collapse_to(floor);
+        // The three session steps now read as one: a single undo lands on the floor
+        // baseline (2), and the pre-session steps are intact below it.
+        assert_eq!(*h.current(), 5);
+        assert_eq!(h.undo_len(), floor + 1);
+        assert!(h.undo());
+        assert_eq!(*h.current(), 2, "one undo spans the whole session");
+        assert!(h.undo());
+        assert_eq!(*h.current(), 1, "pre-session steps remain granular");
+        assert!(h.undo());
+        assert_eq!(*h.current(), 0);
+        assert!(!h.undo());
+    }
+
+    #[test]
+    fn collapse_to_with_no_session_change_adds_no_step() {
+        let mut h = History::new(0);
+        edit(&mut h, 1);
+        let floor = h.undo_len();
+        // Open a session, make and fully undo a change, then collapse.
+        edit(&mut h, 9);
+        h.undo(); // back to 1, the redo holds 9
+        h.collapse_to(floor);
+        assert_eq!(*h.current(), 1);
+        assert!(!h.can_redo(), "the undone session step is discarded");
+        assert!(h.undo());
+        assert_eq!(*h.current(), 0, "only the pre-session step remains");
+        assert!(!h.undo());
+    }
+
+    #[test]
+    fn cancel_to_reverts_the_whole_sub_session() {
+        let mut h = History::new(0);
+        edit(&mut h, 1);
+        let floor = h.undo_len();
+        edit(&mut h, 2);
+        edit(&mut h, 3);
+        h.undo(); // mid-session undo: current 2, redo holds 3
+
+        h.cancel_to(floor);
+        // Back to the floor baseline, with no trace of the session in undo or redo.
+        assert_eq!(*h.current(), 1);
+        assert!(!h.can_redo());
+        assert_eq!(h.undo_len(), floor);
+        assert!(h.undo());
+        assert_eq!(*h.current(), 0, "the pre-session history is intact");
+    }
+
+    #[test]
+    fn forget_redo_drops_the_redo_branch() {
+        let mut h = History::new(0);
+        edit(&mut h, 1);
+        h.undo();
+        assert!(h.can_redo());
+        h.forget_redo();
+        assert!(!h.can_redo());
+        assert_eq!(*h.current(), 0);
     }
 
     #[test]

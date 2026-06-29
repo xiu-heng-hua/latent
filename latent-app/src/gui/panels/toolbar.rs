@@ -25,8 +25,8 @@ pub(crate) fn show(
             let Some(session) = app.session.as_mut() else {
                 return;
             };
-            let can_undo = session.variants[session.active].can_undo();
-            let can_redo = session.variants[session.active].can_redo();
+            let can_undo = session.can_undo();
+            let can_redo = session.can_redo();
             *do_undo |=
                 crate::gui::icons::icon_button(ui, can_undo, "undo", "Undo (Cmd/Ctrl+Z)").clicked();
             *do_redo |=

@@ -23,14 +23,7 @@ pub(crate) fn show(
         egui::MenuBar::new().ui(ui, |ui| {
             let (can_undo, can_redo, title, path) = app
                 .session()
-                .map(|s| {
-                    (
-                        s.variants[s.active].can_undo(),
-                        s.variants[s.active].can_redo(),
-                        s.title.clone(),
-                        s.path.clone(),
-                    )
-                })
+                .map(|s| (s.can_undo(), s.can_redo(), s.title.clone(), s.path.clone()))
                 .unwrap_or_default();
 
             ui.menu_button("File", |ui| {
