@@ -1371,6 +1371,13 @@ impl App {
         ctx: &egui::Context,
     ) -> bool {
         use super::shortcuts::Action;
+        // A tool sub-session locks out develop edits and variant changes from the
+        // keyboard too, mirroring the greyed panel and menu.
+        if action.blocked_during_tool()
+            && self.session.as_ref().is_some_and(|s| s.in_tool_session())
+        {
+            return false;
+        }
         match action {
             Action::Open => {
                 self.open_via_dialog(ctx);

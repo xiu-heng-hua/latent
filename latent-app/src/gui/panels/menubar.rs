@@ -21,10 +21,21 @@ pub(crate) fn show(
 ) {
     egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
-            let (can_undo, can_redo, title, path) = app
+            let (can_undo, can_redo, in_tool, title, path) = app
                 .session()
-                .map(|s| (s.can_undo(), s.can_redo(), s.title.clone(), s.path.clone()))
+                .map(|s| {
+                    (
+                        s.can_undo(),
+                        s.can_redo(),
+                        s.in_tool_session(),
+                        s.title.clone(),
+                        s.path.clone(),
+                    )
+                })
                 .unwrap_or_default();
+            // While a tool sub-session runs, the develop edit actions are locked —
+            // only the active tool's own controls (in the panel) and undo/redo apply.
+            let can_edit = !in_tool;
 
             ui.menu_button("File", |ui| {
                 file_open_items(app, ctx, ui);
@@ -76,14 +87,17 @@ pub(crate) fn show(
                 // kept. Each routes through the shared App methods the shortcuts use.
                 let has_session = app.session().is_some();
                 if ui
-                    .add_enabled(has_session, egui::Button::new("Copy settings"))
+                    .add_enabled(has_session && can_edit, egui::Button::new("Copy settings"))
                     .clicked()
                 {
                     app.copy_settings();
                     ui.close();
                 }
                 if ui
-                    .add_enabled(app.can_paste(), egui::Button::new("Paste settings"))
+                    .add_enabled(
+                        app.can_paste() && can_edit,
+                        egui::Button::new("Paste settings"),
+                    )
                     .on_hover_text("Apply the copied develop look (keeps this image's geometry)")
                     .clicked()
                 {
@@ -91,7 +105,10 @@ pub(crate) fn show(
                     ui.close();
                 }
                 if ui
-                    .add_enabled(has_session, egui::Button::new("Reset all develop"))
+                    .add_enabled(
+                        has_session && can_edit,
+                        egui::Button::new("Reset all develop"),
+                    )
                     .on_hover_text("Reset develop adjustments to neutral (keeps geometry)")
                     .clicked()
                 {
@@ -101,7 +118,7 @@ pub(crate) fn show(
                 ui.separator();
                 // Apply a saved develop preset (the look only — geometry is kept).
                 let has_presets = !app.config.presets.is_empty();
-                ui.add_enabled_ui(has_session && has_presets, |ui| {
+                ui.add_enabled_ui(has_session && has_presets && can_edit, |ui| {
                     ui.menu_button("Apply preset", |ui| {
                         let mut chosen: Option<usize> = None;
                         for (i, preset) in app.config.presets.iter().enumerate() {

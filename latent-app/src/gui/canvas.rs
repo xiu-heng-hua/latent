@@ -408,6 +408,13 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             } else {
                 resp.ctx.request_repaint();
             }
+
+            // A banner across the top of the canvas signals the modal tool
+            // sub-session and how to leave it, so the state is clear even with the
+            // controls panel hidden.
+            if session.in_tool_session() {
+                draw_session_banner(&painter, panel, session.tool);
+            }
         });
 
     // Whether a tool is active, captured before the session borrow is released so
@@ -431,6 +438,33 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         // repaint is not a render.
         ctx.request_repaint();
     }
+}
+
+/// Draw the modal tool-session banner: a small accent pill centered at the top of
+/// the canvas naming the active tool and the apply/cancel keys. Painted over the
+/// image so it reads as a transient mode indicator.
+fn draw_session_banner(painter: &egui::Painter, panel: Rect, tool: tools::CanvasTool) {
+    use tools::CanvasTool;
+    let name = match tool {
+        CanvasTool::Crop => "Cropping",
+        CanvasTool::Straighten => "Straighten",
+        CanvasTool::Keystone => "Keystone",
+        CanvasTool::MaskShape => "Mask shape",
+        CanvasTool::Brush => "Brush",
+        _ => "Tool",
+    };
+    let text = format!("{name} — Enter to apply · Esc to cancel");
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+    let at = Pos2::new(panel.center().x, panel.top() + 10.0);
+    let rect = egui::Align2::CENTER_TOP
+        .anchor_size(at, galley.size())
+        .expand2(egui::vec2(10.0, 5.0));
+    painter.rect_filled(rect, 6.0, theme::ACCENT.gamma_multiply(0.92));
+    painter.galley(
+        rect.center_top() + egui::vec2(-galley.size().x / 2.0, 5.0),
+        galley,
+        Color32::WHITE,
+    );
 }
 
 /// The region `Fit` and the zoom ladder frame while a geometry tool is active, as

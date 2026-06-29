@@ -44,6 +44,18 @@ pub(crate) enum Action {
     CancelTool,
 }
 
+impl Action {
+    /// Whether a tool sub-session locks this action out: the develop edits and the
+    /// variant changes, i.e. the keyboard mirror of the greyed panel/menu. View,
+    /// undo/redo, tool-switch, and apply/cancel stay live.
+    pub(crate) fn blocked_during_tool(self) -> bool {
+        matches!(
+            self,
+            Action::Paste | Action::ResetAll | Action::NextVariant | Action::PrevVariant
+        )
+    }
+}
+
 /// Whether a binding needs a key modifier, so a bare-letter binding can be
 /// suppressed while a text field is focused while a `Cmd/Ctrl` one stays live.
 /// The `Shift`-for-feather refinement on the brush keys is read live at apply
@@ -387,6 +399,32 @@ mod tests {
                     s.action
                 );
             }
+        }
+    }
+
+    #[test]
+    fn tool_sessions_block_edits_not_navigation() {
+        // A tool sub-session locks develop edits and variant changes, but leaves
+        // undo/redo, the tool-switch and apply/cancel, and the view actions live.
+        for a in [
+            Action::Paste,
+            Action::ResetAll,
+            Action::NextVariant,
+            Action::PrevVariant,
+        ] {
+            assert!(a.blocked_during_tool(), "{a:?} should be locked in a tool");
+        }
+        for a in [
+            Action::Undo,
+            Action::Redo,
+            Action::ApplyTool,
+            Action::CancelTool,
+            Action::ToolCrop,
+            Action::ToolBrush,
+            Action::ZoomFit,
+            Action::Copy,
+        ] {
+            assert!(!a.blocked_during_tool(), "{a:?} should stay live in a tool");
         }
     }
 

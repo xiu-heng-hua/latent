@@ -25,6 +25,10 @@ pub(crate) fn show(
             let Some(session) = app.session.as_mut() else {
                 return;
             };
+            // While a tool sub-session runs, only the tool's own controls and the
+            // view/undo controls stay live: variant switching and the orientation
+            // edits are locked, since they are not relative to the active tool.
+            let in_tool = session.in_tool_session();
             let can_undo = session.can_undo();
             let can_redo = session.can_redo();
             *do_undo |=
@@ -35,18 +39,20 @@ pub(crate) fn show(
 
             ui.separator();
 
-            ui.label("Variant:");
-            for i in 0..session.variants.len() {
-                let label = session.variant_label(i);
-                if ui.selectable_label(i == session.active, label).clicked() {
-                    session.select_variant(i);
+            ui.add_enabled_ui(!in_tool, |ui| {
+                ui.label("Variant:");
+                for i in 0..session.variants.len() {
+                    let label = session.variant_label(i);
+                    if ui.selectable_label(i == session.active, label).clicked() {
+                        session.select_variant(i);
+                        *dirty = true;
+                    }
+                }
+                if ui.button("+").on_hover_text("New variant (copy)").clicked() {
+                    session.duplicate_variant(session.active);
                     *dirty = true;
                 }
-            }
-            if ui.button("+").on_hover_text("New variant (copy)").clicked() {
-                session.duplicate_variant(session.active);
-                *dirty = true;
-            }
+            });
 
             ui.separator();
 
@@ -60,37 +66,40 @@ pub(crate) fn show(
             // The orientation edit goes through the app (so the begin/commit lives
             // in one place), so it is applied after this closure via the flag set
             // below.
-            let mut orient: Option<fn(latent_edit::Orientation) -> latent_edit::Orientation> = None;
-            if crate::gui::icons::icon_button(ui, true, "rotate_cw", "Rotate 90° clockwise")
+            ui.add_enabled_ui(!in_tool, |ui| {
+                let mut orient: Option<fn(latent_edit::Orientation) -> latent_edit::Orientation> =
+                    None;
+                if crate::gui::icons::icon_button(ui, true, "rotate_cw", "Rotate 90° clockwise")
+                    .clicked()
+                {
+                    orient = Some(|o| o.rotate_cw());
+                }
+                if crate::gui::icons::icon_button(
+                    ui,
+                    true,
+                    "rotate_ccw",
+                    "Rotate 90° counter-clockwise",
+                )
                 .clicked()
-            {
-                orient = Some(|o| o.rotate_cw());
-            }
-            if crate::gui::icons::icon_button(
-                ui,
-                true,
-                "rotate_ccw",
-                "Rotate 90° counter-clockwise",
-            )
-            .clicked()
-            {
-                orient = Some(|o| o.rotate_ccw());
-            }
-            if crate::gui::icons::icon_button(ui, true, "flip_h", "Flip horizontal").clicked() {
-                orient = Some(|o| o.flip_h());
-            }
-            if crate::gui::icons::icon_button(ui, true, "flip_v", "Flip vertical").clicked() {
-                orient = Some(|o| o.flip_v());
-            }
-            if let Some(f) = orient {
-                // Apply directly on the session's active history (one undo step).
-                let history = &mut session.variants[session.active];
-                history.begin();
-                let o = history.current().geometry.orientation;
-                history.current_mut().geometry.orientation = f(o);
-                history.commit();
-                *dirty = true;
-            }
+                {
+                    orient = Some(|o| o.rotate_ccw());
+                }
+                if crate::gui::icons::icon_button(ui, true, "flip_h", "Flip horizontal").clicked() {
+                    orient = Some(|o| o.flip_h());
+                }
+                if crate::gui::icons::icon_button(ui, true, "flip_v", "Flip vertical").clicked() {
+                    orient = Some(|o| o.flip_v());
+                }
+                if let Some(f) = orient {
+                    // Apply directly on the session's active history (one undo step).
+                    let history = &mut session.variants[session.active];
+                    history.begin();
+                    let o = history.current().geometry.orientation;
+                    history.current_mut().geometry.orientation = f(o);
+                    history.commit();
+                    *dirty = true;
+                }
+            });
 
             ui.separator();
 

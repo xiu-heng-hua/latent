@@ -32,6 +32,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
         return false;
     }
     let mut dirty = false;
+    // While a tool sub-session runs, the panel shows that tool's options at the top
+    // and locks the rest — only tool-relative edits are allowed (the modality the
+    // sub-session model needs so unrelated edits never mix into the tool's step).
+    let in_tool = app.session.as_ref().is_some_and(|s| s.in_tool_session());
     // Whether the user asked to export this frame (handled after the panel closure
     // so the session borrow is released first).
     let mut do_export = false;
@@ -67,6 +71,17 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
         .frame(frame)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // A tool sub-session takes over the panel: its options sit at the top
+                // (enabled), and everything below is disabled so no unrelated edit can
+                // slip into the tool's step. `disable()` greys the rest of this scroll
+                // area without moving the layout.
+                if in_tool {
+                    if let Some(session) = app.session.as_mut() {
+                        tool_options(session, ui, &mut dirty);
+                    }
+                    ui.separator();
+                    ui.disable();
+                }
                 // Variant manager, history, and presets sit at the top of the panel.
                 // They take `&mut App`, so they are rendered before the session is
                 // borrowed for the develop sections below.
@@ -432,6 +447,87 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) -> bool {
     }
 
     dirty
+}
+
+/// The tool-options area shown at the top of the controls panel while a tool
+/// sub-session is active (see [`crate::gui::app::Session::in_tool_session`]). It
+/// holds the active tool's own controls — reused verbatim from the tool's
+/// subsection — plus Apply / Cancel actions and the Enter/Esc hint, so the only
+/// edits reachable while a tool runs are the ones relative to that tool. The rest
+/// of the panel is greyed by the caller. `dirty` is OR-ed with the controls'
+/// redraw flag; clicking Apply/Cancel ends the session immediately.
+fn tool_options(session: &mut Session, ui: &mut egui::Ui, dirty: &mut bool) {
+    use crate::gui::tools::CanvasTool;
+    let name = match session.tool {
+        CanvasTool::Crop => "Cropping",
+        CanvasTool::Straighten => "Straighten",
+        CanvasTool::Keystone => "Keystone",
+        CanvasTool::MaskShape => "Mask shape",
+        CanvasTool::Brush => "Brush",
+        _ => "Tool",
+    };
+    ui.heading(name);
+    ui.label(
+        egui::RichText::new("Editing on the image — Enter to apply, Esc to cancel")
+            .small()
+            .weak(),
+    );
+    ui.add_space(4.0);
+
+    let active = session.active;
+    match session.tool {
+        CanvasTool::Crop => {
+            crop_aspect_row(session, ui);
+            let (w, h) = (session.full.width(), session.full.height());
+            *dirty |= widgets::crop_block(
+                ui,
+                &mut session.variants[active],
+                &mut session.crop_units,
+                w,
+                h,
+            );
+            *dirty |= auto_constrain_row(session, ui);
+        }
+        CanvasTool::Straighten => {
+            *dirty |= widgets::straighten_slider(ui, &mut session.variants[active]);
+            *dirty |= auto_constrain_row(session, ui);
+        }
+        CanvasTool::Keystone => {
+            *dirty |= widgets::keystone_block(ui, &mut session.variants[active]);
+            *dirty |= auto_constrain_row(session, ui);
+        }
+        CanvasTool::Brush => {
+            ui.add(egui::Slider::new(&mut session.brush_radius, 0.01..=0.5).text("Size"))
+                .on_hover_text("Brush radius. 0.01 … 0.5; [ ] resize");
+            ui.add(egui::Slider::new(&mut session.brush_feather, 0.0..=0.5).text("Feather"))
+                .on_hover_text("Brush edge softness. 0 … 0.5; Shift+[ ] resize");
+            ui.checkbox(&mut session.brush_erase, "Erase")
+                .on_hover_text("Subtract coverage instead of adding it");
+            ui.label("Drag on the image to paint.");
+        }
+        CanvasTool::MaskShape => {
+            ui.label("Drag the shape's handles on the image.");
+        }
+        _ => {}
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui
+            .button("Apply")
+            .on_hover_text("Apply this tool's edit (Enter)")
+            .clicked()
+        {
+            *dirty |= session.exit_tool(true);
+        }
+        if ui
+            .button("Cancel")
+            .on_hover_text("Discard this tool's edit (Esc)")
+            .clicked()
+        {
+            *dirty |= session.exit_tool(false);
+        }
+    });
 }
 
 /// The per-frame solo (accordion) context threaded into each section. When solo
