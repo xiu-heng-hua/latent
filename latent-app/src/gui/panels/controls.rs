@@ -599,7 +599,7 @@ impl VisCtx<'_> {
     /// Render the eye / eye-off button at the right edge of a subsection header and
     /// record any change for the caller to persist. `shown` is the current state;
     /// returns the (possibly flipped) state to use this frame. Pure UI — toggling
-    /// it never touches the image. Styled like the per-section reset icon-button.
+    /// it never touches the image. Styled like the row's canvas-tool icons.
     fn eye_button(&mut self, ui: &mut egui::Ui, id: &'static str, shown: bool) -> bool {
         let tip = if shown {
             "Hide these controls"

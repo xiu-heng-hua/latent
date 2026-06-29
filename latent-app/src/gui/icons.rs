@@ -109,24 +109,47 @@ pub(crate) fn icon_button(
 /// A show/hide toggle drawn as an eye — an open eye (almond outline + pupil) when
 /// `shown`, a closed lid (a downward arc with a few lashes) when hidden. Painted
 /// directly rather than as a font glyph, so it reads clearly at this small size and
-/// the "hidden" state is an unmistakable closed eye. Fixed square size (the row
-/// height), so toggling never shifts the layout. Returns the `Response`; the caller
-/// flips the visibility on a click.
+/// the "hidden" state is an unmistakable closed eye. The button chrome (size and
+/// hover border) matches [`selectable_icon`], so it sits flush with the tool icons
+/// it shares a header row with; only the glyph changes between states, never the
+/// footprint, so toggling never shifts the layout. Returns the `Response`; the
+/// caller flips the visibility on a click.
 pub(crate) fn eye_toggle(ui: &mut egui::Ui, shown: bool, tooltip: &str) -> egui::Response {
-    let side = ui.spacing().interact_size.y;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    // Match a `selectable_icon`'s footprint: an icon-sized glyph plus the button
+    // padding, so the eye sits flush with the tool icons it shares a row with. A
+    // representative glyph stands in for the (painter-drawn) eye's metrics.
+    let icon_font = FontId::new(
+        theme::ICON_SIZE,
+        FontFamily::Name(theme::ICON_FAMILY.into()),
+    );
+    let glyph =
+        ui.fonts(|f| f.layout_no_wrap(icon("crop").to_string(), icon_font, egui::Color32::WHITE));
+    let pad = ui.spacing().button_padding;
+    let size = egui::vec2(
+        glyph.size().x + 2.0 * pad.x,
+        (glyph.size().y + 2.0 * pad.y).max(ui.spacing().interact_size.y),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let resp = resp
         .on_hover_text(tooltip)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-    let vis = ui.style().interact(&resp);
-    let color = vis.fg_stroke.color;
-    let bg = vis.weak_bg_fill;
-    let radius = vis.corner_radius;
-    // A subtle background on hover so it reads as a button like its neighbours.
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, radius, bg);
+    // Render exactly like `selectable_label`: the chrome (fill + the accent hover
+    // border) is drawn only on hover/focus, using the same widget visuals the tool
+    // icons do, so the eye reads as the same kind of button. The eye carries no
+    // persistent "selected" accent — its state is shown by the open/closed glyph,
+    // not by a highlight — so the resting row of subsection headers stays calm.
+    let vis = ui.style().interact_selectable(&resp, false);
+    if resp.hovered() || resp.has_focus() {
+        ui.painter().rect(
+            rect,
+            vis.corner_radius,
+            vis.weak_bg_fill,
+            vis.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
     }
+    let color = vis.text_color();
 
     let painter = ui.painter();
     let c = rect.center();
