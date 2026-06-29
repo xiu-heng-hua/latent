@@ -61,6 +61,22 @@ impl CanvasTool {
             CanvasTool::Crop | CanvasTool::Straighten | CanvasTool::Keystone
         )
     }
+
+    /// Whether this tool's whole on-canvas session collapses into a single undo
+    /// step: the handle/vertex tools (crop, straighten, keystone, mask shape),
+    /// where a session is a run of refining drags the user thinks of as one edit.
+    /// The gesture is opened on tool entry and committed on exit (see
+    /// [`super::app::Session::set_tool`]), so dragging a handle never adds an undo
+    /// step mid-session. The brush is excluded — each stroke is its own step.
+    pub(crate) fn is_handle_tool(self) -> bool {
+        matches!(
+            self,
+            CanvasTool::Crop
+                | CanvasTool::Straighten
+                | CanvasTool::Keystone
+                | CanvasTool::MaskShape
+        )
+    }
 }
 
 /// The settings the live preview should render from while `tool` is active.
@@ -295,7 +311,8 @@ fn crop_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(grab) = crop::hit_test(current, pos, transform)
     {
-        session.variants[active].begin();
+        // No per-drag begin/commit: the whole crop session is one undo step,
+        // bracketed by tool entry/exit (see `Session::set_tool`).
         session.drag = Some(CanvasDrag::Crop(grab, current));
     }
     if resp.dragged()
@@ -309,7 +326,6 @@ fn crop_interact(
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::Crop(..))) {
-        session.variants[active].commit();
         session.drag = None;
     }
 
@@ -335,7 +351,7 @@ fn keystone_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(corner) = keystone::hit_test(current, pos, transform)
     {
-        session.variants[active].begin();
+        // One undo step per keystone session, bracketed by tool entry/exit.
         session.drag = Some(CanvasDrag::Keystone(corner, current));
     }
     if resp.dragged()
@@ -351,7 +367,6 @@ fn keystone_interact(
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::Keystone(..))) {
-        session.variants[active].commit();
         session.drag = None;
     }
     // Draw the overlay from the *latest* params (re-read after a possible write
@@ -381,7 +396,7 @@ fn mask_interact(
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some(grab) = mask_shape::hit_test(&shape, pos, transform)
     {
-        session.variants[active].begin();
+        // One undo step per mask-shape session, bracketed by tool entry/exit.
         session.drag = Some(CanvasDrag::MaskShape(grab, shape.clone()));
     }
     if resp.dragged()
@@ -393,7 +408,6 @@ fn mask_interact(
         changed = true;
     }
     if resp.drag_stopped() && matches!(session.drag, Some(CanvasDrag::MaskShape(..))) {
-        session.variants[active].commit();
         session.drag = None;
     }
     mask_shape::draw_overlay(painter, transform, &shape);
@@ -427,7 +441,7 @@ fn straighten_interact(
         // Grab the nearer endpoint and refine it. The line is persistent and never
         // recreated, so a press can't make it disappear.
         let end = straighten::nearest_end(from, to, pos, transform);
-        session.variants[active].begin();
+        // One undo step per straighten session, bracketed by tool entry/exit.
         session.drag = Some(CanvasDrag::Straighten(end));
     }
 
@@ -449,7 +463,6 @@ fn straighten_interact(
             changed = true;
         }
         if resp.drag_stopped() {
-            session.variants[active].commit();
             session.drag = None;
         }
     }
@@ -566,6 +579,23 @@ mod tests {
             super::super::canvas::Zoom::Fit,
             Vec2::ZERO,
         )
+    }
+
+    #[test]
+    fn handle_tools_are_the_vertex_tools() {
+        // The handle/vertex tools collapse a whole on-canvas session into one undo
+        // step; the brush (per-stroke) and the pure-view/pick tools do not.
+        for t in [
+            CanvasTool::Crop,
+            CanvasTool::Straighten,
+            CanvasTool::Keystone,
+            CanvasTool::MaskShape,
+        ] {
+            assert!(t.is_handle_tool(), "{t:?} should bracket as one step");
+        }
+        for t in [CanvasTool::None, CanvasTool::Brush, CanvasTool::WbPick] {
+            assert!(!t.is_handle_tool(), "{t:?} should not bracket");
+        }
     }
 
     #[test]

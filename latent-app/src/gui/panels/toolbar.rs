@@ -39,7 +39,7 @@ pub(crate) fn show(
             for i in 0..session.variants.len() {
                 let label = session.variant_label(i);
                 if ui.selectable_label(i == session.active, label).clicked() {
-                    session.active = i;
+                    session.select_variant(i);
                     *dirty = true;
                 }
             }
@@ -151,12 +151,15 @@ fn tool_selector(session: &mut crate::gui::app::Session, ui: &mut egui::Ui) {
     ];
     for (tool, label) in tools {
         if ui.selectable_label(session.tool == tool, label).clicked() {
-            // Toggle off to View when re-clicking the active tool.
-            session.tool = if session.tool == tool {
+            // Toggle off to View when re-clicking the active tool. Route through
+            // `set_tool` so the handle-tool gesture brackets (and the geometry view
+            // reset) apply the same as every other tool entry point.
+            let next = if session.tool == tool {
                 CanvasTool::None
             } else {
                 tool
             };
+            session.set_tool(next);
         }
     }
 }

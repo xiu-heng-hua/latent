@@ -377,6 +377,15 @@ impl Session {
     /// view state stays consistent across the transition. Routing every tool
     /// change through here keeps that reset in one place.
     pub(crate) fn set_tool(&mut self, tool: CanvasTool) {
+        let old = self.tool;
+        if old == tool {
+            return;
+        }
+        // A handle tool's whole session is one undo step: close the gesture left
+        // open by the tool we are leaving before switching.
+        if old.is_handle_tool() {
+            self.variants[self.active].commit();
+        }
         let crosses_geometry = self.tool.is_geometry() != tool.is_geometry();
         // Entering the straighten tool afresh starts from the default reference
         // line rather than a stale one from an earlier edit this session.
@@ -395,6 +404,11 @@ impl Session {
             _ => {}
         }
         self.tool = tool;
+        // Open the new tool's gesture so every drag in this session writes into the
+        // one undo step committed when the tool is left.
+        if tool.is_handle_tool() {
+            self.variants[self.active].begin();
+        }
         if crosses_geometry {
             self.zoom = Zoom::Fit;
             self.pan = egui::Vec2::ZERO;
@@ -404,6 +418,23 @@ impl Session {
             // viewport edges, so a drag would hit the interior and just move the
             // rect). The toolbar `Fit` reframes to the crop rectangle instead.
             self.fit_region = None;
+        }
+    }
+
+    /// Switch the active variant, carrying any open handle-tool gesture across: the
+    /// old variant's gesture is committed and a fresh one is opened on the new
+    /// variant, so a tool left active across a variant switch still commits as one
+    /// undo step per variant. A no-op when `i` is already active.
+    pub(crate) fn select_variant(&mut self, i: usize) {
+        if i == self.active || i >= self.variants.len() {
+            return;
+        }
+        if self.tool.is_handle_tool() {
+            self.variants[self.active].commit();
+        }
+        self.active = i;
+        if self.tool.is_handle_tool() {
+            self.variants[self.active].begin();
         }
     }
 
@@ -469,6 +500,13 @@ impl Session {
     /// after it and selected. A UI-state mutation (not a `Settings` edit), so it
     /// does not go through `History`; it is persisted by autosave.
     pub(crate) fn duplicate_variant(&mut self, i: usize) {
+        // Close any open handle-tool gesture on the current active variant before it
+        // stops being active, then reopen one on the duplicate so the invariant
+        // "the active variant holds the open gesture while a handle tool is active"
+        // is preserved.
+        if self.tool.is_handle_tool() {
+            self.variants[self.active].commit();
+        }
         let copy = self.variants[i].current().clone();
         let base_name = self.variant_label(i);
         let new = (i + 1).min(self.variants.len());
@@ -476,6 +514,9 @@ impl Session {
         self.names.insert(new, format!("{base_name} copy"));
         self.thumbs.insert(new, None);
         self.active = new;
+        if self.tool.is_handle_tool() {
+            self.variants[self.active].begin();
+        }
     }
 
     /// Delete variant `i`, keeping at least one variant (deleting the last is
@@ -484,10 +525,18 @@ impl Session {
         if self.variants.len() <= 1 || i >= self.variants.len() {
             return false;
         }
+        // Flush any open handle-tool gesture before the active variant is removed or
+        // re-indexed, then reopen one on whatever variant ends up active.
+        if self.tool.is_handle_tool() {
+            self.variants[self.active].commit();
+        }
         self.variants.remove(i);
         self.names.remove(i);
         self.thumbs.remove(i);
         super::state::clamp_selection(&mut self.active, self.variants.len());
+        if self.tool.is_handle_tool() {
+            self.variants[self.active].begin();
+        }
         true
     }
 
@@ -1141,7 +1190,15 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        if !session.variants[session.active].is_idle() {
+        // Block only while a gesture is genuinely mid-flight: an active canvas drag,
+        // or a panel gesture (a history pending with no handle-tool session to
+        // explain it). A handle tool keeps its one undo step open between drags —
+        // that must not stall autosave, since the live `current` is safe to persist
+        // and saving it keeps the sidecar crash-safe even before the tool is left.
+        let dragging = session.drag.is_some();
+        let panel_gesture =
+            !session.tool.is_handle_tool() && !session.variants[session.active].is_idle();
+        if dragging || panel_gesture {
             return;
         }
         let current: Vec<Settings> = session
@@ -1347,7 +1404,7 @@ impl App {
             let len = session.variants.len();
             if len > 1 {
                 let next = (session.active as isize + delta).rem_euclid(len as isize) as usize;
-                session.active = next;
+                session.select_variant(next);
             }
         }
     }

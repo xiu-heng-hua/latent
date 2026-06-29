@@ -126,7 +126,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) -> bool {
     if let Some(i) = to_select
         && i != session.active
     {
-        session.active = i;
+        session.select_variant(i);
         switched = true;
     }
     if let Some(i) = to_duplicate {
