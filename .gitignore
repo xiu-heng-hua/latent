@@ -9,3 +9,6 @@
 
 # cargo-mutants output
 **/mutants.out*/
+
+# Local sample images (large RAW / TIFF / JPG; kept out of the repo)
+/samples
