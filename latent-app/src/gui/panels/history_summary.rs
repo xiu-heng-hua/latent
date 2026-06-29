@@ -41,7 +41,18 @@ pub(crate) fn summarize_change(prev: &Settings, next: &Settings) -> ChangeSummar
         0 => ChangeSummary::new("Edit", ""),
         1 => changes.pop().unwrap(),
         n if *next == Settings::default() => ChangeSummary::new("Reset", format!("{n} cleared")),
-        n => ChangeSummary::new("Multiple", format!("{n} changes")),
+        _ => {
+            // Spell out which controls changed (a paste/preset/reset-with-geometry
+            // touches several at once), capped so a big change stays one tidy line.
+            const MAX: usize = 3;
+            let names: Vec<&str> = changes.iter().map(|c| c.title.as_str()).collect();
+            let title = if names.len() > MAX {
+                format!("{} +{} more", names[..MAX].join(", "), names.len() - MAX)
+            } else {
+                names.join(", ")
+            };
+            ChangeSummary::new(title, String::new())
+        }
     }
 }
 
@@ -415,13 +426,29 @@ mod tests {
     }
 
     #[test]
-    fn multiple_changes_summarize_and_a_neutral_result_resets() {
+    fn multiple_changes_spell_out_and_a_neutral_result_resets() {
+        // A few changes at once are spelled out by name, in field order.
         let mut multi = with_exposure(0.5);
         multi.global.saturation = Some(1.4);
         assert_eq!(
             summarize(&Settings::default(), &multi),
-            ("Multiple".to_owned(), "2 changes".to_owned())
+            ("Exposure, Saturation".to_owned(), String::new())
         );
+        // Many at once are capped with a "+N more" tail so the card stays tidy.
+        let mut many = Settings::default();
+        many.global.exposure = Some(0.5);
+        many.global.tone = Some(latent_edit::SelectiveTone {
+            contrast: 0.2,
+            ..Default::default()
+        });
+        many.global.curves = Some(latent_edit::Curves::default());
+        many.global.saturation = Some(1.2);
+        many.global.dehaze = Some(0.3);
+        assert_eq!(
+            summarize(&Settings::default(), &many).0,
+            "Exposure, Tone, Curves +2 more"
+        );
+        // Clearing everything back to neutral still reads as a reset.
         assert_eq!(summarize(&multi, &Settings::default()).0, "Reset");
     }
 
