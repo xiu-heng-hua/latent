@@ -636,7 +636,7 @@ fn toggle_subsection(
     history: &mut History<Settings>,
     label: &str,
     enabled: bool,
-    set_enabled: impl FnOnce(&mut History<Settings>, bool) -> bool,
+    set_enabled: impl Fn(&mut History<Settings>, bool) -> bool,
     body: impl FnOnce(&mut egui::Ui, &mut History<Settings>) -> bool,
 ) -> bool {
     ui.add_space(2.0);
@@ -648,8 +648,17 @@ fn toggle_subsection(
             if ui.checkbox(&mut on, label).changed() {
                 dirty |= set_enabled(history, on);
             }
-            // The eye button sits at the right edge of the header row.
+            // The reset and eye buttons sit at the right edge of the header row. The
+            // reset is rightmost so it aligns with the per-section reset; the eye
+            // sits just left of it. Reset clears the subsection's field (the same as
+            // disabling it) as one undo step, and is enabled only when the
+            // subsection is on — its enabled state is itself the "modified" mark.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::gui::icons::icon_button(ui, enabled, "undo", "Reset these controls")
+                    .clicked()
+                {
+                    dirty |= set_enabled(history, false);
+                }
                 vis.eye_button(ui, id, shown)
             })
             .inner
@@ -688,7 +697,9 @@ fn toggle_tool_subsection(
     tool: crate::gui::tools::CanvasTool,
     icon: &str,
     enabled: bool,
+    modified: bool,
     on_toggle: impl FnOnce(&mut Session, bool) -> bool,
+    reset: impl FnOnce(&mut Session) -> bool,
     body: impl FnOnce(&mut Session, &mut egui::Ui) -> bool,
 ) -> bool {
     ui.add_space(2.0);
@@ -700,10 +711,19 @@ fn toggle_tool_subsection(
             if ui.checkbox(&mut on, label).changed() {
                 dirty |= on_toggle(session, on);
             }
-            // Push the tool activator and eye button to the right edge of the row.
-            // In a right-to-left layout the eye is laid out first so it lands at the
-            // far right, next to the tool icon.
+            // Push the reset/tool/eye buttons to the right edge of the row. In a
+            // right-to-left layout the reset is laid out first so it lands at the far
+            // right (aligned with the per-section reset); the eye sits next to it,
+            // then the tool activator. The reset clears this transform (field, its
+            // toggle stash, and the enable flag) as one undo step, and is enabled
+            // only when the transform actually differs from default — its enabled
+            // state is the "modified" mark.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::gui::icons::icon_button(ui, modified, "undo", "Reset these controls")
+                    .clicked()
+                {
+                    dirty |= reset(session);
+                }
                 let now_shown = vis.eye_button(ui, id, shown);
                 let active = session.tool == tool;
                 let resp =
@@ -850,8 +870,8 @@ fn export_section(
 }
 
 /// The lens-correction subsection: a single checkbox header `[checkbox] Lens
-/// correction` (the enable) with the eye / eye-off visibility button at the right,
-/// styled like the section reset icon-button. `geometry.lens` is off by default.
+/// correction` (the enable) with the reset and eye / eye-off visibility buttons at
+/// the right edge. `geometry.lens` is off by default.
 /// Enabling detects a profile from the RAW's EXIF on the main thread (the lensfun
 /// `Database` is not `Send`, so it never crosses the render worker) and applies it
 /// — or reports that none was found and leaves the checkbox off. Disabling clears
@@ -901,8 +921,19 @@ fn lens_block(session: &mut Session, ui: &mut egui::Ui, vis: &mut VisCtx) -> boo
                 history.commit();
                 dirty = true;
             }
-            // The eye button sits at the right edge of the header row.
+            // The reset and eye buttons sit at the right edge of the header row, the
+            // reset rightmost (aligned with the section reset) and enabled only while
+            // the correction is applied — clearing it is one undo step.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::gui::icons::icon_button(ui, enabled, "undo", "Reset these controls")
+                    .clicked()
+                {
+                    let history = &mut session.variants[active];
+                    history.begin();
+                    history.current_mut().geometry.lens = None;
+                    history.commit();
+                    dirty = true;
+                }
                 vis.eye_button(ui, "lens", shown)
             })
             .inner
@@ -953,6 +984,11 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
     // constraint, and the edge sliders. The enable checkbox is itself the
     // "this image is cropped" signal, so no separate indicator is needed.
     let crop_enabled = session.crop_enabled;
+    let crop_modified = session.variants[session.active]
+        .current()
+        .geometry
+        .crop
+        .is_some();
     d |= toggle_tool_subsection(
         session,
         ui,
@@ -962,7 +998,9 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         CanvasTool::Crop,
         "crop",
         crop_enabled,
+        crop_modified,
         set_crop_enabled,
+        reset_crop,
         |session, ui| {
             crop_aspect_row(session, ui);
             // The crop is normalized over the displayed image, so the px conversion
@@ -981,6 +1019,11 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
 
     // Straighten — the level tool and its angle.
     let straighten_enabled = session.straighten_enabled;
+    let straighten_modified = session.variants[session.active]
+        .current()
+        .geometry
+        .straighten_degrees
+        != 0.0;
     d |= toggle_tool_subsection(
         session,
         ui,
@@ -990,12 +1033,19 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         CanvasTool::Straighten,
         "straighten",
         straighten_enabled,
+        straighten_modified,
         set_straighten_enabled,
+        reset_straighten,
         |session, ui| widgets::straighten_slider(ui, &mut session.variants[session.active]),
     );
 
     // Keystone — the perspective tool and its two correction axes.
     let keystone_enabled = session.keystone_enabled;
+    let keystone_modified = session.variants[session.active]
+        .current()
+        .geometry
+        .perspective
+        .is_some();
     d |= toggle_tool_subsection(
         session,
         ui,
@@ -1005,7 +1055,9 @@ fn geometry_body(ui: &mut egui::Ui, session: &mut Session, vis: &mut VisCtx) -> 
         CanvasTool::Keystone,
         "keystone",
         keystone_enabled,
+        keystone_modified,
         set_keystone_enabled,
+        reset_keystone,
         |session, ui| widgets::keystone_block(ui, &mut session.variants[session.active]),
     );
 
@@ -1061,6 +1113,30 @@ fn set_keystone_enabled(session: &mut Session, on: bool) -> bool {
     session.keystone_enabled = on;
     let history = &mut session.variants[session.active];
     toggle_keystone(history, &mut session.keystone_stash, on)
+}
+
+/// Reset the crop fully: clear the field and the enable flag (one undo step via the
+/// disable path) and drop the toggle stash, so a reset truly removes the crop rather
+/// than stashing it for a later re-enable. Returns whether the preview is now dirty.
+fn reset_crop(session: &mut Session) -> bool {
+    let dirty = set_crop_enabled(session, false);
+    session.crop_stash = None;
+    dirty
+}
+
+/// Reset the straighten angle fully (clear the angle and stash). See [`reset_crop`].
+fn reset_straighten(session: &mut Session) -> bool {
+    let dirty = set_straighten_enabled(session, false);
+    session.straighten_stash = None;
+    dirty
+}
+
+/// Reset the keystone correction fully (clear the perspective and stash). See
+/// [`reset_crop`].
+fn reset_keystone(session: &mut Session) -> bool {
+    let dirty = set_keystone_enabled(session, false);
+    session.keystone_stash = None;
+    dirty
 }
 
 /// Toggle the crop field on/off as **one** undo step, stashing through `stash` so a
